@@ -390,3 +390,5 @@ ExtractKey_Output/
 # Python 字节码
 __pycache__/
 *.pyc
+
+# GitHub Actions 本地不跑；上游 zip 与构建产物已排除（见上）
