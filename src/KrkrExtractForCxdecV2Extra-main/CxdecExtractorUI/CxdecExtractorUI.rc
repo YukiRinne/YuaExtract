@@ -1,0 +1,118 @@
+// Microsoft Visual C++ generated resource script.
+//
+#pragma code_page(65001)
+#include "resource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 2 resource.
+//
+#include "winres.h"
+#include <commctrl.h>
+
+/////////////////////////////////////////////////////////////////////////////
+#undef APSTUDIO_READONLY_SYMBOLS
+
+/////////////////////////////////////////////////////////////////////////////
+// Chinese (Simplified, PRC) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_CHS)
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
+
+#ifdef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// TEXTINCLUDE
+//
+
+1 TEXTINCLUDE
+BEGIN
+    "resource.h\0"
+END
+
+2 TEXTINCLUDE
+BEGIN
+    "#include \"winres.h\"\r\n"
+    "#include <commctrl.h>\r\n"
+    "\0"
+END
+
+3 TEXTINCLUDE
+BEGIN
+    "\r\n"
+    "\0"
+END
+
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+
+IDD_MainForm DIALOGEX 0, 0, 420, 278
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+EXSTYLE WS_EX_ACCEPTFILES
+CAPTION "Cxdec Batch Extractor"
+FONT 9, "Microsoft YaHei UI", 400, 0, 0x86
+BEGIN
+    LTEXT           "Drop XP3 files here, or click Add Files to queue them in batch.",IDC_DropHint,7,7,258,10
+    PUSHBUTTON      "Add Files",IDC_AddFiles,306,5,50,14
+    PUSHBUTTON      "Clear Done",IDC_ClearCompleted,360,5,53,14
+    LTEXT           "Output:",-1,7,28,34,10
+    EDITTEXT        IDC_OutputPath,44,25,312,14,ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse",IDC_BrowseOutput,360,25,53,14
+    CONTROL         "完成弹窗",IDC_NotifyPopup,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,7,46,55,10
+    CONTROL         "完成提示音",IDC_NotifySound,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,69,46,60,10
+    LTEXT           "Workers: Auto",IDC_WorkerInfo,300,46,113,10
+    CONTROL         "",IDC_OverallProgress,PROGRESS_CLASS,WS_BORDER | WS_TABSTOP,7,62,406,12
+    LTEXT           "Waiting for tasks",IDC_StatusText,7,79,406,10
+    CONTROL         "",IDC_TaskList,"SysListView32",LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,7,93,406,176
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// DESIGNINFO
+//
+
+#ifdef APSTUDIO_INVOKED
+GUIDELINES DESIGNINFO
+BEGIN
+    IDD_MainForm, DIALOG
+    BEGIN
+        LEFTMARGIN, 7
+        RIGHTMARGIN, 413
+        TOPMARGIN, 7
+        BOTTOMMARGIN, 269
+    END
+END
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// AFX_DIALOG_LAYOUT
+//
+
+IDD_MainForm AFX_DIALOG_LAYOUT
+BEGIN
+    0
+END
+
+#endif    // Chinese (Simplified, PRC) resources
+/////////////////////////////////////////////////////////////////////////////
+
+
+
+#ifndef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 3 resource.
+//
+
+
+/////////////////////////////////////////////////////////////////////////////
+#endif    // not APSTUDIO_INVOKED

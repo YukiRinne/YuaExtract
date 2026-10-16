@@ -1,0 +1,680 @@
+#include "ExtractCore.h"
+#include "pe.h"
+#include "file.h"
+#include "directory.h"
+#include "diag.h"
+#include "path.h"
+#include "stringhelper.h"
+#include "ExtendUtils.h"
+
+#include <cstdarg>
+
+namespace
+{
+    // TVP 同时支持绝对路径和相对 app path，这里先做一个轻量判断，
+    // 后续再统一交给 TVP 的标准化逻辑处理。
+    bool IsAbsolutePath(const std::wstring& path)
+    {
+        if (path.length() >= 2 && path[1] == L':')
+        {
+            return true;
+        }
+
+        return path.length() >= 2 && path[0] == L'\\' && path[1] == L'\\';
+    }
+
+    bool IsKnownPlaceholderEntry(const Engine::FileEntry& entry)
+    {
+        // 某些样本会带一个固定的占位条目，索引存在但无法真正打开。
+        // 这里按哈希白名单跳过，避免把已知空洞算成整体解包失败。
+        static constexpr unsigned __int8 PlaceholderDirectoryHash[8] =
+        {
+            0x94, 0xD4, 0xA9, 0x7C, 0x61, 0x49, 0x86, 0x21
+        };
+        static constexpr unsigned __int8 PlaceholderFileHash[32] =
+        {
+            0x2E, 0xA4, 0xAA, 0xEC, 0x6A, 0x09, 0xF9, 0xD1,
+            0x7E, 0x2A, 0x5A, 0x7A, 0xC4, 0x22, 0xFB, 0x64,
+            0xB6, 0xA4, 0x21, 0x95, 0xC5, 0x5C, 0xF6, 0x77,
+            0x2F, 0xB3, 0x0C, 0x0F, 0xA0, 0x12, 0x0C, 0x8D
+        };
+
+        return memcmp(entry.DirectoryPathHash, PlaceholderDirectoryHash, sizeof(PlaceholderDirectoryHash)) == 0
+            && memcmp(entry.FileNameHash, PlaceholderFileHash, sizeof(PlaceholderFileHash)) == 0;
+    }
+}
+
+namespace Engine
+{
+	//**********ExtractCore***********//
+	ExtractCore::ExtractCore()
+        : mCreateStreamFunc(nullptr),
+          mCreateIndexFunc(nullptr),
+          mProgressCallback(nullptr),
+          mProgressContext(nullptr)
+	{
+	}
+
+	ExtractCore::~ExtractCore()
+	{
+	}
+
+	void ExtractCore::SetOutputDirectory(const std::wstring& directory)
+	{
+		this->mExtractDirectoryPath = Path::Combine(directory, ExtractCore::ExtractorOutFolderName);
+	}
+
+	void ExtractCore::SetLoggerDirectory(const std::wstring& directory)
+	{
+		std::wstring path = Path::Combine(directory, ExtractCore::ExtractorLogFileName);
+
+		// 保留上一次的日志（挪成 .1）：用户"再跑一次看看"时，失败现场不会跟着丢。
+		// 以前这里是先 Delete 再 Open，等于每次运行都把上一次的证据抹掉。
+		this->mLogger.OpenKeepingPrevious(path.c_str());
+
+		// 落点本身记一行：日志位置是算出来的（<工具根>\Log\，工具根写不了会退到
+		// %LOCALAPPDATA%），用户要找日志时得有个准话。
+		this->mLogger.WriteLine(L"Log file: %s", path.c_str());
+	}
+
+    void ExtractCore::SetProgressCallback(tExtractProgressCallback callback, void* context)
+    {
+        this->mProgressCallback = callback;
+        this->mProgressContext = context;
+    }
+
+	void ExtractCore::Initialize(PVOID codeVa, DWORD codeSize)
+	{
+        // 直接复用宿主实现，避免自己重写 Hxv4 的索引和解密逻辑。
+		PVOID createStream = PE::SearchPattern(codeVa, codeSize, ExtractCore::CreateStreamSignature, sizeof(ExtractCore::CreateStreamSignature) - 1u);
+		PVOID createIndex = PE::SearchPattern(codeVa, codeSize, ExtractCore::CreateIndexSignature, sizeof(ExtractCore::CreateIndexSignature) - 1u);
+
+		if (createStream && createIndex)
+		{
+			this->mCreateStreamFunc = (tCreateStream)createStream;
+			this->mCreateIndexFunc = (tCreateIndex)createIndex;
+		}
+	}
+
+	bool ExtractCore::IsInitialized()
+	{
+		return this->mCreateStreamFunc && this->mCreateIndexFunc;
+	}
+
+    bool ExtractCore::ExtractPackage(const std::wstring& packageFileName, unsigned int taskId)
+    {
+        return this->ExtractPackageTo(packageFileName, this->mExtractDirectoryPath, taskId);
+    }
+
+    bool ExtractCore::ExtractPackageTo(const std::wstring& packagePath, const std::wstring& outputDirectory, unsigned int taskId)
+	{
+        // 外部 UI 依赖状态回调驱动列表和总进度，因此整个流程会分阶段汇报状态。
+        std::wstring packageDisplayName = Path::GetFileName(packagePath);
+        if (packageDisplayName.empty())
+        {
+            packageDisplayName = packagePath;
+        }
+
+        this->NotifyProgress(taskId, packagePath, ExtractTaskPreparing, 0u, 0u, L"准备解包");
+
+		if (!this->IsInitialized())
+		{
+            const std::wstring detail = L"未初始化CxdecV2接口，请检查是否为无DRM的Wamsoft Hxv4加密游戏";
+            this->WriteLogLevel(Log::Level::Error, L"Extract Failed: %s | %s", packageDisplayName.c_str(), detail.c_str());
+            this->NotifyProgress(taskId, packagePath, ExtractTaskFailed, 0u, 0u, detail);
+			return false;
+		}
+
+        tTJSString tjsXp3PackagePath = ExtractCore::ResolvePackageStoragePath(packagePath);
+        if (tjsXp3PackagePath.IsEmpty())
+        {
+            const std::wstring detail = L"封包路径无效";
+            this->WriteLogLevel(Log::Level::Error, L"Extract Failed: %s | %s", packageDisplayName.c_str(), detail.c_str());
+            this->NotifyProgress(taskId, packagePath, ExtractTaskFailed, 0u, 0u, detail);
+            return false;
+        }
+
+		std::vector<FileEntry> entries = std::vector<FileEntry>();
+		this->GetEntries(tjsXp3PackagePath, entries);
+		if (entries.empty())
+		{
+            const std::wstring detail = L"请选择正确的XP3封包";
+            this->WriteLogLevel(Log::Level::Error, L"Extract Failed: %s | %s", packageDisplayName.c_str(), detail.c_str());
+            this->NotifyProgress(taskId, packagePath, ExtractTaskFailed, 0u, 0u, detail);
+            return false;
+		}
+
+        const std::wstring effectiveOutputDirectory = outputDirectory.empty() ? this->mExtractDirectoryPath : outputDirectory;
+
+        // 输出目录建不出来时，后面每个文件都会失败，所以这一步必须单独报，
+        // 而且要把错误码留下 —— 权限不足 / 路径过长 / 磁盘满在这里就能分开。
+        Win32Error::Info createError;
+        if (!Directory::Create(effectiveOutputDirectory, &createError))
+        {
+            const std::wstring failure =
+                Win32Error::FailureLine(L"CreateDirectory", effectiveOutputDirectory, createError);
+            this->WriteLogLevel(Log::Level::Error, L"Extract Failed: %s | %s", packageDisplayName.c_str(), failure.c_str());
+            this->NotifyProgress(taskId, packagePath, ExtractTaskFailed, 0u, 0u, failure);
+            return false;
+        }
+
+        // 每个任务记一份环境快照：路径长度、盘符类型、剩余空间、能不能写、
+        // 系统有没有开长路径支持。以前这些只能靠问用户，现在日志里直接有。
+        for (const std::wstring& line : Diag::SnapshotLines(effectiveOutputDirectory))
+        {
+            this->WriteLog(L"[env] %s", line.c_str());
+        }
+
+        this->mFailures.Reset();
+
+        // 日志本身打不开是"现场全丢"级别的故障：必须让上层看得见，
+        // 否则用户报"日志是空的"时，我们分不清是没出事还是日志没开成。
+        if (!this->mLogger.IsOpen())
+        {
+            const std::wstring detail = L"解包日志不可用：" + Win32Error::Describe(this->mLogger.LastOpenError());
+            this->NotifyProgress(taskId, packagePath, ExtractTaskPreparing, 0u, 0u, detail);
+        }
+
+        // .alst 保存“目录哈希 / 文件哈希”映射，便于后续结合 hash 日志回填路径。
+        std::wstring packageName = Path::GetFileNameWithoutExtension(packageDisplayName);
+        std::wstring extractOutput = Path::Combine(effectiveOutputDirectory, packageName);
+        std::wstring fileTableOutput = extractOutput + L".alst";
+
+        this->NotifyProgress(taskId, packagePath, ExtractTaskIndexLoaded, 0u, (unsigned int)entries.size(), L"索引读取完成");
+        this->WriteLog(L"Extract Start: %s -> %s", packageDisplayName.c_str(), extractOutput.c_str());
+
+        Win32Error::Info deleteError;
+        if (!File::Delete(fileTableOutput, &deleteError))
+        {
+            // 删不掉就是"往旧清单上追加"，后面回填路径会读到上一次的残留
+            this->WriteLogLevel(Log::Level::Error, L"File Table Delete Failed: %s | %s", fileTableOutput.c_str(),
+                           Win32Error::FailureLine(L"DeleteFile", fileTableOutput, deleteError).c_str());
+        }
+        Log::Logger fileTable = Log::Logger(fileTableOutput.c_str());
+
+        // 清单就写在输出目录里，打不开的话这一趟没有任何映射记录可查，必须显式报出来
+        if (!fileTable.IsOpen())
+        {
+            this->WriteLogLevel(Log::Level::Warn, L"File Table Unavailable: %s | %s", fileTableOutput.c_str(),
+                           Win32Error::Describe(fileTable.LastOpenError()).c_str());
+        }
+
+        WORD bom = 0xFEFF;
+        fileTable.WriteData(&bom, sizeof(bom));
+
+        bool allSucceeded = true;
+        unsigned int skippedPlaceholderCount = 0u;
+        const unsigned int totalCount = (unsigned int)entries.size();
+
+        for (unsigned int index = 0u; index < totalCount; ++index)
+        {
+            FileEntry& entry = entries[index];
+
+            // 纯哈希封包没有明文路径，输出结构只能按 hash 目录还原。
+            std::wstring dirHash = StringHelper::BytesToHexStringW(entry.DirectoryPathHash, sizeof(entry.DirectoryPathHash));
+            std::wstring fileNameHash = StringHelper::BytesToHexStringW(entry.FileNameHash, sizeof(entry.FileNameHash));
+            std::wstring relativePath = packageName + L"\\" + dirHash + L"\\" + fileNameHash;
+            std::wstring arcOutputPath = Path::Combine(effectiveOutputDirectory, relativePath);
+
+            this->NotifyProgress(taskId, packagePath, ExtractTaskExtracting, index, totalCount, relativePath);
+
+            bool currentSucceeded = false;
+            if (IStream* stream = this->CreateStream(entry, tjsXp3PackagePath))
+            {
+                // .alst 记的是「域哈希 / 文件哈希」，末尾再加上这条记录的 Key。
+                //
+                // 为什么要记 Key：重封包时每个文件的过滤器密钥是打包方自由挑的，原包用的
+                // 那把只存在于包里。不写下来，重封包即使顺序和明文都对上了，密文也会因为
+                // 密钥不同而整片不同，永远复刻不了原包的字节。Key 在 CreateStream 里本来
+                // 就要用，顺手记一条没有任何额外成本。
+                fileTable.WriteUnicode(L"%s%s%s%s%s%s%s%s%016llX\r\n",
+                                       dirHash.c_str(),
+                                       ExtractCore::Split,
+                                       dirHash.c_str(),
+                                       ExtractCore::Split,
+                                       fileNameHash.c_str(),
+                                       ExtractCore::Split,
+                                       fileNameHash.c_str(),
+                                       ExtractCore::Split,
+                                       static_cast<unsigned long long>(entry.Key));
+
+                currentSucceeded = this->ExtractFile(stream, arcOutputPath, relativePath);
+                stream->Release();
+            }
+            else
+            {
+                currentSucceeded = false;
+                ++this->mFailures.openStream;
+                this->mFailures.AddSample(L"打不开资源流 " + relativePath);
+                this->WriteLogLevel(Log::Level::Warn, L"File Not Exist: %s", relativePath.c_str());
+            }
+
+            if (!currentSucceeded && IsKnownPlaceholderEntry(entry))
+            {
+                currentSucceeded = true;
+                ++skippedPlaceholderCount;
+                this->WriteLogLevel(Log::Level::Warn, L"Skip Placeholder Entry: %s", relativePath.c_str());
+            }
+
+            if (!currentSucceeded)
+            {
+                allSucceeded = false;
+            }
+
+            this->NotifyProgress(taskId,
+                                 packagePath,
+                                 ExtractTaskExtracting,
+                                 index + 1u,
+                                 totalCount,
+                                 currentSucceeded ? relativePath : (relativePath + L" | 失败"));
+        }
+
+        fileTable.Close();
+
+        if (allSucceeded)
+        {
+            if (skippedPlaceholderCount > 0u)
+            {
+                this->WriteLogLevel(Log::Level::Warn, L"Skipped Placeholder Entries: %s | %u",
+                               packageDisplayName.c_str(),
+                               skippedPlaceholderCount);
+            }
+
+            this->WriteLog(L"Extract Completed: %s", packageDisplayName.c_str());
+            this->NotifyProgress(taskId, packagePath, ExtractTaskCompleted, totalCount, totalCount, L"解包完成");
+        }
+        else
+        {
+            this->WriteLogLevel(Log::Level::Warn, L"Extract Completed With Errors: %s", packageDisplayName.c_str());
+
+            // 收尾汇总：一次解包可能上千条失败、日志上百万字节，这一行比让人翻日志有用。
+            const FailureTally& tally = this->mFailures;
+            this->WriteLogLevel(Log::Level::Warn, L"Failure summary: dir-create=%u open-stream=%u write-open=%u "
+                           L"write-data=%u invalid=%u",
+                           tally.dirCreate, tally.openStream, tally.writeOpen, tally.writeData,
+                           tally.invalid);
+            for (const std::wstring& sample : tally.samples)
+            {
+                this->WriteLog(L"  sample: %s", sample.c_str());
+            }
+
+            // UI 列表里也给出首条原因：用户贴图/口述时带上它，就能直接判断方向。
+            std::wstring detail = L"解包完成，但存在失败条目";
+            if (!tally.samples.empty())
+            {
+                detail += L"（首条：" + tally.samples.front() + L"）";
+            }
+            this->NotifyProgress(taskId, packagePath, ExtractTaskFailed, totalCount, totalCount, detail);
+        }
+
+        return allSucceeded;
+	}
+
+	void ExtractCore::GetEntries(const tTJSString& xp3PackagePath, std::vector<FileEntry>& retValue)
+	{
+		retValue.clear();
+
+		tTJSVariant tjsEntries;
+		tTJSVariant tjsPackagePath(xp3PackagePath);
+		this->mCreateIndexFunc(&tjsEntries, &tjsPackagePath);
+
+		if (tjsEntries.Type() != tvtObject)
+        {
+            return;
+        }
+
+		tTJSVariantClosure& dirEntriesObj = tjsEntries.AsObjectClosureNoAddRef();
+
+		tTJSVariant tjsCount;
+		tjs_int count = 0;
+		dirEntriesObj.PropGet(TJS_MEMBERMUSTEXIST, L"count", NULL, &tjsCount, nullptr);
+		count = (tjs_int)tjsCount.AsInteger();
+
+		// Hxv4 返回的是“目录 hash / 子项对象”交替排列的数组。
+		constexpr tjs_int DirectoryItemSize = 2;
+		tjs_int dirCount = count / DirectoryItemSize;
+
+		for (tjs_int di = 0; di < dirCount; ++di)
+		{
+			tTJSVariant tjsDirHash;
+			tTJSVariant tjsFileEntries;
+			dirEntriesObj.PropGetByNum(TJS_CII_GET, di * DirectoryItemSize + 0, &tjsDirHash, nullptr);
+			dirEntriesObj.PropGetByNum(TJS_CII_GET, di * DirectoryItemSize + 1, &tjsFileEntries, nullptr);
+
+			tTJSVariantOctet* dirHash = tjsDirHash.AsOctetNoAddRef();
+            if (dirHash == nullptr || dirHash->GetLength() != 8u)
+            {
+                this->WriteLogLevel(Log::Level::Warn, L"Skip Entry: invalid directory hash length");
+                continue;
+            }
+
+			tTJSVariantClosure& fileEntries = tjsFileEntries.AsObjectClosureNoAddRef();
+			tjsCount.Clear();
+			fileEntries.PropGet(TJS_MEMBERMUSTEXIST, L"count", NULL, &tjsCount, nullptr);
+			count = (tjs_int)tjsCount.AsInteger();
+
+			// 子项对象内部同样是“文件 hash / 文件信息”成对排列。
+			constexpr tjs_int FileItemSize = 2;
+			tjs_int fileCount = count / FileItemSize;
+
+			for (tjs_int fi = 0; fi < fileCount; ++fi)
+			{
+				tTJSVariant tjsFileNameHash;
+				tTJSVariant tjsFileInfo;
+				fileEntries.PropGetByNum(TJS_CII_GET, fi * FileItemSize + 0, &tjsFileNameHash, nullptr);
+				fileEntries.PropGetByNum(TJS_CII_GET, fi * FileItemSize + 1, &tjsFileInfo, nullptr);
+
+				tTJSVariantOctet* fileNameHash = tjsFileNameHash.AsOctetNoAddRef();
+                if (fileNameHash == nullptr || fileNameHash->GetLength() != 32u)
+                {
+                    this->WriteLogLevel(Log::Level::Warn, L"Skip Entry: invalid file hash length");
+                    continue;
+                }
+
+				tTJSVariantClosure& fileInfo = tjsFileInfo.AsObjectClosureNoAddRef();
+
+				__int64 ordinal = 0i64;
+				__int64 key = 0i64;
+
+				tTJSVariant tjsValue;
+				fileInfo.PropGetByNum(TJS_CII_GET, 0, &tjsValue, nullptr);
+				ordinal = tjsValue.AsInteger();
+
+				tjsValue.Clear();
+				fileInfo.PropGetByNum(TJS_CII_GET, 1, &tjsValue, nullptr);
+				key = tjsValue.AsInteger();
+
+				FileEntry entry{ };
+				memcpy(entry.DirectoryPathHash, dirHash->GetData(), sizeof(entry.DirectoryPathHash));
+				memcpy(entry.FileNameHash, fileNameHash->GetData(), sizeof(entry.FileNameHash));
+				entry.Key = key;
+				entry.Ordinal = ordinal;
+
+                if (!entry.IsVaild())
+                {
+                    this->WriteLogLevel(Log::Level::Warn, L"Skip Entry: invalid ordinal");
+                    continue;
+                }
+
+				retValue.push_back(entry);
+			}
+		}
+	}
+
+	IStream* ExtractCore::CreateStream(const FileEntry& entry, const tTJSString& packageStoragePath)
+	{
+		tjs_char fakeName[4]{ };
+		entry.GetFakeName(fakeName);
+
+        // TVP 存储路径格式为 "archive.xp3>entryName"。
+        // 这里的 entryName 不是明文文件名，而是由 ordinal 推导出的伪名。
+		tTJSString tjsArcPath = packageStoragePath;
+		tjsArcPath += L">";
+		tjsArcPath += fakeName;
+		tjsArcPath = TVPNormalizeStorageName(tjsArcPath);
+
+		return this->mCreateStreamFunc(&tjsArcPath, entry.Key, entry.GetEncryptMode());
+	}
+
+	bool ExtractCore::ExtractFile(IStream* stream, const std::wstring& extractPath, const std::wstring& relativePath)
+	{
+		unsigned long long size = StreamUtils::IStreamEx::Length(stream);
+		if (size == 0)
+		{
+            this->WriteLogLevel(Log::Level::Warn, L"Empty File: %s", relativePath.c_str());
+            return false;
+		}
+
+        std::wstring outputDir = Path::GetDirectoryName(extractPath);
+        if (!outputDir.empty())
+        {
+            Win32Error::Info dirError;
+            if (!Directory::Create(outputDir, &dirError))
+            {
+                // 这一步以前完全被忽略：建目录失败会一路走到下面报成"Write Error"，
+                // 把"目录建不出来"伪装成"写文件失败"，用户机器上根本看不出是哪一步。
+                const std::wstring reason = Win32Error::FailureLine(L"CreateDirectory", outputDir, dirError);
+                ++this->mFailures.dirCreate;
+                this->mFailures.AddSample(L"建目录失败 " + relativePath + L" | " + reason);
+                this->WriteLogLevel(Log::Level::Error, L"Dir Create Failed: %s | %s", relativePath.c_str(), reason.c_str());
+                return false;
+            }
+        }
+
+		std::vector<uint8_t> buffer;
+		bool success = false;
+
+        // 先尝试走 krkr 的文本资源解密分支；失败时再原样导出字节流。
+		if (ExtractCore::TryDecryptText(stream, buffer))
+		{
+			success = true;
+		}
+		else
+		{
+			buffer.resize((size_t)size);
+
+			stream->Seek(LARGE_INTEGER{ }, STREAM_SEEK_SET, nullptr);
+					if (StreamUtils::IStreamEx::Read(stream, buffer.data(), (ULONG)size) == (ULONG)size)
+			{
+				success = true;
+			}
+		}
+
+		if (success && !buffer.empty())
+		{
+            File::WriteStage stage = File::WriteStage::None;
+            Win32Error::Info writeError;
+			if (File::WriteAllBytes(extractPath, buffer.data(), buffer.size(), &stage, &writeError))
+			{
+                this->WriteLog(L"Extract Successed: %s", relativePath.c_str());
+                stream->Seek(LARGE_INTEGER{ }, STREAM_SEEK_SET, nullptr);
+                return true;
+			}
+
+            // 失败在哪一步（打开 / 写入 / 落盘 flush / 关闭）连同错误码一起记下来，
+            // 只写一句"Write Error"时，这几种情况在日志里长得一模一样。
+            const std::wstring reason = Win32Error::FailureLine(L"WriteAllBytes", extractPath, writeError);
+            if (stage == File::WriteStage::Open)
+            {
+                ++this->mFailures.writeOpen;
+            }
+            else
+            {
+                ++this->mFailures.writeData;
+            }
+            this->mFailures.AddSample(L"写失败(" + std::wstring(File::WriteStageName(stage)) + L") " +
+                                      relativePath + L" | " + reason);
+
+            this->WriteLogLevel(Log::Level::Error, L"Write Failed: %s | stage=%s | %zu 字节 | %s",
+                           relativePath.c_str(),
+                           File::WriteStageName(stage),
+                           buffer.size(),
+                           reason.c_str());
+		}
+		else
+		{
+            ++this->mFailures.invalid;
+            this->WriteLogLevel(Log::Level::Error, L"Invaild File: %s", relativePath.c_str());
+		}
+
+		stream->Seek(LARGE_INTEGER{ }, STREAM_SEEK_SET, nullptr);
+        return false;
+	}
+
+	bool ExtractCore::TryDecryptText(IStream* stream, std::vector<uint8_t>& output)
+	{
+		uint8_t mark[2]{ };
+		StreamUtils::IStreamEx::Read(stream, mark, 2ul);
+
+		if (mark[0] == 0xfe && mark[1] == 0xfe)
+		{
+            // Krkr 文本流头: FE FE + mode + FF FE
+            // mode 0/1 为逐字符变换，mode 2 为 zlib 压缩后的 UTF-16 文本。
+			uint8_t mode;
+			StreamUtils::IStreamEx::Read(stream, &mode, 1ul);
+
+			if (mode != 0 && mode != 1 && mode != 2)
+			{
+				return false;
+			}
+
+			ZeroMemory(mark, sizeof(mark));
+			StreamUtils::IStreamEx::Read(stream, mark, 2ul);
+
+			if (mark[0] != 0xff || mark[1] != 0xfe)
+			{
+				return false;
+			}
+
+			if (mode == 2)
+			{
+				long long compressed = 0;
+				long long uncompressed = 0;
+				StreamUtils::IStreamEx::Read(stream, &compressed, sizeof(long long));
+				StreamUtils::IStreamEx::Read(stream, &uncompressed, sizeof(long long));
+
+				if (compressed <= 0 || compressed >= INT_MAX || uncompressed <= 0 || uncompressed >= INT_MAX)
+				{
+					return false;
+				}
+
+				std::vector<uint8_t> data = std::vector<uint8_t>((size_t)compressed);
+
+				if (StreamUtils::IStreamEx::Read(stream, data.data(), (ULONG)compressed) != compressed)
+				{
+					return false;
+				}
+
+				std::vector<uint8_t> buffer = std::vector<uint8_t>((size_t)uncompressed + 2u);
+
+				buffer[0] = mark[0];
+				buffer[1] = mark[1];
+
+                // 保留 UTF-16LE BOM，输出文件能被常见编辑器直接识别。
+				uint8_t* dest = buffer.data() + 2;
+				unsigned long destLen = (unsigned long)uncompressed;
+
+				if (ZLIB_uncompress(dest, &destLen, data.data(), (unsigned long)compressed) || destLen != (unsigned long)uncompressed)
+				{
+					return false;
+				}
+
+				output = std::move(buffer);
+				return true;
+			}
+
+			long long startpos = StreamUtils::IStreamEx::Position(stream);
+			long long endpos = StreamUtils::IStreamEx::Length(stream);
+
+			StreamUtils::IStreamEx::Seek(stream, startpos, STREAM_SEEK_SET);
+
+			long long size = endpos - startpos;
+			if (size <= 0 || size >= INT_MAX)
+			{
+				return false;
+			}
+
+			size_t count = (size_t)(size / sizeof(wchar_t));
+			if (count == 0)
+			{
+				return false;
+			}
+
+			std::vector<wchar_t> buffer(count + 1);
+			StreamUtils::IStreamEx::Read(stream, buffer.data(), (ULONG)size);
+
+			if (mode == 0)
+			{
+                // mode 0: 高位和最低位共同参与异或，还原可读 UTF-16 字符。
+				for (size_t i = 0; i < count; i++)
+				{
+					wchar_t ch = buffer[i];
+					if (ch >= 0x20)
+                    {
+                        buffer[i] = ch ^ (((ch & 0xfe) << 8) ^ 1);
+                    }
+				}
+			}
+			else if (mode == 1)
+			{
+                // mode 1: 交换奇偶位。
+				for (size_t i = 0; i < count; i++)
+				{
+					wchar_t ch = buffer[i];
+					ch = ((ch & 0xaaaaaaaa) >> 1) | ((ch & 0x55555555) << 1);
+					buffer[i] = ch;
+				}
+			}
+
+			size_t sizeToCopy = count * sizeof(wchar_t);
+			output.resize(sizeToCopy + 2u);
+			output[0] = mark[0];
+			output[1] = mark[1];
+			memcpy(output.data() + 2, buffer.data(), sizeToCopy);
+			return true;
+		}
+		return false;
+	}
+
+    tTJSString ExtractCore::ResolvePackageStoragePath(const std::wstring& packagePath)
+    {
+        if (packagePath.empty())
+        {
+            return tTJSString();
+        }
+
+        if (!IsAbsolutePath(packagePath))
+        {
+            // 拖入相对路径时，按 TVP 的 app path 语义拼接，保持和宿主行为一致。
+            tTJSString relativePath = TVPGetAppPath();
+            relativePath += packagePath.c_str();
+            return TVPNormalizeStorageName(relativePath);
+        }
+
+        // 绝对路径统一做一次规范化，避免分隔符或大小写导致 TVP 找不到封包。
+        std::wstring fullPath = Path::GetFullPath(packagePath);
+        if (fullPath.empty())
+        {
+            fullPath = packagePath;
+        }
+        return TVPNormalizeStorageName(fullPath.c_str());
+    }
+
+    void ExtractCore::WriteLog(const wchar_t* format, ...)
+    {
+        va_list ap;
+        va_start(ap, format);
+        std::wstring message = StringHelper::VFormat(format, ap);
+        va_end(ap);
+        this->mLogger.WriteLine(L"%s", message.c_str());
+    }
+
+    void ExtractCore::WriteLogLevel(Log::Level level, const wchar_t* format, ...)
+    {
+        va_list ap;
+        va_start(ap, format);
+        std::wstring message = StringHelper::VFormat(format, ap);
+        va_end(ap);
+        this->mLogger.WriteLineLevel(level, L"%s", message.c_str());
+    }
+
+    void ExtractCore::NotifyProgress(unsigned int taskId,
+                                     const std::wstring& packagePath,
+                                     unsigned int state,
+                                     unsigned int current,
+                                     unsigned int total,
+                                     const std::wstring& detail) const
+    {
+        if (this->mProgressCallback)
+        {
+            this->mProgressCallback(taskId,
+                                    packagePath.c_str(),
+                                    state,
+                                    current,
+                                    total,
+                                    detail.c_str(),
+                                    this->mProgressContext);
+        }
+    }
+	//================================//
+}

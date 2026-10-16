@@ -1,0 +1,5 @@
+﻿LIBRARY
+EXPORTS
+	ExtractPackage
+	ExtractPackageEx
+	SetExtractProgressCallback

@@ -1,0 +1,271 @@
+﻿#include "tjs2_parser.h"
+#include "antimalform_log.h"
+#include <cstring>
+#include <cstdio>
+#include <windows.h>
+#include <cstdarg>
+
+
+namespace Tjs2Parser {
+
+static inline uint16_t LE16(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
+static inline uint32_t LE32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0])         | (static_cast<uint32_t>(p[1]) << 8)
+         | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// 带 SEH 的读取助手：越界检查 + __try 兜底
+static inline bool SafeRead16(const uint8_t* data, size_t off, size_t size, uint16_t* out) {
+    if (off + 2 > size) return false;
+    __try {
+        *out = LE16(data + off);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        AmLog(L"[T2] SEH: AV at SafeRead16 off=0x%zX size=0x%zX", off, size);
+        return false;
+    }
+}
+
+static inline bool SafeRead32(const uint8_t* data, size_t off, size_t size, uint32_t* out) {
+    if (off + 4 > size) return false;
+    __try {
+        *out = LE32(data + off);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        AmLog(L"[T2] SEH: AV at SafeRead32 off=0x%zX size=0x%zX", off, size);
+        return false;
+    }
+}
+
+static constexpr uint32_t FILE_TAG = ('T')|('J'<<8)|('S'<<16)|('2'<<24);
+static constexpr uint32_t VER_TAG  = ('1')|('0'<<8)|('0'<<16)|(0   <<24);
+static constexpr uint32_t DATA_TAG = ('D')|('A'<<8)|('T'<<16)|('A'<<24);
+static constexpr uint32_t OBJ_TAG  = ('O')|('B'<<8)|('J'<<16)|('S'<<24);
+
+bool IsTjs2(const uint8_t* data, size_t size) {
+    if (size < 20) return false;
+    return LE32(data) == FILE_TAG && LE32(data + 4) == VER_TAG;
+}
+
+ByteCode Parse(const uint8_t* data, size_t size) {
+    ByteCode bc;
+    bc.valid = false;
+    if (size < 20) return bc;
+    if (LE32(data) != FILE_TAG || LE32(data + 4) != VER_TAG) { AmLog(L"[T2] BAD header"); return bc; }
+    if (LE32(data + 8) != static_cast<uint32_t>(size)) { AmLog(L"[T2] BAD size: hdr=0x%X size=%zu", LE32(data+8), size); return bc; }
+
+    // --- DATA 区 ---
+    if (LE32(data + 12) != DATA_TAG) { AmLog(L"[T2] BAD DATA tag"); return bc; }
+    uint32_t dataSize = LE32(data + 16);
+    size_t off = 20;
+    size_t dataEnd = off + dataSize;
+    if (dataEnd > size) { AmLog(L"[T2] dataEnd=%zu > size=%zu", dataEnd, size); return bc; }
+
+    // DATA 区各数组依次排布，每段带 4 字节长度，byte/short 对齐到 4
+
+    // 前进前校验：count >= 0，且 off + count*elemSize 不越界，
+    // 然后按对齐后的字节数前进；越界返回 false
+    auto safe_advance = [&](int32_t count, size_t elemSize, size_t align, size_t bound) -> bool {
+        if (count < 0) { AmLog(L"[T2] Negative count %d", count); return false; }
+        size_t bytes = static_cast<size_t>(count) * elemSize;
+        if (off + bytes > bound) { AmLog(L"[T2] Advance OOB: off=%zu bytes=%zu bound=%zu", off, bytes, bound); return false; }
+        off += bytes;
+        if (align > 1) {
+            size_t rem = off % align;
+            if (rem != 0) {
+                size_t pad = align - rem;
+                if (off + pad > bound) { off = bound; return true; }
+                off += pad;
+            }
+        }
+        return true;
+    };
+
+    // byte 数组
+    if (off + 4 > dataEnd) { AmLog(L"[T2] DATA truncated at byte array"); return bc; }
+    int32_t count = static_cast<int32_t>(LE32(data + off)); off += 4;
+    if (!safe_advance(count, 1, 4, dataEnd)) return bc;
+
+    // short 数组
+    if (off + 4 > dataEnd) { AmLog(L"[T2] DATA truncated at short array"); return bc; }
+    count = static_cast<int32_t>(LE32(data + off)); off += 4;
+    if (!safe_advance(count, 2, 4, dataEnd)) return bc;
+
+    // long 数组
+    if (off + 4 > dataEnd) { AmLog(L"[T2] DATA truncated at long array"); return bc; }
+    count = static_cast<int32_t>(LE32(data + off)); off += 4;
+    if (!safe_advance(count, 4, 1, dataEnd)) return bc;
+
+    // longlong 数组
+    if (off + 4 > dataEnd) { AmLog(L"[T2] DATA truncated at longlong array"); return bc; }
+    count = static_cast<int32_t>(LE32(data + off)); off += 4;
+    if (!safe_advance(count, 8, 1, dataEnd)) return bc;
+
+    // double 数组
+    if (off + 4 > dataEnd) { AmLog(L"[T2] DATA truncated at double array"); return bc; }
+    count = static_cast<int32_t>(LE32(data + off)); off += 4;
+    if (!safe_advance(count, 8, 1, dataEnd)) return bc;
+
+    // --- 字符串池 ---
+    count = static_cast<int32_t>(LE32(data + off)); off += 4;
+    std::vector<std::string> strings;
+    strings.reserve(count > 0 ? count : 0);
+    for (int32_t i = 0; i < count; ++i) {
+        if (off + 4 > dataEnd) break;
+        int32_t slen = static_cast<int32_t>(LE32(data + off)); off += 4;
+        std::string s;
+        s.reserve(slen);
+        for (int32_t j = 0; j < slen; ++j) {
+            if (off + 2 > dataEnd) break;
+            uint16_t ch = LE16(data + off); off += 2;
+            // 按 UTF-8 存，只保留 ASCII 字符（够用）
+            if (ch < 0x80) s.push_back(static_cast<char>(ch));
+            else s.push_back('?');
+        }
+        strings.push_back(s);
+        if (slen & 1) off += 2;
+    }
+    bc.strings = strings; // save global string pool
+
+    // 存下字符串池备用
+    // 后面还有 octet 数组，用不到就跳过
+
+    // OBJS 起始位置有几种变体，挨个试
+    size_t objsOff = 20 + dataSize;
+    if (objsOff + 4 > size || LE32(data + objsOff) != OBJ_TAG) {
+        objsOff = 12 + dataSize;  // dataSize includes DATA tag+size
+        if (objsOff + 4 > size || LE32(data + objsOff) != OBJ_TAG) {
+            objsOff = 20 + dataSize - 8;  // dataSize includes just the DATA tag
+        }
+    }
+    AmLog(L"[T2] Trying OBJS at 0x%zX: tag=0x%08X", objsOff, (objsOff+4<=size)?LE32(data+objsOff):0);
+    if (objsOff + 4 > size || LE32(data + objsOff) != OBJ_TAG) {
+        AmLog(L"[T2] BAD OBJS tag");
+        return bc;
+    }
+    off = objsOff;
+
+    off += 4; // skip OBJS tag
+    uint32_t objsSize = LE32(data + off) - 8; // objsSize includes tag+size
+    off += 4;
+    size_t objsEnd = off + objsSize;
+    AmLog(L"[T2] OBJS data size=%u objsEnd=%zu", objsSize, objsEnd);
+    if (objsEnd > size) {
+        AmLog(L"[T2] objsEnd=%zu > size=%zu, adjusting", objsEnd, size);
+        objsEnd = size;
+    }
+
+    // 有的变体在 objs_size 后还有对象计数字段
+    // 后面不是 "TJS2" 就说明有计数字段
+    if (off + 4 <= objsEnd && LE32(data + off) != FILE_TAG) {
+        uint32_t objCount = LE32(data + off);
+        AmLog(L"[T2] Object count field: %u", objCount);
+        off += 8; // skip count (4 bytes) + reserved (4 bytes)
+    }
+
+    while (off + 28 <= objsEnd) {
+        uint32_t objTag = LE32(data + off);
+        if (objTag != FILE_TAG) {
+            AmLog(L"[T2] obj tag not TJS2 at 0x%zX: 0x%08X", off, objTag);
+            break;
+        }
+        off += 4; // tag
+        uint32_t objSize = LE32(data + off) - 8; // objSize includes tag+size
+        off += 4;
+
+        off += 4; // parent
+        int32_t nameIdx = static_cast<int32_t>(LE32(data + off)); off += 4;
+        off += 4; // ctxType
+        off += 4; // maxVariableCount
+        off += 4; // variableReserveCount
+        off += 4; // maxFrameCount
+        off += 4; // funcDeclArgCount
+        off += 4; // funcDeclUnnamedArgArrayBase
+        off += 4; // funcDeclCollapseBase
+        off += 4; // propSetter
+        off += 4; // propGetter
+        off += 4; // superClassGetter
+
+        // 源码位置表
+        if (off + 4 > objsEnd) break;
+        int32_t srcCount = static_cast<int32_t>(LE32(data + off));
+        off += 4;
+        if (!safe_advance(srcCount, 8, 1, objsEnd)) break;
+
+        // 代码数组
+        if (off + 4 > objsEnd) break;
+        int32_t codeCount = static_cast<int32_t>(LE32(data + off));
+        off += 4;
+        if (codeCount < 0) { AmLog(L"[T2] Negative codeCount %d", codeCount); break; }
+
+        ByteCode::Context ctx;
+        ctx.name = (nameIdx >= 0 && nameIdx < static_cast<int32_t>(strings.size()))
+                   ? strings[nameIdx] : "";
+        ctx.code.reserve(static_cast<size_t>(codeCount));
+
+        size_t codeStart = off;
+        ctx.rawCodeOffset = codeStart;
+
+        for (int32_t i = 0; i < codeCount; ++i) {
+            if (off + 2 > objsEnd) break;
+            uint16_t op16;
+            if (!SafeRead16(data, off, objsEnd, &op16)) break;
+            int16_t op = static_cast<int16_t>(op16);
+            ctx.code.push_back(static_cast<int32_t>(op));
+            off += 2;
+        }
+        // codeCount 为奇数时补对齐
+        if (codeCount & 1) {
+            if (off + 2 <= objsEnd) off += 2;
+        }
+
+        // 变体表
+        if (off + 4 > objsEnd) break;
+        int32_t varCount = static_cast<int32_t>(LE32(data + off));
+        off += 4;
+        if (varCount < 0) { AmLog(L"[T2] Negative varCount %d", varCount); break; }
+
+        std::vector<std::pair<int16_t, int16_t>> variants;
+        variants.reserve(static_cast<size_t>(varCount));
+        for (int32_t i = 0; i < varCount; ++i) {
+            if (off + 4 > objsEnd) break;
+            uint16_t vt16, vi16;
+            if (!SafeRead16(data, off, objsEnd, &vt16)) break;
+            if (!SafeRead16(data, off + 2, objsEnd, &vi16)) break;
+            int16_t vt = static_cast<int16_t>(vt16);
+            int16_t vi = static_cast<int16_t>(vi16);
+            variants.push_back({vt, vi});
+            off += 4;
+        }
+
+        ctx.strings.resize(static_cast<size_t>(varCount), "");
+        for (int32_t i = 0; i < static_cast<int32_t>(variants.size()); ++i) {
+            if (variants[i].first == 3 && variants[i].second >= 0 &&
+                variants[i].second < static_cast<int32_t>(strings.size())) {
+                ctx.strings[i] = strings[variants[i].second];
+            }
+        }
+
+        // 父类 getter 表
+        if (off + 4 > objsEnd) break;
+        int32_t scCount = static_cast<int32_t>(LE32(data + off));
+        off += 4;
+        if (!safe_advance(scCount, 4, 1, objsEnd)) break;
+
+        // 属性表
+        if (off + 4 > objsEnd) break;
+        int32_t propCount = static_cast<int32_t>(LE32(data + off));
+        off += 4;
+        if (!safe_advance(propCount, 8, 1, objsEnd)) break;
+
+        bc.contexts.push_back(std::move(ctx));
+    }
+
+    bc.valid = !bc.contexts.empty();
+    AmLog(L"[T2] Parse done: valid=%d contexts=%zu", bc.valid, bc.contexts.size());
+    return bc;
+}
+
+} // namespace Tjs2Parser

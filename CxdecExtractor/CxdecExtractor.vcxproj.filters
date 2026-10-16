@@ -1,0 +1,120 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="源文件">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Commom">
+      <UniqueIdentifier>{9d43feff-c600-4b74-b6f0-eb414ba3849f}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="KrkrPlugin">
+      <UniqueIdentifier>{958ae095-bb06-4568-ac2d-3f8d594c9460}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Detours">
+      <UniqueIdentifier>{a9097175-9ff1-4420-9881-f5e971100d6b}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="dllmain.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Common\encoding.cpp">
+      <Filter>Commom</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Common\file.cpp">
+      <Filter>Commom</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Common\log.cpp">
+      <Filter>Commom</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Common\path.cpp">
+      <Filter>Commom</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Common\pe.cpp">
+      <Filter>Commom</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Common\stringhelper.cpp">
+      <Filter>Commom</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Common\util.cpp">
+      <Filter>Commom</Filter>
+    </ClCompile>
+    <ClCompile Include="..\KrkrPlugin\tp_stub.cpp">
+      <Filter>KrkrPlugin</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Detours\creatwth.cpp">
+      <Filter>Detours</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Detours\detours.cpp">
+      <Filter>Detours</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Detours\disasm.cpp">
+      <Filter>Detours</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Detours\image.cpp">
+      <Filter>Detours</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Detours\modules.cpp">
+      <Filter>Detours</Filter>
+    </ClCompile>
+    <ClCompile Include="Application.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="ExtractCore.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Common\directory.cpp">
+      <Filter>Commom</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\Common\encoding.h">
+      <Filter>Commom</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Common\file.h">
+      <Filter>Commom</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Common\log.h">
+      <Filter>Commom</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Common\path.h">
+      <Filter>Commom</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Common\pe.h">
+      <Filter>Commom</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Common\stringhelper.h">
+      <Filter>Commom</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Common\util.h">
+      <Filter>Commom</Filter>
+    </ClInclude>
+    <ClInclude Include="..\KrkrPlugin\tp_stub.h">
+      <Filter>KrkrPlugin</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Detours\detours.h">
+      <Filter>Detours</Filter>
+    </ClInclude>
+    <ClInclude Include="Application.h">
+      <Filter>源文件</Filter>
+    </ClInclude>
+    <ClInclude Include="ExtractApi.h">
+      <Filter>源文件</Filter>
+    </ClInclude>
+    <ClInclude Include="ExtractCore.h">
+      <Filter>源文件</Filter>
+    </ClInclude>
+    <ClInclude Include="ExtendUtils.h">
+      <Filter>源文件</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Common\directory.h">
+      <Filter>Commom</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="export.def">
+      <Filter>源文件</Filter>
+    </None>
+  </ItemGroup>
+</Project>

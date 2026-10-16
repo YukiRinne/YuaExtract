@@ -1,0 +1,128 @@
+#pragma code_page(65001)
+// Microsoft Visual C++ generated resource script.
+//
+#include "resource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 2 resource.
+//
+#include "winres.h"
+
+/////////////////////////////////////////////////////////////////////////////
+#undef APSTUDIO_READONLY_SYMBOLS
+
+/////////////////////////////////////////////////////////////////////////////
+// 中文(简体，中国) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_CHS)
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
+
+#ifdef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// TEXTINCLUDE
+//
+
+1 TEXTINCLUDE 
+BEGIN
+    "resource.h\0"
+END
+
+2 TEXTINCLUDE 
+BEGIN
+    "#include \"\"winres.h\"\"\r\n"
+    "\0"
+END
+
+3 TEXTINCLUDE 
+BEGIN
+    "\r\n"
+    "\0"
+END
+
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Icon
+//
+
+// Icon with lowest ID value placed first to ensure application icon
+// remains consistent on all systems.
+IDI_MainIcon            ICON                    "YuaExtract_1.ico"
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+
+// 上游原版功能窗口。首页的「高级操作 → CxdecExtractorLoader 原版功能」按需打开它，
+// 保留全部旧入口（解包 / 运行时恢复 / Hook 撞库 / 提取Key / 封包）。
+IDD_MainForm DIALOGEX 0, 0, 261, 190
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "YuaExtract - 原版功能"
+FONT 9, "微软雅黑", 400, 0, 0x86
+BEGIN
+    PUSHBUTTON      "加载解包模块",IDC_Extractor,38,17,185,14,NOT WS_TABSTOP
+    PUSHBUTTON      "加载运行时恢复Hash映射模块",IDC_StringDumper,38,42,185,14,NOT WS_TABSTOP
+    PUSHBUTTON      "加载Hook撞库恢复Hash映射模块",IDC_HashRestore,38,67,185,14,NOT WS_TABSTOP
+    PUSHBUTTON      "提取Key",IDC_KeyStatic,38,92,185,14,NOT WS_TABSTOP
+    PUSHBUTTON      "封包（目录 → XP3）",IDC_Repack,38,117,185,14,NOT WS_TABSTOP
+    LTEXT           "提取进度",IDC_KeyProgressLabel,25,150,40,10
+    CONTROL         "",IDC_KeyProgress,"msctls_progress32",WS_BORDER | WS_TABSTOP,25,163,180,12
+    LTEXT           "0%",IDC_KeyProgressText,214,151,20,10
+END
+
+// IDD_SelectExe（双击启动时的独立拖放窗口）已废弃：
+// 目标 exe 现在直接在 YuaExtract 主界面里选择，主窗口自己接受拖放，不再需要这个弹窗。
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// DESIGNINFO
+//
+
+#ifdef APSTUDIO_INVOKED
+GUIDELINES DESIGNINFO
+BEGIN
+    IDD_MainForm, DIALOG
+    BEGIN
+        LEFTMARGIN, 7
+        RIGHTMARGIN, 254
+        VERTGUIDE, 76
+        VERTGUIDE, 185
+        TOPMARGIN, 7
+        BOTTOMMARGIN, 119
+    END
+END
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// AFX_DIALOG_LAYOUT
+//
+
+IDD_MainForm AFX_DIALOG_LAYOUT
+BEGIN
+    0
+END
+
+#endif    // 中文(简体，中国) resources
+/////////////////////////////////////////////////////////////////////////////
+
+
+
+#ifndef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 3 resource.
+//
+
+
+/////////////////////////////////////////////////////////////////////////////
+#endif    // not APSTUDIO_INVOKED

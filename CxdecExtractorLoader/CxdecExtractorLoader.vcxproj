@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>16.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{26785597-4b94-439f-ae7e-4f41a4010be1}</ProjectGuid>
+    <RootNamespace>CxdecExtractorLoader</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>CxdecExtractorLoader</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <OutDir>$(SolutionDir)Debug\</OutDir>
+    <LinkIncremental>true</LinkIncremental>
+    <ManagedAssembly>false</ManagedAssembly>
+    <EmbedManifest>true</EmbedManifest>
+    <GenerateManifest>true</GenerateManifest>
+    <LinkDelaySign>false</LinkDelaySign>
+    <!-- 产品名是 YuaExtract：输出 exe 跟着改名，工程/目录名保持上游原样，便于对照。 -->
+    <TargetName>YuaExtract</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <LinkIncremental>false</LinkIncremental>
+    <GenerateManifest>true</GenerateManifest>
+    <EmbedManifest>true</EmbedManifest>
+    <ManagedAssembly>false</ManagedAssembly>
+    <LinkDelaySign>false</LinkDelaySign>
+    <OutDir>$(SolutionDir)Release\</OutDir>
+    <IntDir>$(ProjectDir)$(Configuration)\</IntDir>
+    <TargetName>YuaExtract</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <PreprocessorDefinitions>_WIN32_WINNT=0x601;WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+      <AdditionalIncludeDirectories>$(SolutionDir)Detours;$(SolutionDir)Common;$(SolutionDir)CxdecRepacker;$(SolutionDir)CxdecRepacker\third_party\zlib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <SDLCheck>false</SDLCheck>
+      <GuardEHContMetadata>false</GuardEHContMetadata>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <OpenMPSupport>false</OpenMPSupport>
+      <EnableModules>false</EnableModules>
+      <CompileAsManaged>false</CompileAsManaged>
+      <CompileAsWinRT>false</CompileAsWinRT>
+      <MultiProcessorCompilation>false</MultiProcessorCompilation>
+      <ControlFlowGuard>false</ControlFlowGuard>
+      <CreateHotpatchableImage>false</CreateHotpatchableImage>
+      <BuildStlModules>false</BuildStlModules>
+      <EnableParallelCodeGeneration>false</EnableParallelCodeGeneration>
+      <FloatingPointExceptions>false</FloatingPointExceptions>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <PreventDllBinding>false</PreventDllBinding>
+      <RandomizedBaseAddress>false</RandomizedBaseAddress>
+      <DataExecutionPrevention>false</DataExecutionPrevention>
+      <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
+      <GenerateWindowsMetadata>false</GenerateWindowsMetadata>
+      <WindowsMetadataLinkDelaySign>false</WindowsMetadataLinkDelaySign>
+      <SupportNobindOfDelayLoadedDLL>true</SupportNobindOfDelayLoadedDLL>
+      <CETCompat>false</CETCompat>
+      <EnableUAC>false</EnableUAC>
+      <LargeAddressAware>false</LargeAddressAware>
+    </Link>
+    <Manifest>
+      <VerboseOutput>false</VerboseOutput>
+    </Manifest>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>_WIN32_WINNT=0x601;WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+      <AdditionalIncludeDirectories>$(SolutionDir)Detours;$(SolutionDir)Common;$(SolutionDir)CxdecRepacker;$(SolutionDir)CxdecRepacker\third_party\zlib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <CompileAsManaged>false</CompileAsManaged>
+      <SDLCheck>false</SDLCheck>
+      <OpenMPSupport>false</OpenMPSupport>
+      <GuardEHContMetadata>false</GuardEHContMetadata>
+      <EnableModules>false</EnableModules>
+      <CompileAsWinRT>false</CompileAsWinRT>
+      <OmitFramePointers>false</OmitFramePointers>
+      <ControlFlowGuard>false</ControlFlowGuard>
+      <FloatingPointExceptions>false</FloatingPointExceptions>
+      <CreateHotpatchableImage>false</CreateHotpatchableImage>
+      <GuardSignedReturns>
+      </GuardSignedReturns>
+      <EnableParallelCodeGeneration>false</EnableParallelCodeGeneration>
+      <MultiProcessorCompilation>false</MultiProcessorCompilation>
+      <BuildStlModules>false</BuildStlModules>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <PreventDllBinding>false</PreventDllBinding>
+      <RandomizedBaseAddress>false</RandomizedBaseAddress>
+      <DataExecutionPrevention>false</DataExecutionPrevention>
+      <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
+      <GenerateWindowsMetadata>false</GenerateWindowsMetadata>
+      <SupportUnloadOfDelayLoadedDLL>
+      </SupportUnloadOfDelayLoadedDLL>
+      <WindowsMetadataLinkDelaySign>false</WindowsMetadataLinkDelaySign>
+      <LargeAddressAware>false</LargeAddressAware>
+      <CETCompat>false</CETCompat>
+      <SupportNobindOfDelayLoadedDLL>true</SupportNobindOfDelayLoadedDLL>
+      <EnableUAC>false</EnableUAC>
+      <ImportLibrary>$(IntDir)$(TargetName).lib</ImportLibrary>
+      <ProgramDatabaseFile>$(IntDir)$(TargetName).pdb</ProgramDatabaseFile>
+    </Link>
+    <Manifest>
+      <VerboseOutput>false</VerboseOutput>
+    </Manifest>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\Common\directory.cpp" />
+    <ClCompile Include="..\Common\encoding.cpp" />
+    <ClCompile Include="..\Common\file.cpp" />
+    <ClCompile Include="..\Common\log.cpp" />
+    <ClCompile Include="..\Common\path.cpp" />
+    <ClCompile Include="..\Common\pe.cpp" />
+    <ClCompile Include="..\Common\stringhelper.cpp" />
+    <ClCompile Include="..\Common\util.cpp" />
+    <!-- 扩展集内核。SipHash-2-4 直接用 CxdecRepacker 里那份已验证的实现，
+         不另抄一份，避免与 CxdecRepacker\core\resource_hash.cpp 的口径分叉。 -->
+    <ClCompile Include="ExtensionSet.cpp" />
+    <ClCompile Include="..\CxdecRepacker\crypto\siphash.cpp" />
+    <!-- 仓库自带的 zlib（deflate/compress 已编进 CxdecRepacker.dll），不引任何第三方依赖。
+         gz* 那四个文件是 gz 文件 API，扩展集用不上，不登记。 -->
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\adler32.c" />
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\compress.c" />
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\crc32.c" />
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\deflate.c" />
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\infback.c" />
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\inffast.c" />
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\inflate.c" />
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\inftrees.c" />
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\trees.c" />
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\uncompr.c" />
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\zutil.c" />
+    <ClCompile Include="..\Detours\creatwth.cpp" />
+    <ClCompile Include="..\Detours\detours.cpp" />
+    <ClCompile Include="..\Detours\disasm.cpp" />
+    <ClCompile Include="..\Detours\image.cpp" />
+    <ClCompile Include="..\Detours\modules.cpp" />
+    <ClCompile Include="CxdecExtractorLoader.cpp" />
+    <ClCompile Include="detour_section.cpp" />
+    <ClCompile Include="Blake2s.cpp" />
+    <ClCompile Include="HashNameMiner.cpp" />
+    <ClCompile Include="HashNameRestorer.cpp" />
+    <ClCompile Include="YuaExtractWorkspace.cpp" />
+    <ClCompile Include="YuaExtractMainWindow.cpp" />
+    <ClCompile Include="YuaRestoreWindow.cpp" />
+    <!-- 扩展集「在线更新」：WinHTTP 拉取 + 信任链校验（§14）。winhttp.lib 在 .cpp 里用
+         #pragma comment(lib, ...) 带上，链接项不动。 -->
+    <ClCompile Include="OnlineUpdate.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\Common\directory.h" />
+    <ClInclude Include="..\Common\encoding.h" />
+    <ClInclude Include="..\Common\file.h" />
+    <ClInclude Include="..\Common\diag.h" />
+    <ClInclude Include="..\Common\log.h" />
+    <ClInclude Include="..\Common\logdir.h" />
+    <ClInclude Include="..\Common\path.h" />
+    <ClInclude Include="..\Common\pe.h" />
+    <ClInclude Include="..\Common\stringhelper.h" />
+    <ClInclude Include="..\Common\util.h" />
+    <ClInclude Include="..\Detours\detours.h" />
+    <ClInclude Include="..\CxdecRepacker\crypto\siphash.h" />
+    <ClInclude Include="..\CxdecRepacker\third_party\zlib\zlib.h" />
+    <ClInclude Include="..\CxdecRepacker\third_party\zlib\zconf.h" />
+    <ClInclude Include="..\CxdecRepacker\third_party\zlib\crc32.h" />
+    <ClInclude Include="..\CxdecRepacker\third_party\zlib\deflate.h" />
+    <ClInclude Include="..\CxdecRepacker\third_party\zlib\inffast.h" />
+    <ClInclude Include="..\CxdecRepacker\third_party\zlib\inffixed.h" />
+    <ClInclude Include="..\CxdecRepacker\third_party\zlib\inflate.h" />
+    <ClInclude Include="..\CxdecRepacker\third_party\zlib\inftrees.h" />
+    <ClInclude Include="..\CxdecRepacker\third_party\zlib\trees.h" />
+    <ClInclude Include="..\CxdecRepacker\third_party\zlib\zutil.h" />
+    <ClInclude Include="resource.h" />
+    <ClInclude Include="ExtensionSet.h" />
+    <ClInclude Include="Blake2s.h" />
+    <ClInclude Include="HashNameMiner.h" />
+    <ClInclude Include="HashNameRestorer.h" />
+    <ClInclude Include="YuaExtractWorkspace.h" />
+    <ClInclude Include="YuaExtractHost.h" />
+    <ClInclude Include="YuaExtractMainWindow.h" />
+    <ClInclude Include="YuaRestoreWindow.h" />
+    <ClInclude Include="OnlineUpdate.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="CxdecExtractorLoader.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="YuaExtract_1.ico" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

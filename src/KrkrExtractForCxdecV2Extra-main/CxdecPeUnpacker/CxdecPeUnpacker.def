@@ -1,0 +1,5 @@
+LIBRARY CxdecPeUnpacker
+EXPORTS
+    CxdecPeUnpacker_Detect
+    CxdecPeUnpacker_Process
+    CxdecPeUnpacker_LastError

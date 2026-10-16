@@ -1,0 +1,182 @@
+﻿#pragma once
+
+#include <Windows.h>
+#include <string>
+#include <unordered_set>
+#include "tp_stub.h"
+#include "log.h"
+
+namespace Engine
+{
+
+	// Hash接口
+	class IStringHasher
+	{
+	public:
+		//IStringHasher::Calculate接口  fastcall模拟thiscall
+		using tCalculate = tjs_int(__fastcall*)(IStringHasher* thisObj, void* unuseEdx, tTJSVariant* hashValueRet, const tTJSString* str, const tTJSString* seed);
+
+		// 虚表结构
+		struct VptrTable
+		{
+			void* Destruct;			//析构
+			tCalculate Calculate;	//计算Hash
+		};
+
+	private:
+		// vtable 偏移 0x00
+		tjs_uint8* mSalt;   //盐指针   offset:0x04
+		tjs_int mSaltSize;	//盐大小   offset:0x08
+	public:
+		virtual ~IStringHasher() = 0;
+		// Hash计算
+		// hashValueRet：返回值；str：字符串；seed：种子；返回 Hash长度
+		virtual tjs_int Calculate(tTJSVariant* hashValueRet, const tTJSString* str, const tTJSString* seed) = 0;
+
+	public:
+		// 获取盐的长度
+		tjs_int GetSaltLength() const;
+		// 获取盐数据指针
+		const tjs_uint8* GetSaltBytes() const;
+
+		// 获取虚表指针 (Hook用)
+		VptrTable* GetVptrTable();
+		// 设置虚表指针 (Hook用)
+		void SetVptrTable(const VptrTable* vt);
+
+		IStringHasher() = delete;
+		IStringHasher(const IStringHasher&) = delete;
+		IStringHasher(IStringHasher&&) = delete;
+		IStringHasher& operator=(const IStringHasher&) = delete;
+		IStringHasher& operator=(IStringHasher&&) = delete;
+	};
+
+	// 文件路径Hash接口
+	class PathNameHasher : public IStringHasher
+	{
+	private:
+		// IStringHasher 基类偏移 0x00
+		tjs_uint8 mSaltData[0x10]; //盐数据 offset:0x0C
+
+	public:
+		PathNameHasher() = delete;
+		PathNameHasher(const PathNameHasher&) = delete;
+		PathNameHasher(PathNameHasher&&) = delete;
+		PathNameHasher& operator=(const PathNameHasher&) = delete;
+		PathNameHasher& operator=(PathNameHasher&&) = delete;
+	};
+
+	// 文件名Hash接口
+	class FileNameHasher : public IStringHasher
+	{
+	private:
+		// IStringHasher 基类偏移 0x00
+		tjs_uint8 mSaltData[0x20]; //盐数据 offset:0x0C
+
+	public:
+		FileNameHasher() = delete;
+		FileNameHasher(const FileNameHasher&) = delete;
+		FileNameHasher(FileNameHasher&&) = delete;
+		FileNameHasher& operator=(const FileNameHasher&) = delete;
+		FileNameHasher& operator=(FileNameHasher&&) = delete;
+	};
+
+
+	//Cxdec插件储存管理 size = 0x60
+	// CompoundStorageMedia 继承 iTVPStorageMedia
+	struct CompoundStorageMedia
+	{
+		void* VptrTable;					//0x00
+		int RefCount;						//0x04
+		DWORD field_8;						//0x08
+		tTJSString PreFix;					//0x0C  资源前缀
+		tTJSString HasherSeed;				//0x10	Hash盐
+		CRITICAL_SECTION CriticalSection;	//0x14	临界区锁
+
+		//0x2C  已加载资源表
+		//std::unorder_map<tTJSString, FileEntry> ArchiveEntryLoaded
+		BYTE Reserve[0x20];
+
+		//0x4C	已加载封包名字
+		//std::vector<tTJSString>  PackageLoaded
+		tTJSString* Start;
+		tTJSString* Position;
+		tTJSString* End;
+
+		//0x58	路径Hash对象
+		IStringHasher* PathNameHasher;
+
+		//0x5C  文件名Hash对象
+		IStringHasher* FileNameHasher;
+	};
+
+
+	class HashCore
+	{
+	public:
+		using tCreateCompoundStorageMedia = tjs_error(__cdecl*)(CompoundStorageMedia** retTVPStorageMedia, tTJSVariant* tjsVarPrefix, int argc, void* argv);
+
+		// 挂钩 TVPStorageMedia创建
+		friend tjs_error __cdecl HookCreateCompoundStorageMedia(CompoundStorageMedia** retTVPStorageMedia, tTJSVariant* tjsVarPrefix, int argc, void* argv);
+		// 挂钩 文件夹路径计算
+		friend tjs_int __fastcall HookPathNameHasherCalcute(IStringHasher* thisObj, void* unusedEdx, tTJSVariant* hashValueRet, const tTJSString* str, const tTJSString* seed);
+		// 挂钩 文件名计算
+		friend tjs_int __fastcall HookFileNameHasherCalcute(IStringHasher* thisObj, void* unusedEdx, tTJSVariant* hashValueRet, const tTJSString* str, const tTJSString* seed);
+
+	private:
+		static constexpr const wchar_t FolderName[] = L"StringHashDumper_Output";			//字符串Dump文件夹
+		static constexpr const wchar_t DirectoryHashFileName[] = L"DirectoryHash.log";		//Dump路径日志文件名
+		static constexpr const wchar_t FileNameHashFileName[] = L"FileNameHash.log";		//Dump文件名日志文件名
+		static constexpr const wchar_t UniversalFileName[] = L"Universal.log";				//通用日志文件名
+
+	private:
+		static constexpr const char CreateCompoundStorageMediaSignature[] = "\x55\x8B\xEC\x6A\xFF\x68\x2A\x2A\x2A\x2A\x64\xA1\x00\x00\x00\x00\x50\x83\xEC\x08\x56\xA1\x2A\x2A\x2A\x2A\x33\xC5\x50\x8D\x45\xF4\x64\xA3\x00\x00\x00\x00\xA1\x2A\x2A\x2A\x2A\x85\xC0\x75\x12\x68\x2A\x2A\x2A\x2A\xE8\x2A\x2A\x2A\x2A\x83\xC4\x04\xA3\x2A\x2A\x2A\x2A\x8B\x75\x0C\x56\xFF\xD0\x83\xF8\x02\x74\x2A\xB8\x15\xFC\xFF\xFF\x8B\x4D\xF4\x64\x89\x0D\x00\x00\x00\x00\x59\x5E\x8B\xE5\x5D\xC3";
+		static constexpr const wchar_t Split[] = L"##YSig##";		//输出分隔符
+
+		std::wstring mDumperDirectoryPath;			//Dump输出目录
+		std::wstring mLogDirectoryPath;				//会话日志目录（统一 Log 目录）；空 = 跟着输出目录
+		Log::Logger mDirectoryHashLogger;			//文件夹Hash日志
+		Log::Logger mFileNameHashLogger;			//文件名Hash日志
+		Log::Logger mUniversalLogger;				//通用日志
+		std::unordered_set<std::wstring> mKnownDirectoryHashLines;	//已记录的文件夹Hash行
+		std::unordered_set<std::wstring> mKnownFileNameHashLines;	//已记录的文件名Hash行
+		CRITICAL_SECTION mHashLineLock;				//Hash日志去重锁
+
+	private:
+		HashCore();
+		HashCore(const HashCore&) = delete;
+		HashCore(HashCore&&) = delete;
+		HashCore& operator=(const HashCore&) = delete;
+		HashCore& operator=(HashCore&&) = delete;
+		~HashCore();
+
+	public:
+
+		// 设置Hash表输出路径
+		// directory：文件夹绝对路径
+		void SetOutputDirectory(const std::wstring& directory);
+		// 会话日志（Universal.log / HashCrack.log）的目录。
+		// 要在 SetHashOutputDirectory **之前**调用；不调就落在输出目录里。
+		// DirectoryHash.log / FileNameHash.log 是**映射库产物**（会被读回去），
+		// 永远留在输出目录，不受这里影响。
+		void SetLogDirectory(const std::wstring& directory);
+		// 当前会话日志目录（HashCrack 那条路径也要往里写）
+		const std::wstring& GetLogDirectoryPath() const { return mLogDirectoryPath; }
+		void SetHashOutputDirectory(const std::wstring& directory);
+		void WriteDirectoryHash(const std::wstring& relativeDirPath, const std::wstring& hash);
+		void WriteFileNameHash(const std::wstring& fileName, const std::wstring& hash);
+
+		// 初始化 (特征码找接口)
+		// codeVa：代码起始地址；codeSize：代码大小
+		void Initialize(PVOID codeVa, DWORD codeSize);
+		// 检查是否已经初始化
+		// 返回 True已初始化 False未初始化
+		bool IsInitialized();
+
+
+		// 获取对象实例
+		static HashCore* GetInstance();
+		// 释放
+		static void Release();
+	};
+}
