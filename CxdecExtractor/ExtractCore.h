@@ -66,8 +66,8 @@ namespace Engine
         static constexpr const wchar_t ExtractorLogFileName[] = L"Extractor.log";        //提取器日志文件名
 
 	private:
-		// 白盒回归宿主（_verify/restore-harness/safety-tests）访问私有纯函数用；
-		// 不导出、不改变生产行为。
+			// 仅供内部白盒测试访问私有纯函数；不导出、不改变生产行为。
+
 		friend struct ExtractCoreTestAccess;
 
 		// 运行时通过签名扫描宿主插件，定位实际负责建索引和开流的内部函数。

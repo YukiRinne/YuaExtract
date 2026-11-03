@@ -379,16 +379,17 @@ Release_old/
 README_add.txt
 
 # ---- YuaExtract 本仓库追加 ----
-# 验证脚手架的临时产物（Run\ 可随时重生成；_verify 本体进仓库）
-_verify/restore-harness/Run/
-_verify/restore-harness/_build/
-_verify/realgame-test/
-# 上游源码备份 zip（内容已在 refs\ / upstream-release\ 展开存放）
+# 本地验证、内部文档、上游参考副本与旧产物不进入公开源码树
+_verify/
+docs/
+refs/
+src/
+upstream-release/
 *.zip
-# 产品运行时产物（合成/真实工作区都会生成）
+*_scratch.vcxproj
+
+# 产品运行时产物
 ExtractKey_Output/
 # Python 字节码
 __pycache__/
 *.pyc
-
-# GitHub Actions 本地不跑；上游 zip 与构建产物已排除（见上）

@@ -4,7 +4,7 @@
 
 基于 KrkrExtractForCxdecV2Extra 重制界面，提供 XP3 解包、动态 Hash 收集、离线资源名还原，以及可复用的扩展集。
 
-[下载发行包](https://github.com/YukiRinne/YuaExtract/releases) · [构建记录](https://github.com/YukiRinne/YuaExtract/actions) · [社区扩展集](https://github.com/YukiRinne/Yua-Extensions) · [问题反馈](https://github.com/YukiRinne/YuaExtract/issues)
+[下载发行包](https://github.com/YukiRinne/YuaExtract/releases) · [构建记录](https://github.com/YukiRinne/YuaExtract/actions) · [社区扩展集](https://github.com/YukiRinne/Yua-Extensions)
 
 > 仅用于合法副本的学习研究、兼容性分析、个人备份、汉化与资源修复。动态提取会启动游戏并注入模块；部分密钥派生还会执行游戏内嵌代码。请只处理可信的目标文件，**本工具不是沙箱**。
 
@@ -67,8 +67,6 @@ CxdecExtractordll/
 
 安装会在替换前检查现有清单，并对普通写入失败尝试回滚；无法回滚时保留备份并报告。**这不等于跨文件的断电或进程崩溃原子性保证。**
 
-更多细节见 [扩展集设计](docs/扩展集设计.md)。
-
 ## 安全与行为变化
 
 2026-11 的审计修复覆盖路径、解析边界、文件事务、后台任务与原生执行授权：
@@ -82,7 +80,7 @@ CxdecExtractordll/
 - **替换与注入如实报错。** `steam_api.dll` 替换需先确认并创建唯一备份，失败尝试回滚；远程模块加载失败不再被报告为成功。
 - **运行时模块不支持动态卸载。** 注入模块按目标进程生命周期保持加载。
 
-完整说明和验收边界见 [审计修复说明](docs/审计修复说明.md)。建议普通权限运行；处理真实游戏前另行备份游戏目录及已有工作成果。
+建议普通权限运行；处理真实游戏前另行备份游戏目录及已有工作成果。
 
 ## 从源码构建
 
@@ -102,33 +100,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Release 构建失败' }
 
 GitHub Actions 在 `main` 更新时构建 Release / Debug 并提供工作流产物。**源码推送不等于发布新版 Releases**；仓库的发行流程由 `v*` 标签触发。
 
-## 回归验证
-
-2026-11-03 本轮本地验收结果：
-
-| 验证项 | 结果 |
-| --- | --- |
-| 整个解决方案 Release / Debug x86 重建 | 均通过，日志中 0 警告、0 错误 |
-| 路径、还原、XP3、PE 与流读取安全测试 | 161 / 161 |
-| 扩展集、事务与暂存安全测试 | 129 / 129 |
-| 原生授权与运行时完整性测试 | 29 项汇总检查全部通过 |
-| 任务生命周期测试 | 4 组全部通过 |
-| 原有还原 / 补充与关窗测试 | 31 / 31、37 / 37 |
-
-合成 GUI 验收覆盖 201 个封包、804 个源文件：默认输出 603 个资源及报告，保留模式保存未知资源；源文件哈希保持不变，同源输出被拒绝，窗口正常关闭。
-
-安全回归入口如下，详细前置条件见各测试目录说明：
-
-```powershell
-pwsh -NoProfile -File _verify\restore-harness\safety-tests\run-security-core.ps1
-pwsh -NoProfile -File _verify\restore-harness\security-extension\run-security-extension.ps1
-pwsh -NoProfile -File _verify\security-lifecycle\security-lifecycle-run-tests.ps1
-```
-
-原生授权回归入口是 [`_verify/security-native/run-tests.ps1`](_verify/security-native/run-tests.ps1)，运行前需准备该脚本要求的被测模块，或通过 `-KeyStaticDir`、`-RepackerDir`、`-CliDir` 指向构建产物。测试数据使用合成夹具，产物与日志写入被 Git 忽略的目录。
-
-**未验证或不保证的范围：** 本轮未执行真实游戏原生派生、真实注入 / Hook、真实 HTTPS 下载或系统证书安装；主机权限和卷配置限制了文件符号链接及 8.3 短文件名的动态覆盖。以上测试结果不是对所有游戏、系统版本或断电恢复的保证。
-
 ## 代码结构
 
 ```text
@@ -141,8 +112,6 @@ CxdecKeyStatic/           静态密钥派生
 CxdecRepacker/            XP3 重封包与参数管理
 CxdecCli/                 命令行辅助工具
 CxdecPeUnpacker/          PE 解析与相关辅助流程
-docs/                     设计、使用与审计说明
-_verify/                  回归脚手架、合成夹具生成器与测试源码
 ```
 
 CLI 与 `CxdecRepacker.dll`、`CxdecKeyStatic.dll` 应位于同一目录。查看命令帮助：
@@ -150,16 +119,6 @@ CLI 与 `CxdecRepacker.dll`、`CxdecKeyStatic.dll` 应位于同一目录。查�
 ```powershell
 .\Release\CxdecExtractordll\CxdecCli.exe help
 ```
-
-## 文档与反馈
-
-- [资源名还原流程](docs/hash-restore-workflow.md)
-- [扩展集设计](docs/扩展集设计.md)
-- [界面与模块说明](docs/YuaExtract-UI升级说明.md)
-- [审计修复说明](docs/审计修复说明.md)
-- [社区扩展集仓库](https://github.com/YukiRinne/Yua-Extensions)
-
-反馈问题时请说明工具版本或提交号、Windows 版本、目标引擎信息、操作步骤，以及经过脱敏的错误日志。不要上传游戏资源本体、密钥、令牌或未经许可的可执行文件。
 
 ## 致谢与许可
 

@@ -1,6 +1,6 @@
 #include "ExtensionSet.h"
 
-// 扩展集内核（一期：同游戏闭环）。接口与口径说明见 ExtensionSet.h，设计依据见 docs\扩展集设计.md。
+// 扩展集内核（一期：同游戏闭环）。接口与口径说明见 ExtensionSet.h。
 //
 // 本文件的骨架按数据流分节：
 //   1) 基础工具（编码、路径、文件、CRC32、SHA-256、zlib 包装）
@@ -1139,7 +1139,7 @@ namespace Yua
 
             // 目录名：'\' -> '/'、小写、补结尾斜杠、根域记 "/"。
             // 幂等（先削掉所有结尾分隔符再补一个），所以 "system" 与 "system/" 都折成 "system/"。
-            // 与 docs\hxv4\02-资源名与哈希.md §3「目录字符串带结尾斜杠、且是小写」一致。
+            // 目录字符串使用小写形式并保留结尾斜杠。
             std::wstring NormalizeDirectoryImpl(const std::wstring& raw)
             {
                 std::wstring value = TrimSpaces(raw);
