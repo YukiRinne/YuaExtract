@@ -92,7 +92,7 @@ jobs:
         run: |
           gh release create "${{ github.ref_name }}" `
             "KrkrExtractForCxdecV2-${{ github.ref_name }}.zip" `
-            --title "${{ github.ref_name }}" --generate-notes
+            --title "${{ github.ref_name }}" --notes-from-tag
 
   # 排查用：保留编译中间产物（.pdb/.lib/.exp），不打 tag 也不发版。
   debug:
