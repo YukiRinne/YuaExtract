@@ -28,6 +28,10 @@ struct PackOptions {
     int32_t open_flag_override = -1;
     // 仓库里没有这个 EXE 的参数时，是否现场派生（调同目录的 CxdecKeyStatic）。默认开。
     bool auto_derive = true;
+    // 是否允许现场派生时执行游戏内嵌的 BOOTSTRAP DLL。**默认 false**。
+    // 只有调用方（用户）显式授权后才置 true；false 时如果仓库里没有参数，
+    // pack_static 直接失败，不会回落到内置参数生成一个看着成功、实际错误的包。
+    bool allow_native_execution = false;
 };
 
 struct PackReport {

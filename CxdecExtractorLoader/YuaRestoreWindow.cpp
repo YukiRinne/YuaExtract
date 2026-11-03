@@ -1,4 +1,4 @@
-// YuaExtract 步骤3「资源名还原」窗口实现。
+﻿// YuaExtract 步骤3「资源名还原」窗口实现。
 //
 // 结构照 CxdecExtractorUI/BatchExtractorUI.cpp（"按队列 + N 工作线程 + 任务列表 +
 // 详细日志"的现成实现）来，但有两点关键差别：
@@ -13,6 +13,7 @@
 #include "YuaRestoreWindow.h"
 
 #include "HashNameRestorer.h"
+#include "PathSafety.h"
 #include "YuaExtractHost.h"
 #include "YuaExtractWorkspace.h"
 
@@ -22,6 +23,9 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <exception>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -202,7 +206,13 @@ namespace
         bool SupplementPending = false;  // true = Pass 1 结束后要跑挖掘再来 Pass 2
         unsigned int PassNumber = 1;     // 当前是第几遍（1 = 普通还原遍）
         std::vector<RestorePackageResult> FirstPassResults; // Pass 1 各封包结果（报告合并用）
-        std::set<std::wstring> FirstPassDelivered;          // Pass 1 已交付的目标（Pass 2 跳过用）
+        // Pass 1 已交付的**源**集合（只用于计数/日志）与"源 → 实际目标"记录。
+        // 第二遍不再按目标路径跳过：目标名可能因新映射而变，按目标跳过会把真名交付误判成已做过。
+        std::set<std::wstring> FirstPassDelivered;
+        std::map<std::wstring, std::wstring> FirstPassPreviousDeliveries;
+        // 启动时一次性从控件读出的选项快照。工作线程绝不访问 HWND / SendMessage。
+        bool SnapshotKeepUnrestored = false;
+        bool SnapshotInferSupplement = false;
         // **防重入闸门**：语义是"挖掘线程正在跑"（true 期间共享映射表在被改写）。
         // 挖完在 kMsgSupplementDone 里清、窗口销毁时在 join 之后清；OnStart 也拿它拒重入。
         // watchdog 每次进来都必须先看它：挖掘期间第一遍的任务表还全是终态，不挡住就会把
@@ -372,6 +382,19 @@ namespace
 
     // ---------- 任务表 ----------
 
+    // RAII 临界区：任何 wstring/vector 赋值抛异常都不会把锁留在持有状态。
+    // 会分配内存的锁区（任务快照拷贝、push_back、映射表合并）一律用它，
+    // 不再手写 Enter/Leave 对。
+    struct ScopedCriticalSection
+    {
+        CRITICAL_SECTION* Lock;
+        explicit ScopedCriticalSection(CRITICAL_SECTION* lock) : Lock(lock) { ::EnterCriticalSection(Lock); }
+        ~ScopedCriticalSection() { ::LeaveCriticalSection(Lock); }
+        ScopedCriticalSection(const ScopedCriticalSection&) = delete;
+        ScopedCriticalSection& operator=(const ScopedCriticalSection&) = delete;
+    };
+    using QueueLockGuard = ScopedCriticalSection;
+
     int FindTaskIndexLocked(UiContext* context, unsigned int taskId)
     {
         for (size_t index = 0; index < context->Tasks.size(); ++index)
@@ -426,9 +449,10 @@ namespace
         }
 
         TaskRecord snapshot;
-        ::EnterCriticalSection(&context->QueueLock);
-        snapshot = context->Tasks[static_cast<size_t>(taskIndex)];
-        ::LeaveCriticalSection(&context->QueueLock);
+        {
+            ScopedCriticalSection guard(&context->QueueLock);
+            snapshot = context->Tasks[static_cast<size_t>(taskIndex)];
+        }
 
         int row = FindListRowByTaskId(context->TaskList, snapshot.Id);
         if (row < 0)
@@ -464,20 +488,21 @@ namespace
         unsigned long long aggregate = 0u;
         size_t total = 0u;
 
-        ::EnterCriticalSection(&context->QueueLock);
-        total = context->Tasks.size();
-        for (const TaskRecord& task : context->Tasks)
         {
-            switch (task.State)
+            ScopedCriticalSection guard(&context->QueueLock);
+            total = context->Tasks.size();
+            for (const TaskRecord& task : context->Tasks)
             {
-                case kStateQueued: ++queued; break;
-                case kStateRunning: ++running; break;
-                case kStateCompleted: ++completed; break;
-                case kStateFailed: ++failed; break;
+                switch (task.State)
+                {
+                    case kStateQueued: ++queued; break;
+                    case kStateRunning: ++running; break;
+                    case kStateCompleted: ++completed; break;
+                    case kStateFailed: ++failed; break;
+                }
+                aggregate += ComputeTaskProgressPercent(task.Step, task.Percent);
             }
-            aggregate += ComputeTaskProgressPercent(task.Step, task.Percent);
         }
-        ::LeaveCriticalSection(&context->QueueLock);
 
         const unsigned int percent =
             total > 0u ? static_cast<unsigned int>(aggregate / total) : 0u;
@@ -521,6 +546,64 @@ namespace
         }
     }
 
+    // FinishRun 的异常兜底：只做不分配内存的收尾（停线程、放闸门、恢复按钮）。
+    // 走这里说明报告/汇总阶段抛了（例如 std::bad_alloc）；算法结果可能不完整，
+    // 但绝不能把锁/线程状态留在半截，也不能让异常穿出窗口过程。
+    void FinishRunFallbackNoThrow(UiContext* context)
+    {
+        if (!context)
+        {
+            return;
+        }
+        ::SetEvent(context->StopEvent);
+        if (context->QueueEvent)
+        {
+            ::SetEvent(context->QueueEvent);
+        }
+        for (HANDLE worker : context->Workers)
+        {
+            ::WaitForSingleObject(worker, INFINITE);
+            ::CloseHandle(worker);
+        }
+        context->Workers.clear();
+        if (context->MiningThread)
+        {
+            ::WaitForSingleObject(context->MiningThread, INFINITE);
+            ::CloseHandle(context->MiningThread);
+            context->MiningThread = nullptr;
+            context->InSupplementMining = false;
+        }
+        {
+            ScopedCriticalSection guard(&context->QueueLock);
+            for (TaskRecord& task : context->Tasks)
+            {
+                if (task.State == kStateRunning)
+                {
+                    task.State = kStateFailed;
+                    task.Finished = true;
+                }
+            }
+        }
+        context->Running = false;
+        context->FinishIssued = false;
+        context->ActiveWorkers = 0u;
+        if (context->QueueEvent)
+        {
+            ::ResetEvent(context->QueueEvent);
+        }
+        if (context->Window)
+        {
+            ::KillTimer(context->Window, kWatchdogTimerId);
+        }
+        SetInputsEnabled(context, true);
+        if (context->StatusText)
+        {
+            ::SetWindowTextW(context->StatusText,
+                             L"还原收尾时发生内部错误，已停止工作线程（结果可能不完整）。");
+        }
+        NotifyOwner(context, kStateFailed, 0u);
+    }
+
     // 全部任务收尾之后跑一次：汇总写报告、停线程、刷新界面。
     void FinishRun(UiContext* context)
     {
@@ -529,6 +612,8 @@ namespace
             return;
         }
 
+        try
+        {
         RestoreReportData report;
         report.sourceDirectory = context->SourceDirectory;
         report.hashDirectory = context->HashDirectory;
@@ -543,7 +628,7 @@ namespace
 
         unsigned int failed = 0u;
         {
-            ::EnterCriticalSection(&context->QueueLock);
+            ScopedCriticalSection guard(&context->QueueLock);
             for (const TaskRecord& task : context->Tasks)
             {
                 if (task.Finished)
@@ -555,7 +640,6 @@ namespace
                     }
                 }
             }
-            ::LeaveCriticalSection(&context->QueueLock);
         }
 
         // 两遍式：把第一遍（普通还原）的结果并进报告。两个 pass 的**交付集互斥**
@@ -623,7 +707,7 @@ namespace
         context->Workers.clear();
 
         {
-            ::EnterCriticalSection(&context->QueueLock);
+            ScopedCriticalSection guard(&context->QueueLock);
             for (TaskRecord& task : context->Tasks)
             {
                 if (task.State == kStateRunning)
@@ -641,7 +725,6 @@ namespace
                     task.Percent = 100u;
                 }
             }
-            ::LeaveCriticalSection(&context->QueueLock);
         }
 
         for (size_t index = 0; index < context->Tasks.size(); ++index)
@@ -718,6 +801,12 @@ namespace
         }
 
         NotifyOwner(context, failed > 0u ? kStateFailed : kStateCompleted, 100u);
+        }
+        catch (...)
+        {
+            // 报告/汇总的 std::alloc 或其它异常：退回无分配收尾，绝不穿出窗口过程。
+            FinishRunFallbackNoThrow(context);
+        }
     }
 
     // 两遍式的第一段（界面线程）：收集第一遍成果 → 打第一遍还原率 → 起挖掘线程 → 立即返回。
@@ -728,6 +817,7 @@ namespace
     // 返回 false 表示窗口正在关闭，调用方应直接走收尾。
     bool StartPass2(UiContext* context);
     DWORD WINAPI SupplementMiningThreadProc(LPVOID parameter);
+    bool StopRequested(UiContext* context);
 
     // 界面线程判定"没有正在跑的任务"就收尾。这不是主路径（主路径是最后一个工作线程
     // 自己投递 kMsgRunFinished），而是"投递被丢弃"时的兜底 —— 只要界面还能收到定时器，
@@ -744,19 +834,28 @@ namespace
             return;
         }
 
-        bool allFinished = true;
-        ::EnterCriticalSection(&context->QueueLock);
-        const bool runningWorker = context->ActiveWorkers > 0u;
-        const bool queueEmpty = context->Queue.empty();
-        for (const TaskRecord& task : context->Tasks)
+        // 用户已停止（关窗 / 中止）：不再判定收尾、更不许起挖掘或第二遍。
+        if (StopRequested(context))
         {
-            if (!task.Finished)
+            return;
+        }
+
+        bool allFinished = true;
+        bool runningWorker = false;
+        bool queueEmpty = false;
+        {
+            ScopedCriticalSection guard(&context->QueueLock);
+            runningWorker = context->ActiveWorkers > 0u;
+            queueEmpty = context->Queue.empty();
+            for (const TaskRecord& task : context->Tasks)
             {
-                allFinished = false;
-                break;
+                if (!task.Finished)
+                {
+                    allFinished = false;
+                    break;
+                }
             }
         }
-        ::LeaveCriticalSection(&context->QueueLock);
 
         if (allFinished && !runningWorker && queueEmpty)
         {
@@ -792,23 +891,28 @@ namespace
         // 1) 收集第一遍的成果：结果（写报告合并用）+ 已交付目标（第二遍跳过用）。
         context->FirstPassResults.clear();
         context->FirstPassDelivered.clear();
+        context->FirstPassPreviousDeliveries.clear();
         {
-            ::EnterCriticalSection(&context->QueueLock);
+            ScopedCriticalSection guard(&context->QueueLock);
             for (const TaskRecord& task : context->Tasks)
             {
                 if (task.Finished)
                 {
                     context->FirstPassResults.push_back(task.Result);
-                    for (const std::wstring& target : task.Result.deliveredRelative)
+                    for (const RestoreDelivery& delivery : task.Result.deliveries)
                     {
-                        context->FirstPassDelivered.insert(target);
+                        if (delivery.sourceRelative.empty() || delivery.targetRelative.empty())
+                        {
+                            continue;
+                        }
+                        context->FirstPassDelivered.insert(delivery.sourceRelative);
+                        context->FirstPassPreviousDeliveries[delivery.sourceRelative] = delivery.targetRelative;
                     }
                 }
             }
-            ::LeaveCriticalSection(&context->QueueLock);
         }
-        LogLine(context, false, L"第一遍交付 %s 个文件，作为推理补充还原的跳过基线。",
-                FormatCount(static_cast<unsigned long long>(context->FirstPassDelivered.size())).c_str());
+        LogLine(context, false, L"第一遍交付 %s 个源文件，作为推理补充还原的比对基线。",
+                FormatCount(static_cast<unsigned long long>(context->FirstPassPreviousDeliveries.size())).c_str());
 
         // 2) 第一遍还原率。分母取"哈希名文件"（真正需要还原的那批），不是文件总数 ——
         //    要还多少、还原出来多少，这两个数才是用户想看的比例。0 个哈希名文件时写
@@ -857,28 +961,29 @@ namespace
         // 重置任务表，把所有封包重新排队（Pass 2）。
         const std::vector<RestorePackageTask> packages = EnumerateRestorePackages(context->SourceDirectory);
         ListView_DeleteAllItems(context->TaskList);
-        ::EnterCriticalSection(&context->QueueLock);
-        context->Tasks.clear();
-        context->Queue.clear();
-        context->NextTaskId = 1u;
-        for (const RestorePackageTask& package : packages)
         {
-            TaskRecord task;
-            task.Id = context->NextTaskId++;
-            task.PackageName = package.packageName;
-            task.PackageDirectory = package.packageDirectory;
-            task.RootLevel = package.rootLevel;
-            task.FileCount = package.fileCount;
-            task.Bytes = package.bytes;
-            task.State = kStateQueued;
-            task.Step = RestoreProgressStep::Queued;
-            task.Percent = 0u;
-            task.Info = FormatString(L"推理补充还原遍（第一遍已交付 %u 个）",
-                                     static_cast<unsigned int>(context->FirstPassDelivered.size()));
-            context->Tasks.push_back(task);
-            context->Queue.push_back(task.Id);
+            ScopedCriticalSection guard(&context->QueueLock);
+            context->Tasks.clear();
+            context->Queue.clear();
+            context->NextTaskId = 1u;
+            for (const RestorePackageTask& package : packages)
+            {
+                TaskRecord task;
+                task.Id = context->NextTaskId++;
+                task.PackageName = package.packageName;
+                task.PackageDirectory = package.packageDirectory;
+                task.RootLevel = package.rootLevel;
+                task.FileCount = package.fileCount;
+                task.Bytes = package.bytes;
+                task.State = kStateQueued;
+                task.Step = RestoreProgressStep::Queued;
+                task.Percent = 0u;
+                task.Info = FormatString(L"推理补充还原遍（第一遍已交付 %u 个）",
+                                         static_cast<unsigned int>(context->FirstPassDelivered.size()));
+                context->Tasks.push_back(task);
+                context->Queue.push_back(task.Id);
+            }
         }
-        ::LeaveCriticalSection(&context->QueueLock);
 
         for (size_t index = 0; index < context->Tasks.size(); ++index)
         {
@@ -904,45 +1009,58 @@ namespace
 
     // ---------- 工作线程 ----------
 
+    bool StopRequested(UiContext* context)
+    {
+        return context->Closed || ::WaitForSingleObject(context->StopEvent, 0) == WAIT_OBJECT_0;
+    }
+
     bool PopNextTask(UiContext* context, unsigned int& taskId)
     {
         bool hasTask = false;
-        ::EnterCriticalSection(&context->QueueLock);
-        if (!context->Queue.empty())
+        QueueLockGuard guard(&context->QueueLock);
+        if (StopRequested(context))
+        {
+            // 停止后**不再取后续包**：把还在排队的任务从队列里取消掉，一份都不再开始。
+            context->Queue.clear();
+        }
+        else if (!context->Queue.empty())
         {
             taskId = context->Queue.front();
             context->Queue.erase(context->Queue.begin());
             hasTask = true;
         }
-        if (context->Queue.empty())
+        if (context->Queue.empty() && context->QueueEvent)
         {
             ::ResetEvent(context->QueueEvent);
         }
-        ::LeaveCriticalSection(&context->QueueLock);
         return hasTask;
     }
 
     void PublishProgress(UiContext* context, unsigned int taskId, RestoreProgressStep step,
                          unsigned int percent, const std::wstring& entry)
     {
-        // 任务记录永远先更新：它是唯一事实来源，界面重画时读的就是它。
-        ::EnterCriticalSection(&context->QueueLock);
-        const int index = FindTaskIndexLocked(context, taskId);
-        if (index >= 0)
+        try
         {
-            TaskRecord& task = context->Tasks[static_cast<size_t>(index)];
-            task.Step = step;
-            task.Percent = percent;
-            if (!entry.empty())
+        // 任务记录永远先更新：它是唯一事实来源，界面重画时读的就是它。
+        int index = -1;
+        {
+            QueueLockGuard guard(&context->QueueLock);
+            index = FindTaskIndexLocked(context, taskId);
+            if (index >= 0)
             {
-                task.CurrentEntry = entry;
-            }
-            if (task.State == kStateQueued)
-            {
-                task.State = kStateRunning;
+                TaskRecord& task = context->Tasks[static_cast<size_t>(index)];
+                task.Step = step;
+                task.Percent = percent;
+                if (!entry.empty())
+                {
+                    task.CurrentEntry = entry;
+                }
+                if (task.State == kStateQueued)
+                {
+                    task.State = kStateRunning;
+                }
             }
         }
-        ::LeaveCriticalSection(&context->QueueLock);
 
         if (index < 0)
         {
@@ -954,11 +1072,19 @@ namespace
         if (step == RestoreProgressStep::Restoring)
         {
             const DWORD now = ::GetTickCount();
-            if (static_cast<DWORD>(now - context->LastProgressPostTick) < kProgressThrottleMs)
+            bool throttled = false;
+            {
+                QueueLockGuard guard(&context->QueueLock);
+                throttled = static_cast<DWORD>(now - context->LastProgressPostTick) < kProgressThrottleMs;
+                if (!throttled)
+                {
+                    context->LastProgressPostTick = now;
+                }
+            }
+            if (throttled)
             {
                 return;
             }
-            context->LastProgressPostTick = now;
         }
 
         // 这条消息只影响"实时感"。丢了大不了界面下一帧照任务记录画。
@@ -980,6 +1106,11 @@ namespace
         {
             ::HeapFree(::GetProcessHeap(), 0, message);
         }
+        }
+        catch (...)
+        {
+            // 进度只是"实时感"：记录更新失败也不能让工作线程带着锁/异常退出。
+        }
     }
 
     // 写终态。这是"任务终态由工作线程按返回值决定"的落点：
@@ -987,8 +1118,12 @@ namespace
     void PublishTerminalState(UiContext* context, unsigned int taskId, RestoreTaskState state,
                               const RestorePackageResult& result, DWORD elapsedMs)
     {
-        ::EnterCriticalSection(&context->QueueLock);
-        const int index = FindTaskIndexLocked(context, taskId);
+        try
+        {
+        int index = -1;
+        {
+        QueueLockGuard guard(&context->QueueLock);
+        index = FindTaskIndexLocked(context, taskId);
         if (index >= 0)
         {
             TaskRecord& task = context->Tasks[static_cast<size_t>(index)];
@@ -1006,7 +1141,7 @@ namespace
             }
             task.Info += FormatString(L"，耗时 %u ms", elapsedMs);
         }
-        ::LeaveCriticalSection(&context->QueueLock);
+        }
 
         if (index < 0)
         {
@@ -1031,6 +1166,11 @@ namespace
                 ::HeapFree(::GetProcessHeap(), 0, message);
             }
         }
+        }
+        catch (...)
+        {
+            // 终态写失败不能在 worker 里向 std::terminate 逃逸。
+        }
     }
 
     DWORD WINAPI WorkerThreadProc(LPVOID parameter)
@@ -1038,79 +1178,172 @@ namespace
         UiContext* context = static_cast<UiContext*>(parameter);
         HANDLE waitHandles[2]{ context->StopEvent, context->QueueEvent };
 
-        while (true)
+        unsigned int currentTaskId = 0u;
+        bool workerCounted = false;
+        const auto releaseWorkerSlot = [&]()
         {
-            unsigned int taskId = 0u;
-            if (!PopNextTask(context, taskId))
+            if (!workerCounted)
             {
-                // 队列空了。等新任务或停止信号。
-                // StopEvent 必须排在前面：QueueEvent 是手动重置事件，收尾时会一直保持
-                // 置位，只等它就会变成 100% 占着 CPU 的死循环。
-                const DWORD waitResult = ::WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
-                if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_FAILED)
+                return;
+            }
+            {
+                ScopedCriticalSection guard(&context->QueueLock);
+                --context->ActiveWorkers;
+            }
+            workerCounted = false;
+        };
+        // 顶层异常兜底：只做不分配内存的终态写入（不改 Info / PackageName），
+        // 保证 ActiveWorkers 一定归还，且异常绝不穿出 CreateThread 线程体。
+        const auto markCurrentTaskFailedNoThrow = [&]()
+        {
+            if (currentTaskId == 0u)
+            {
+                return;
+            }
+            ScopedCriticalSection guard(&context->QueueLock);
+            const int index = FindTaskIndexLocked(context, currentTaskId);
+            if (index >= 0)
+            {
+                TaskRecord& task = context->Tasks[static_cast<size_t>(index)];
+                if (!task.Finished)
+                {
+                    task.State = kStateFailed;
+                    task.Step = RestoreProgressStep::Finishing;
+                    task.Percent = 100u;
+                    task.Finished = true;
+                }
+            }
+        };
+
+        try
+        {
+            while (true)
+            {
+                currentTaskId = 0u;
+                if (StopRequested(context))
                 {
                     break;
                 }
-                continue;
-            }
-
-            ::InterlockedIncrement(&context->ActiveWorkers);
-
-            TaskRecord snapshot;
-            {
-                ::EnterCriticalSection(&context->QueueLock);
-                const int index = FindTaskIndexLocked(context, taskId);
-                if (index >= 0)
+                unsigned int taskId = 0u;
+                if (!PopNextTask(context, taskId))
                 {
-                    snapshot = context->Tasks[static_cast<size_t>(index)];
+                    if (StopRequested(context))
+                    {
+                        break;
+                    }
+                    // 队列空了。等新任务或停止信号。
+                    // StopEvent 必须排在前面：QueueEvent 是手动重置事件，收尾时会一直保持
+                    // 置位，只等它就会变成 100% 占着 CPU 的死循环。
+                    const DWORD waitResult = ::WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+                    if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_FAILED)
+                    {
+                        break;
+                    }
+                    continue;
                 }
-                ::LeaveCriticalSection(&context->QueueLock);
-            }
+                currentTaskId = taskId;
 
-            if (snapshot.Id == 0u)
+                TaskRecord snapshot;
+                {
+                    ScopedCriticalSection guard(&context->QueueLock);
+                    ++context->ActiveWorkers;
+                    workerCounted = true;
+                    const int index = FindTaskIndexLocked(context, taskId);
+                    if (index >= 0)
+                    {
+                        snapshot = context->Tasks[static_cast<size_t>(index)];
+                    }
+                }
+
+                if (snapshot.Id == 0u)
+                {
+                    releaseWorkerSlot();
+                    currentTaskId = 0u;
+                    continue;
+                }
+
+                PublishProgress(context, taskId, RestoreProgressStep::Restoring, 0u, L"准备中");
+
+                RestorePackageTask packageTask;
+                packageTask.packageName = snapshot.PackageName;
+                packageTask.packageDirectory = snapshot.PackageDirectory;
+                packageTask.rootLevel = snapshot.RootLevel;
+                packageTask.fileCount = snapshot.FileCount;
+                packageTask.bytes = snapshot.Bytes;
+
+                // 选项在每个工作线程里各拷一份，**全部来自启动时的快照**。
+                // 工作线程绝不 SendMessage 到控件：窗口销毁后那条同步消息会永远等不到界面线程。
+                RestoreOptions taskOptions;
+                taskOptions.sourceDirectory = context->SourceDirectory;
+                taskOptions.outputDirectory = context->OutputDirectory;
+                taskOptions.logDirectory = context->LogDirectory;
+                taskOptions.keepUnrestored = context->SnapshotKeepUnrestored;
+                // 两遍式的第二遍：把第一遍的"源 → 实际目标"记录交给内核。
+                // 内核按源判断是否已交付、并在同一源改到新目标时只清理本源自己的旧落点；
+                // UI 不再用目标路径集合跳过（目标名在两遍之间可能变）。
+                taskOptions.previousDeliveries = context->FirstPassPreviousDeliveries;
+                taskOptions.cancelRequested = [context]()
+                { return ::WaitForSingleObject(context->StopEvent, 0) == WAIT_OBJECT_0; };
+                taskOptions.progress = [context, taskId](unsigned int percent, const std::wstring& entry)
+                { PublishProgress(context, taskId, RestoreProgressStep::Restoring, percent, entry); };
+
+                RestorePackageResult result;
+                result.packageName = snapshot.PackageName;
+                result.totalFiles = snapshot.FileCount;
+                const DWORD started = ::GetTickCount();
+                try
+                {
+                    result = RestoreSinglePackage(packageTask, context->Tables, taskOptions);
+                }
+                catch (const std::exception& exception)
+                {
+                    result = RestorePackageResult{};
+                    result.packageName = snapshot.PackageName;
+                    result.totalFiles = snapshot.FileCount;
+                    result.succeeded = false;
+                    result.completed = true;
+                    result.info = L"任务抛出异常，未完成";
+                    (void)exception;
+                }
+                catch (...)
+                {
+                    result = RestorePackageResult{};
+                    result.packageName = snapshot.PackageName;
+                    result.totalFiles = snapshot.FileCount;
+                    result.succeeded = false;
+                    result.completed = true;
+                    result.info = L"任务抛出未知异常，未完成";
+                }
+                const DWORD elapsed = static_cast<DWORD>(::GetTickCount() - started);
+
+                // 终态：先写记录，再发消息。消息丢了也不影响这一行的最终状态。
+                PublishTerminalState(context, taskId,
+                                     result.succeeded ? kStateCompleted : kStateFailed, result, elapsed);
+
+                releaseWorkerSlot();
+                currentTaskId = 0u;
+                ::PostMessageW(context->Window, kMsgWatchdog, 0, 0);
+
+                // 用户已经中止：不再取下一个包（即使队列里还有）。
+                if (StopRequested(context))
+                {
+                    break;
+                }
+            }
+        }
+        catch (...)
+        {
+            markCurrentTaskFailedNoThrow();
+            releaseWorkerSlot();
+            currentTaskId = 0u;
+            // 通知界面来刷（失败也刷新一次的兜底）；窗口没了就通知 owner 稍后重读报告。
+            if (::PostMessageW(context->Window, kMsgWatchdog, 0, 0) == FALSE)
             {
-                ::InterlockedDecrement(&context->ActiveWorkers);
-                continue;
+                NotifyOwner(context, kStateFailed, 0u);
             }
-
-            PublishProgress(context, taskId, RestoreProgressStep::Restoring, 0u, L"准备中");
-
-            RestorePackageTask packageTask;
-            packageTask.packageName = snapshot.PackageName;
-            packageTask.packageDirectory = snapshot.PackageDirectory;
-            packageTask.rootLevel = snapshot.RootLevel;
-            packageTask.fileCount = snapshot.FileCount;
-            packageTask.bytes = snapshot.Bytes;
-
-            // 选项在每个工作线程里各拷一份：勾选框在运行期间是禁用的，
-            // 读一次就固定下来，工作线程之间不会看到不同的值。
-            RestoreOptions taskOptions;
-            taskOptions.sourceDirectory = context->SourceDirectory;
-            taskOptions.outputDirectory = context->OutputDirectory;
-            taskOptions.logDirectory = context->LogDirectory;
-            taskOptions.keepUnrestored =
-                ::SendMessageW(context->KeepCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            // 两遍式的第二遍：第一遍已交付的目标直接跳过（只补漏，不重拷不造副本）。
-            // 集合在启动第二遍前由界面线程填好，工作线程全程只读。
-            taskOptions.alreadyDelivered = context->FirstPassDelivered;
-            taskOptions.cancelRequested = [context]()
-            { return ::WaitForSingleObject(context->StopEvent, 0) == WAIT_OBJECT_0; };
-            taskOptions.progress = [context, taskId](unsigned int percent, const std::wstring& entry)
-            { PublishProgress(context, taskId, RestoreProgressStep::Restoring, percent, entry); };
-
-            const DWORD started = ::GetTickCount();
-            const RestorePackageResult result =
-                RestoreSinglePackage(packageTask, context->Tables, taskOptions);
-            const DWORD elapsed = static_cast<DWORD>(::GetTickCount() - started);
-
-            // 终态：先写记录，再发消息。消息丢了也不影响这一行的最终状态。
-            PublishTerminalState(context, taskId,
-                                 result.succeeded ? kStateCompleted : kStateFailed, result, elapsed);
-
-            ::InterlockedDecrement(&context->ActiveWorkers);
-            ::PostMessageW(context->Window, kMsgWatchdog, 0, 0);
         }
 
+        releaseWorkerSlot();
         return 0u;
     }
 
@@ -1121,6 +1354,15 @@ namespace
         if (output.empty())
         {
             Host::ShowInfo(context->Window, L"请先填写还原输出目录。");
+            return false;
+        }
+        std::wstring why;
+        if (!PathSafety::ValidateWriteRoots(context->SourceDirectory, output, &why))
+        {
+            // 与内核同一套真实路径 / 尾点 / 嵌套判定：UI 不能假开始后再让 core 拒绝。
+            Host::ShowError(context->Window,
+                            L"输出目录与解包目录不安全：\r\n" + (why.empty() ? output : why) +
+                                L"\r\n\r\n请换一个与解包目录不相交、无尾点/重解析点的目录。");
             return false;
         }
         if (_wcsicmp(output.c_str(), context->SourceDirectory.c_str()) == 0 ||
@@ -1191,27 +1433,54 @@ namespace
     {
         UiContext* context = static_cast<UiContext*>(parameter);
 
-        SupplementOptions options;
-        options.sourceDirectory = context->SourceDirectory;
-        options.outputDirectory = context->OutputDirectory;
-        options.logDirectory = context->LogDirectory;
-        options.minedListPath = context->MinedListPath;
-        // Closed 只在 WM_DESTROY 里、join 本线程**之后**才写，所以这里读它是安全的。
-        options.cancelRequested = [context]()
-        {
-            return context->Closed ||
-                   ::WaitForSingleObject(context->StopEvent, 0) == WAIT_OBJECT_0;
-        };
-
-        SupplementOutcome outcome =
-            RunSupplementRestore(context->Tables, options,
-                                 [context](const SupplementProgress& progress)
-                                 { PublishSupplementProgress(context, progress); });
-
         // 结论交给界面线程：它负责写日志、更新映射计数、启动第二遍。
         // 载荷用 new 而不是 HeapAlloc —— SupplementOutcome 里有 std::wstring，
         // HeapAlloc 只给裸内存、不跑构造函数，字符串会在第一次赋值时崩掉。
-        SupplementOutcome* payload = new (std::nothrow) SupplementOutcome(outcome);
+        SupplementOutcome* payload = nullptr;
+        try
+        {
+            // 停止后绝不再挖：窗口关闭时 StopEvent 已置位，直接投一条空结论放闸门。
+            if (StopRequested(context))
+            {
+                payload = new (std::nothrow) SupplementOutcome();
+                if (payload)
+                {
+                    payload->attempted = false;
+                }
+            }
+            else
+            {
+                SupplementOptions options;
+                options.sourceDirectory = context->SourceDirectory;
+                options.outputDirectory = context->OutputDirectory;
+                options.logDirectory = context->LogDirectory;
+                options.minedListPath = context->MinedListPath;
+                // Closed 只在 WM_DESTROY 里、join 本线程**之后**才写，所以这里读它是安全的。
+                options.cancelRequested = [context]()
+                {
+                    return context->Closed ||
+                           ::WaitForSingleObject(context->StopEvent, 0) == WAIT_OBJECT_0;
+                };
+
+                SupplementOutcome outcome =
+                    RunSupplementRestore(context->Tables, options,
+                                         [context](const SupplementProgress& progress)
+                                         { PublishSupplementProgress(context, progress); });
+                payload = new (std::nothrow) SupplementOutcome(outcome);
+            }
+        }
+        catch (...)
+        {
+            // std::bad_alloc / 内核异常：仍然要投一条结论，否则界面侧的挖掘闸门
+            // 永远开不了、第二遍与收尾都不会发生。异常本身绝不穿出线程体。
+            payload = new (std::nothrow) SupplementOutcome();
+            if (payload)
+            {
+                payload->attempted = true;
+                payload->message.clear();
+            }
+        }
+
         if (!payload)
         {
             // 连载荷都申请不出来：仍然要投一条空结论，否则界面侧的闸门永远开不了。
@@ -1365,8 +1634,12 @@ namespace
         }
         ::SetWindowTextW(context->WorkerEdit, std::to_wstring(workers).c_str());
 
-        const bool keepUnrestored =
+        // 选项 UI **只在这里读一次**：工作线程拿到的是不可变快照，绝不再碰 HWND。
+        context->SnapshotKeepUnrestored =
             ::SendMessageW(context->KeepCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        context->SnapshotInferSupplement =
+            ::SendMessageW(context->InferCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        const bool keepUnrestored = context->SnapshotKeepUnrestored;
         context->KeepUnrestored = keepUnrestored;
 
         context->OutputDirectory = output;
@@ -1415,6 +1688,7 @@ namespace
         context->PassNumber = 1u;
         context->FirstPassResults.clear();
         context->FirstPassDelivered.clear();
+        context->FirstPassPreviousDeliveries.clear();
         // Pass2Started 必须复位：它只在 CheckRunCompletion 里被置位过，不复位的话
         // 同一个窗口跑第二轮时"第一遍已到终态 + Pass2Started 为 true"会直接收尾，
         // 挖掘和第二遍永远不跑（第二轮静默退化成单遍）。
@@ -1422,8 +1696,7 @@ namespace
         // 上一轮的挖掘结论不能留给这一轮：挖不成（窗口被关/盐不可用）时报告里那一节
         // 必须是"本次没挖"，而不是上一轮的数字。
         context->Supplement = SupplementOutcome();
-        context->SupplementPending =
-            ::SendMessageW(context->InferCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        context->SupplementPending = context->SnapshotInferSupplement;
         if (context->SupplementPending)
         {
             LogLine(context, false,
@@ -1443,28 +1716,29 @@ namespace
         // 上一轮的行全清掉：同一份任务表既能显示"排队中"，也能显示终态，
         // 留着旧行只会让"总任务"这个数字对不上。
         ListView_DeleteAllItems(context->TaskList);
-        ::EnterCriticalSection(&context->QueueLock);
-        context->Tasks.clear();
-        context->Queue.clear();
-        context->NextTaskId = 1u;
-        for (const RestorePackageTask& package : packages)
         {
-            TaskRecord task;
-            task.Id = context->NextTaskId++;
-            task.PackageName = package.packageName;
-            task.PackageDirectory = package.packageDirectory;
-            task.RootLevel = package.rootLevel;
-            task.FileCount = package.fileCount;
-            task.Bytes = package.bytes;
-            task.State = kStateQueued;
-            task.Step = RestoreProgressStep::Queued;
-            task.Percent = 0u;
-            task.Info = FormatString(L"%s 个文件 / %s", FormatCount(package.fileCount).c_str(),
-                                     FormatSize(package.bytes).c_str());
-            context->Tasks.push_back(task);
-            context->Queue.push_back(task.Id);
+            ScopedCriticalSection guard(&context->QueueLock);
+            context->Tasks.clear();
+            context->Queue.clear();
+            context->NextTaskId = 1u;
+            for (const RestorePackageTask& package : packages)
+            {
+                TaskRecord task;
+                task.Id = context->NextTaskId++;
+                task.PackageName = package.packageName;
+                task.PackageDirectory = package.packageDirectory;
+                task.RootLevel = package.rootLevel;
+                task.FileCount = package.fileCount;
+                task.Bytes = package.bytes;
+                task.State = kStateQueued;
+                task.Step = RestoreProgressStep::Queued;
+                task.Percent = 0u;
+                task.Info = FormatString(L"%s 个文件 / %s", FormatCount(package.fileCount).c_str(),
+                                         FormatSize(package.bytes).c_str());
+                context->Tasks.push_back(task);
+                context->Queue.push_back(task.Id);
+            }
         }
-        ::LeaveCriticalSection(&context->QueueLock);
 
         for (size_t index = 0; index < context->Tasks.size(); ++index)
         {
@@ -1716,7 +1990,7 @@ namespace
 
         int index = -1;
         {
-            ::EnterCriticalSection(&context->QueueLock);
+            ScopedCriticalSection guard(&context->QueueLock);
             index = FindTaskIndexLocked(context, message->TaskId);
             if (index >= 0)
             {
@@ -1745,7 +2019,6 @@ namespace
                     }
                 }
             }
-            ::LeaveCriticalSection(&context->QueueLock);
         }
 
         if (index >= 0)
@@ -1756,9 +2029,8 @@ namespace
             // Tasks[]，那是工作线程还在写的容器。
             std::wstring packageName;
             {
-                ::EnterCriticalSection(&context->QueueLock);
+                ScopedCriticalSection guard(&context->QueueLock);
                 packageName = context->Tasks[static_cast<size_t>(index)].PackageName;
-                ::LeaveCriticalSection(&context->QueueLock);
             }
 
             if (message->State == static_cast<unsigned int>(kStateCompleted))

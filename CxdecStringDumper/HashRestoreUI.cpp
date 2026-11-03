@@ -1,4 +1,5 @@
 ﻿#include "HashRestoreUI.h"
+#include "PathSafety.h"
 #include "logdir.h"
 #include "utf8text.h"
 
@@ -1324,7 +1325,8 @@ namespace
                 return candidate;
             }
         }
-        return path;
+        // 候选耗尽：返回空串，调用方记失败；绝不把已占用的路径交回去覆盖用户已有文件。
+        return std::wstring();
     }
 
     void WriteRestoreLog(const std::wstring& logDirectory, const wchar_t* stage, const wchar_t* format, ...)
@@ -1716,17 +1718,69 @@ namespace
                     targetRelative = targetRelative.empty() ? dirIt->second : CombinePath(targetRelative, dirIt->second);
                 }
                 targetRelative = CombinePath(targetRelative, fileIt->second);
-                std::wstring targetPath = MakeUniquePath(CombinePath(restore->SourceDirectory, targetRelative));
+
+                // 二次防线：目标必须仍在 SourceDirectory 下（组件边界、忽略大小写），
+                // 且路径上已有的每一级都不能是 junction/symlink。界面层不做这件事时，
+                // 一条 "../../x" 或一个指向外部的 junction 就能让改名写到源目录外。
+                std::wstring targetFull;
+                std::wstring boundaryWhy;
+                const bool safeTarget = PathSafety::TryResolveUnderRoot(
+                    restore->SourceDirectory, targetRelative, PathSafety::Kind::RelativePath,
+                    targetFull, &boundaryWhy);
 
                 bool moved = false;
-                if (EnsureDirectoryForFile(targetPath))
+                std::wstring targetPath = targetFull;
+                if (safeTarget)
                 {
-                    moved = ::MoveFileW(candidate.SourcePath.c_str(), targetPath.c_str()) != FALSE;
-                    if (!moved)
+                    for (unsigned int attempt = 0u; attempt < 8u && !moved; ++attempt)
                     {
-                        moved = ::CopyFileW(candidate.SourcePath.c_str(), targetPath.c_str(), FALSE) != FALSE
-                            && ::DeleteFileW(candidate.SourcePath.c_str()) != FALSE;
+                        targetPath = MakeUniquePath(targetFull);
+                        if (targetPath.empty())
+                        {
+                            boundaryWhy = L"重名候选耗尽";
+                            break;
+                        }
+                        if (!EnsureDirectoryForFile(targetPath))
+                        {
+                            boundaryWhy = L"建不出目标目录";
+                            break;
+                        }
+                        std::wstring offending;
+                        if (PathSafety::HasReparsePoint(targetPath, &offending))
+                        {
+                            boundaryWhy = L"目标路径上有重解析点：" + offending;
+                            break;
+                        }
+
+                        // MoveFileW 不覆盖已有目标；CopyFile 的第三参数必须是 TRUE，
+                        // 只有复制成功后才删源，失败时源与已存在的目标都保留。
+                        if (::MoveFileW(candidate.SourcePath.c_str(), targetPath.c_str()) != FALSE)
+                        {
+                            moved = true;
+                            break;
+                        }
+                        if (::CopyFileW(candidate.SourcePath.c_str(), targetPath.c_str(), TRUE) != FALSE)
+                        {
+                            if (::DeleteFileW(candidate.SourcePath.c_str()) != FALSE)
+                            {
+                                moved = true;
+                                break;
+                            }
+                            // 复制成功但源删不掉：目标已写成，按失败报出来（源仍在，不会丢）。
+                            boundaryWhy = L"复制成功但删源失败";
+                            break;
+                        }
+                        const DWORD moveError = ::GetLastError();
+                        if (moveError != ERROR_FILE_EXISTS && moveError != ERROR_ALREADY_EXISTS)
+                        {
+                            boundaryWhy = L"落盘失败（错误 " + std::to_wstring(moveError) + L"）";
+                            break;
+                        }
                     }
+                }
+                else if (boundaryWhy.empty())
+                {
+                    boundaryWhy = L"目标越出 SourceDirectory";
                 }
 
                 if (moved)

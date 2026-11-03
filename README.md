@@ -1,115 +1,168 @@
 # YuaExtract
 
-**面向 Wamsoft / KiriKiri Z Hxv4 (2021.11+) / CxdecV2 系列加密游戏的动态分析与资源整理工具**
+**面向 Wamsoft / KiriKiri Z Hxv4 / CxdecV2 系列游戏的资源提取与文件名还原工具。**
 
-解包 · Hash 收集 · 资源名还原 · 扩展集（免跑游戏重复还原）
+基于 KrkrExtractForCxdecV2Extra 重制界面，提供 XP3 解包、动态 Hash 收集、离线资源名还原，以及可复用的扩展集。
 
-[![build](https://img.shields.io/badge/platform-Windows%207%20SP1%2B-blue)](#环境)
-[![arch](https://img.shields.io/badge/arch-x86%20(Win32)-informational)](#环境)
-[![license](https://img.shields.io/badge/license-see%20LICENSE-green)](LICENSE)
+[下载发行包](https://github.com/YukiRinne/YuaExtract/releases) · [构建记录](https://github.com/YukiRinne/YuaExtract/actions) · [社区扩展集](https://github.com/YukiRinne/Yua-Extensions) · [问题反馈](https://github.com/YukiRinne/YuaExtract/issues)
 
----
+> 仅用于合法副本的学习研究、兼容性分析、个人备份、汉化与资源修复。动态提取会启动游戏并注入模块；部分密钥派生还会执行游戏内嵌代码。请只处理可信的目标文件，**本工具不是沙箱**。
 
-## 这是什么
+## 功能
 
-YuaExtract 是 **KrkrExtractForCxdecV2Extra**（KrkrExtractV2 for CxdecV2）的重制版：界面全部重做，并在上游功能之上加了一条
-**「解包 → 动态 Hash 收集 → 离线还原资源名」** 的三步流程。最新版本又加上了**扩展集**：
-把一部游戏已经整理好的「文件名 ↔ 哈希」成果留档，**同一部游戏以后重解包时不再需要跑游戏做动态采集**。
+- **XP3 动态解包**：批量提取封包资源，保存到 `Extractor_Output`。
+- **动态 Hash 收集**：运行游戏并记录明文资源名与哈希的对应关系。
+- **离线资源名还原**：结合映射恢复目录、文件名与后缀，复制到独立输出目录，保持源解包目录不变。
+- **扩展集制作与复用**：把已有名字与哈希整理为 `rules.int`，同一部游戏再次处理时可离线生成映射，省去重复动态采集。
+- **扩展集在线更新**：按用户操作从社区仓库获取、校验和安装档案，不自动后台联网。
+- **辅助工具**：静态 Key 提取、XP3 重封包、参数文件管理及命令行调试。
 
+兼容性取决于游戏的引擎版本、加密实现与可用映射；不保证所有游戏都能处理，也不保证固定还原率。
+
+## 下载与运行
+
+从 [Releases](https://github.com/YukiRinne/YuaExtract/releases) 下载完整发行压缩包，解压后运行 `YuaExtract.exe`。不要只复制主程序：各功能依赖相邻的模块目录。
+
+```text
+YuaExtract.exe
+CxdecExtractordll/
+  CxdecExtractor.dll
+  CxdecStringDumper.dll
+  CxdecKeyStatic.dll
+  CxdecRepacker.dll
+  CxdecCli.exe
+  ...
 ```
-传统三步（首次）：  ① 解包 XP3  →  ② 跑游戏收集 Hash  →  ③ 还原资源名
-扩展集（以后）：    ① 从扩展集生成静态 Hash 表  →  ② 解包 XP3  →  ③ 还原资源名
-                                              ↑ 不用再跑游戏
-```
 
-## 主要功能
+建议使用 Windows 10 / 11。项目沿用 Windows 7 SP1 的目标设置，但本轮验证在 Windows 11 上完成，未重新验证 Windows 7 兼容性。程序与注入模块均为 **x86 / Win32**，不面向 64 位游戏进程。
 
-- **XP3 动态解包** — 批量解包游戏封包，产出哈希名的 `Extractor_Output`
-- **动态 Hash 收集** — 启动游戏并注入模块，实时记录「明文名 ↔ Hash」对应关系
-- **资源名还原** — 按收集到的映射离线还原目录名、文件名、后缀，实测成功率 90% 以上
-- **静态 Key 提取** — 不启动游戏、不注入、不依赖 Frida/Python，直接从游戏 EXE 派生密钥材料
-- **扩展集**（新增）— 「名字 ↔ 哈希」知识档案（`rules.int`）：留档、干跑测试、装库、
-  **从社区仓库在线更新**，同一部游戏重解包免跑采集
+## 使用流程
 
-## 扩展集（本版本的旗舰功能）
+### 首次处理：传统动态模式
 
-一部游戏的扩展集 = 这部游戏「哪些哈希对应哪些名字」的知识档案（`rules.int`，只含名字与哈希，
-**不含任何游戏资源**）。
+1. 打开工具，选择目标游戏主程序，在首页选择「传统动态模式」。
+2. **步骤 1：解包 XP3。** 提取结果进入工作区的 `Extractor_Output`。
+3. **步骤 2：收集 Hash。** 按界面提示运行游戏，访问需要还原的资源以收集名字映射。
+4. **步骤 3：还原资源名。** 在独立还原窗口选择映射和输出目录，运行后查看 `RestoreReport.txt`。
 
-- **制作**：「制作扩展集」页签一键生成 —— 合并采集/还原成果 → 归一化 → 生成期自校验（每条
-  「名字+盐→哈希」必须算得回去）→ 压缩留档（一部游戏约 200 KB）
-- **复用**：以后重解包同一部游戏，首页「该作扩展集提取」直接离线展开静态 Hash 表，**免跑游戏**
-- **在线更新**：从社区扩展集仓库 [YukiRinne/Yua-Extensions](https://github.com/YukiRinne/Yua-Extensions)
-  浏览、下载、安装别人整理好的扩展集。安全设计：
-  - 仅 HTTPS、不跟随重定向、三段超时、体积上限
-  - 下载后 **sha256 必须与索引一致**，容器结构 / CRC / 内嵌摘要逐层校验，任一不过即拒且本地零改动
-  - **绝不自动加载、绝不后台联网** —— 入库只是入库，用不用仍由归属校验把关
-- **如实说明**：档案里不存哈希层，工具**验不了"名字对不对"**；信任根是仓库索引，
-  名字的最终把关是**还原率这个事实**
+默认只输出已还原的哈希名资源，同时保留原本就是明文名的文件。若要保留未知资源，勾选「保留未还原文件名的文件」；工具会在可识别时按文件头补后缀。
 
-## 快速开始
+还原采用复制方式，不改写源解包目录。输出目录不得与源目录相同或互相嵌套。目标重名会尝试使用 `__dupN` 保留两份数据，无法找到可用名字时明确报错，不覆盖已有文件。
 
-1. 从 [Releases](../../releases) 下载 `YuaExtract.exe`（或自行构建，见下）
-2. 打开工具，选择目标游戏的主程序 exe
-3. 首次：首页选「传统动态模式」，按提示跑完三步 → 在「制作扩展集」页签把成果**生成扩展集并安装到库**
-4. 以后重解包同一部游戏：首页选「该作扩展集提取」→ 扩展集页签「在线更新」拿到档案 → 三步跑完
+### 再次处理：使用该作扩展集
 
-> 详细口径与设计文档见 [`docs/`](docs/)：[扩展集设计](docs/扩展集设计.md) ·
-> [UI 升级说明](docs/YuaExtract-UI升级说明.md) · [交接说明](docs/交接说明.md)
+完成首次采集与还原后，可在「制作扩展集」页签生成档案并安装到本地库。已有同作扩展集时：
 
-## 构建
+1. 安装自己的档案，或在扩展集页签手动在线获取社区档案。
+2. 首页选择「该作扩展集提取」，通过归属检查后生成静态 Hash 表。
+3. 解包 XP3，再使用生成的映射离线还原。
+
+**扩展集省去的是重复 Hash 采集，不是动态解包本身。** 解包仍可能需要启动游戏并注入模块。
+
+### 扩展集是什么
+
+`rules.int` 保存资源名、盐、归属信息及少量例外映射，常规哈希由名字和盐重新计算；不包含图片、音频或脚本等游戏资源本体。制作时合并已有成果并进行自校验；复用时检查归属后展开映射。
+
+在线下载仅接受 HTTPS，并设有超时与体积上限。工具对照索引检查 SHA-256，验证档案结构、CRC 与相关摘要，再用**同一份已校验字节**安装。校验与摘要不能独立证明每个名字都正确，来源可信度和实际还原结果仍需用户判断。
+
+安装会在替换前检查现有清单，并对普通写入失败尝试回滚；无法回滚时保留备份并报告。**这不等于跨文件的断电或进程崩溃原子性保证。**
+
+更多细节见 [扩展集设计](docs/扩展集设计.md)。
+
+## 安全与行为变化
+
+2026-11 的审计修复覆盖路径、解析边界、文件事务、后台任务与原生执行授权：
+
+- **原生执行默认拒绝。** 静态 Key 提取不启动游戏主进程，但派生路径可能加载游戏内嵌 DLL 并调用其中函数。GUI 需要明确确认；CLI 需要 `--allow-native-code`。授权后代码以工具进程权限运行，不具备沙箱隔离。
+- **优先复用已有参数。** 封包时可以使用已有匹配参数；指定游戏 EXE 但缺少匹配参数时，不再静默回落到无关的内置配置。
+- **路径不越界。** 拒绝目录穿越、危险 Windows 名称和不安全映射；还原、临时目录清理与输出检查防止沿重解析点越出指定范围。
+- **读取与解压有边界。** 对 XP3、PE、资源目录及文本流检查长度、偏移与完整读取；相关解压路径限制输出大小并检查流结束状态。
+- **已有成果优先保全。** 安装与映射历史使用暂存和替换机制；停止补充扫描时不以不完整结果覆盖历史。
+- **取消和关闭不等于完成。** 后台任务持有有效状态直到线程实际退出，过期任务消息被忽略；在线任务取消或关窗后不再安装。
+- **替换与注入如实报错。** `steam_api.dll` 替换需先确认并创建唯一备份，失败尝试回滚；远程模块加载失败不再被报告为成功。
+- **运行时模块不支持动态卸载。** 注入模块按目标进程生命周期保持加载。
+
+完整说明和验收边界见 [审计修复说明](docs/审计修复说明.md)。建议普通权限运行；处理真实游戏前另行备份游戏目录及已有工作成果。
+
+## 从源码构建
+
+需要 Visual Studio 2022 或 Build Tools，安装「使用 C++ 的桌面开发」、MSVC v143 与 Windows 10 SDK。多数项目使用 C++20，Repacker / CLI 保留 C++17；zlib 与 Detours 源码已包含在仓库中。
 
 ```powershell
-# 前置：Visual Studio 2022（MSVC v143）+ Windows 10 SDK 10.0.19041.0+
 git clone https://github.com/YukiRinne/YuaExtract.git
 cd YuaExtract
-Get-Process YuaExtract -ErrorAction SilentlyContinue | Stop-Process -Force   # 防止文件占用
-& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe' `
-  YuaExtract.sln /p:Configuration=Release /p:Platform=x86 /m /v:minimal /nologo
+
+# 如使用完整 Visual Studio，请按实际安装位置调整路径。
+$msbuild = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe'
+& $msbuild YuaExtract.sln /t:Rebuild /p:Configuration=Release /p:Platform=x86 /m /v:minimal /nologo
+if ($LASTEXITCODE -ne 0) { throw 'Release 构建失败' }
 ```
 
-产物在 `Release\YuaExtract.exe`（附 `Release\CxdecExtractordll\` 下的各功能模块）。
+构建前请正常关闭正在使用这些模块的工具与测试程序，避免文件占用。产物位于 `Release\YuaExtract.exe` 与 `Release\CxdecExtractordll\`；调试构建将配置改为 `Debug`，输出位于 `Debug\`。
 
-| 环境 | 要求 |
-|---|---|
-| 系统 | Windows 7 SP1 x64 及以上（推荐 Win10 / Win11） |
-| 工具链 | MSVC 2022 (v143)，C++20，`/utf-8` |
-| 平台 | x86 / Win32 |
-| 第三方依赖 | **无**（BLAKE2s 手写实现；zlib 为仓库内置的 vendored 副本） |
+GitHub Actions 在 `main` 更新时构建 Release / Debug 并提供工作流产物。**源码推送不等于发布新版 Releases**；仓库的发行流程由 `v*` 标签触发。
 
-## 仓库结构
+## 回归验证
 
+2026-11-03 本轮本地验收结果：
+
+| 验证项 | 结果 |
+| --- | --- |
+| 整个解决方案 Release / Debug x86 重建 | 均通过，日志中 0 警告、0 错误 |
+| 路径、还原、XP3、PE 与流读取安全测试 | 161 / 161 |
+| 扩展集、事务与暂存安全测试 | 129 / 129 |
+| 原生授权与运行时完整性测试 | 29 项汇总检查全部通过 |
+| 任务生命周期测试 | 4 组全部通过 |
+| 原有还原 / 补充与关窗测试 | 31 / 31、37 / 37 |
+
+合成 GUI 验收覆盖 201 个封包、804 个源文件：默认输出 603 个资源及报告，保留模式保存未知资源；源文件哈希保持不变，同源输出被拒绝，窗口正常关闭。
+
+安全回归入口如下，详细前置条件见各测试目录说明：
+
+```powershell
+pwsh -NoProfile -File _verify\restore-harness\safety-tests\run-security-core.ps1
+pwsh -NoProfile -File _verify\restore-harness\security-extension\run-security-extension.ps1
+pwsh -NoProfile -File _verify\security-lifecycle\security-lifecycle-run-tests.ps1
 ```
-├─ CxdecExtractorLoader/    主程序 + 扩展集内核（ExtensionSet.*）+ 在线更新层（OnlineUpdate.*）
-├─ CxdecExtractor/          XP3 动态解包核心
-├─ CxdecStringDumper/       动态 Hash 收集模块（注入游戏）
-├─ CxdecHashRestore/        Hook 撞库恢复 Hash 映射
-├─ CxdecKeyStatic/          静态 Key 提取
-├─ CxdecRepacker/           目录重封包 XP3（含 vendored zlib）
-├─ docs/                    设计文档与各轮交接说明
-└─ _verify/restore-harness/ 验证脚手架（合成工作区 + UI 驱动 + 断言 + 假绿护栏）
+
+原生授权回归入口是 [`_verify/security-native/run-tests.ps1`](_verify/security-native/run-tests.ps1)，运行前需准备该脚本要求的被测模块，或通过 `-KeyStaticDir`、`-RepackerDir`、`-CliDir` 指向构建产物。测试数据使用合成夹具，产物与日志写入被 Git 忽略的目录。
+
+**未验证或不保证的范围：** 本轮未执行真实游戏原生派生、真实注入 / Hook、真实 HTTPS 下载或系统证书安装；主机权限和卷配置限制了文件符号链接及 8.3 短文件名的动态覆盖。以上测试结果不是对所有游戏、系统版本或断电恢复的保证。
+
+## 代码结构
+
+```text
+Common/                   路径安全、原子文件、原生执行授权及通用工具
+CxdecExtractorLoader/     主界面、工作区、离线还原、扩展集与在线更新
+CxdecExtractor/           XP3 动态提取
+CxdecStringDumper/        动态 Hash 收集
+CxdecHashRestore/         运行时 Hash 映射恢复
+CxdecKeyStatic/           静态密钥派生
+CxdecRepacker/            XP3 重封包与参数管理
+CxdecCli/                 命令行辅助工具
+CxdecPeUnpacker/          PE 解析与相关辅助流程
+docs/                     设计、使用与审计说明
+_verify/                  回归脚手架、合成夹具生成器与测试源码
 ```
 
-（其余上游模块与完整模块说明见 [docs/YuaExtract-UI升级说明.md](docs/YuaExtract-UI升级说明.md) §4。）
+CLI 与 `CxdecRepacker.dll`、`CxdecKeyStatic.dll` 应位于同一目录。查看命令帮助：
 
-## 相关仓库
+```powershell
+.\Release\CxdecExtractordll\CxdecCli.exe help
+```
 
-- **[YukiRinne/Yua-Extensions](https://github.com/YukiRinne/Yua-Extensions)** — 社区扩展集仓库。
-  工具内置基址指向这里；投稿只需 PR 一份 `rules.int`，CI 自动校验（详见其 README）。
+## 文档与反馈
 
-## 免责声明
+- [资源名还原流程](docs/hash-restore-workflow.md)
+- [扩展集设计](docs/扩展集设计.md)
+- [界面与模块说明](docs/YuaExtract-UI升级说明.md)
+- [审计修复说明](docs/审计修复说明.md)
+- [社区扩展集仓库](https://github.com/YukiRinne/Yua-Extensions)
 
-本项目仅供**学习研究、兼容性分析、个人合法备份、汉化与资源修复**等用途。
-请在你合法拥有的游戏副本上使用；本项目及其产物**不包含、也不应用于传播**任何游戏资源本体。
+反馈问题时请说明工具版本或提交号、Windows 版本、目标引擎信息、操作步骤，以及经过脱敏的错误日志。不要上传游戏资源本体、密钥、令牌或未经许可的可执行文件。
 
-## 致谢
+## 致谢与许可
 
-- **KrkrExtractForCxdecV2Extra**（KrkrExtractV2 for CxdecV2）—— 上游项目，本仓库在其基础上重做界面并扩展功能
-- 各 `Cxdec*` 模块的原作者与贡献者
-- 参考项目：[GARbro](https://github.com/crskycode/GARbro)、[GARbro2](https://github.com/UserUnknownFactor/GARbro2)、
-  [cxdec-hxv4-static-analysis](https://github.com/hktkqj/cxdec-hxv4-static-analysis)
-- 扩展集仓库的第一份档案由 [Rinne](https://github.com/YukiRinne) 整理
+感谢 KrkrExtractForCxdecV2Extra 上游项目及各 `Cxdec*` 模块作者与贡献者。相关参考项目包括 [GARbro](https://github.com/crskycode/GARbro)、[GARbro2](https://github.com/UserUnknownFactor/GARbro2) 和 [cxdec-hxv4-static-analysis](https://github.com/hktkqj/cxdec-hxv4-static-analysis)。
 
-## License
-
-见 [LICENSE](LICENSE)。
+许可条款见 [LICENSE](LICENSE)。第三方组件保留各自的许可声明；本项目不包含或授权传播游戏资源。

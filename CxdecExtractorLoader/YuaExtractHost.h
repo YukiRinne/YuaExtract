@@ -23,6 +23,93 @@ namespace Yua
 {
 namespace Host
 {
+namespace Detail
+{
+    // 有界等待一个句柄，同时保持 owner 窗口可重绘。
+    //
+    // 约束（预检 / 注入路径共用，headless 测试也直接调这一份）：
+    //   - 只从消息队列里取 WM_PAINT / WM_TIMER 并派发，其余消息原样留在队列；
+    //   - WM_CLOSE 只用 PM_NOREMOVE 探测，登记 cancel 后立刻返回，不删除消息对象；
+    //   - WM_QUIT 同样只探测，不 Consume —— 外层消息循环仍能正常退出；
+    //   - 重入调用退化为纯 WaitForSingleObject，避免嵌套泵消息；
+    //   - 超时 / 用户取消 / owner 失效都返回 false，调用方只清理自己新建的 child。
+    inline bool WaitForHandleResponsive(HWND owner, HANDLE handle, ULONGLONG deadline,
+                                        bool& cancelRequested)
+    {
+        cancelRequested = false;
+        if (handle == nullptr || handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        static volatile LONG reentry = 0;
+        if (::InterlockedCompareExchange(&reentry, 1, 0) != 0)
+        {
+            const ULONGLONG now = ::GetTickCount64();
+            const DWORD remaining = deadline > now ? static_cast<DWORD>(deadline - now) : 0u;
+            return ::WaitForSingleObject(handle, remaining) == WAIT_OBJECT_0;
+        }
+        struct ReentryGuard
+        {
+            volatile LONG* Flag;
+            ~ReentryGuard() { ::InterlockedExchange(Flag, 0); }
+        } guard{ &reentry };
+
+        for (;;)
+        {
+            if (owner && !::IsWindow(owner))
+            {
+                cancelRequested = true;
+                return false;
+            }
+            MSG probe{};
+            // 只探测、不移除：WM_CLOSE 仍归原消息循环，预检只负责安全中止。
+            if (owner && ::PeekMessageW(&probe, owner, WM_CLOSE, WM_CLOSE, PM_NOREMOVE))
+            {
+                cancelRequested = true;
+                return false;
+            }
+            // WM_QUIT 是线程消息：不 Consume，等外层循环退出时再处理。
+            if (::PeekMessageW(&probe, nullptr, WM_QUIT, WM_QUIT, PM_NOREMOVE))
+            {
+                cancelRequested = true;
+                return false;
+            }
+
+            const ULONGLONG now = ::GetTickCount64();
+            if (now >= deadline)
+            {
+                return false;
+            }
+            const ULONGLONG remaining = deadline - now;
+            const DWORD slice = remaining > 100ull ? 100u : static_cast<DWORD>(remaining);
+            const DWORD wait =
+                ::MsgWaitForMultipleObjects(1, &handle, FALSE, slice, QS_PAINT | QS_TIMER);
+            if (wait == WAIT_OBJECT_0)
+            {
+                return true;
+            }
+            if (wait == WAIT_FAILED)
+            {
+                return false;
+            }
+
+            MSG message{};
+            while (::PeekMessageW(&message, nullptr, WM_PAINT, WM_PAINT, PM_REMOVE))
+            {
+                ::TranslateMessage(&message);
+                ::DispatchMessageW(&message);
+            }
+            while (::PeekMessageW(&message, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE))
+            {
+                ::TranslateMessage(&message);
+                ::DispatchMessageW(&message);
+            }
+            // 其它消息（输入 / 完成通知等）留在队列，不吞、不派发业务重入。
+        }
+    }
+}
+
     // Loader 自己的会话日志文件名（工具目录\Log\ 下）。
     // 上游叫 CxdecExtractorLoader.log；既然产品改名为 YuaExtract，日志也跟着改，
     // 界面上的「显示详细日志」读的就是这个文件。
@@ -55,18 +142,26 @@ namespace Host
                               const std::wstring& runtimeHashTargetDirectory, std::wstring& error);
 
     // 选定目标后触发上游的 SteamStub 检测/反篡改补丁流程。
-    // 返回 true = 本次调用已交给补丁流程处理（可能生成了 <名字>_crack.exe），
-    // 调用方应当检查 CrackedExePath 并据此决定后续动作。
-    bool PrepareTargetExe(HWND owner, const std::wstring& exePath);
+    // 状态是明确的：调用方不得再把"没产出 _crack.exe"当成可继续。
+    enum class PrepareStatus
+    {
+        Ready = 0,    // 无需补丁（原本就没壳 / 已经补过），可以按原 exe 继续启动
+        Patched = 1,  // 本次确实产出了新的 _crack.exe，应改用 CrackedExePath
+        Cancelled = 2,// 用户在脱壳确认处取消，本次启动应中止
+        Failed = 3    // 检测/脱壳/注入/补丁失败，本次启动应中止并报 error
+    };
+
+    PrepareStatus PrepareTargetExe(HWND owner, const std::wstring& exePath, std::wstring& error);
 
     // 反篡改补丁流程产出的成品：<exePath 去掉扩展名>_crack.exe（存在才返回，否则空串）。
-    // 上游的做法是弹框让用户"把它拖回来继续"，我们直接接上，省掉这次手动操作。
+    // 调用方必须结合 PrepareStatus::Patched 使用，不能把上一次留下的旧文件当成本次成功。
     std::wstring CrackedExePath(const std::wstring& exePath);
 
     // 上游原版功能窗口（解包 / 运行时恢复 / Hook 撞库 / 提取Key / 封包）。
     void ShowLegacyFunctionsWindow(HWND owner);
     // 静态 Key 提取（等价于原版窗口里的「提取Key」）。
-    void RunStaticKeyExtractionForTarget(HWND owner);
+    // 会在执行前明确确认"将运行游戏内嵌原生代码"；返回 true = 用户确认且提取成功。
+    bool RunStaticKeyExtractionForTarget(HWND owner);
 
     void EnableDropOnWindow(HWND hwnd);
 

@@ -35,6 +35,9 @@ DripProgram derive_drip_program(
     uint32_t rva_manager_ctor,
     uint32_t rva_bootstrap_derive,
     uint32_t rva_archive_derive,
-    uint32_t rva_hashkey_derive);
+    uint32_t rva_hashkey_derive,
+    // 默认 false：任何直接调用都不会把内嵌 DLL 写盘/加载。只有调用方显式
+    // 传入 true（来自 GameParams / ExportApi 的授权位）才进入原生路径。
+    bool allow_native_execution = false);
 
 } // namespace FilterManager

@@ -64,10 +64,14 @@ bool ImportProfileHxv4p(const std::string& utf8_hxv4p, const std::string& utf8_e
 // 从游戏 EXE 取参数并收进仓库。顺序：
 //   1. 先看 exe 旁边有没有**已经生成好的**产物（`ExtractKey_Output\Static\<exe名>_drip_program.hxv4p`），
 //      有就直接收编 —— 同一个游戏不必派生两次；只认同名的那份，别的 exe 的参数不收。
-//   2. 没有才真的去派生：调同目录的 CxdecKeyStatic.dll，产物先落 <keys_root>/.derive，
-//      收进仓库后清掉，不碰游戏目录。
+//   2. 没有才真的去派生：调同目录的 CxdecKeyStatic.dll，产物先落 <keys_root>/.derive\<唯一子目录>，
+//      收进仓库后只清掉本次自己的子目录，不碰游戏目录、不删别人正在用的内容。
+//
+// allow_native_execution 默认 false：步骤 1（纯文件收编）不需要原生执行；
+// 只有真的走步骤 2 时才要求 true。false 且没有旁侧产物时明确失败。
 bool DeriveProfile(const std::string& utf8_exe, const std::string& keys_root,
-                   std::string* note_out, std::string* why_out);
+                   std::string* note_out, std::string* why_out,
+                   bool allow_native_execution = false);
 
 // 仓库里有没有这个 EXE 对应的参数（不载入，只查清单）。
 bool HasProfileForExe(const std::string& utf8_exe, const std::string& keys_root);

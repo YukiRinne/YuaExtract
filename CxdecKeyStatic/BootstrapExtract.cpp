@@ -4,16 +4,17 @@
 #include "PeResource.h"
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
 
 namespace Bootstrap {
 
 static void parse_config_table(const uint8_t* dll, size_t dll_size, uint32_t table_rva,
                                 std::wstring& unique, std::wstring& warning,
                                 std::vector<uint8_t>& params) {
-    if (table_rva == 0 || table_rva + 2 > dll_size) return;
+    if (table_rva == 0 || table_rva > dll_size || dll_size - table_rva < 2) return;
 
     size_t cursor = table_rva;
-    while (cursor + 3 <= dll_size) {
+    while (cursor < dll_size && dll_size - cursor >= 3) {
         if (dll[cursor] == 0) break;
 
         size_t label_start = cursor;
@@ -22,12 +23,13 @@ static void parse_config_table(const uint8_t* dll, size_t dll_size, uint32_t tab
         size_t label_len = cursor - label_start;
         cursor++;
 
-        if (cursor + 2 > dll_size) break;
+        if (dll_size - cursor < 2) break;
         uint32_t length = (uint32_t)dll[cursor] | ((uint32_t)dll[cursor+1] << 8);
         cursor += 2;
 
-        if (length == 0 || cursor + length > dll_size) {
-            cursor += length;
+        if (length == 0 || length > dll_size - cursor) {
+            // 长度字段坏掉时不能 cursor += length（会越过末尾，甚至回绕后再也前进不了）。
+            cursor += std::min<uint32_t>(length, (uint32_t)(dll_size - cursor));
             continue;
         }
 
@@ -78,7 +80,7 @@ BootstrapConfig extract_bootstrap(
                                             zlib_data.size() - 8);
     if (cfg.dll_data.empty()) return cfg;
 
-    if (memcmp(cfg.dll_data.data(), "MZ", 2) != 0)
+    if (cfg.dll_data.size() < 2 || memcmp(cfg.dll_data.data(), "MZ", 2) != 0)
         return cfg;
 
     const uint32_t TABLE_RVA = 0x80E38;

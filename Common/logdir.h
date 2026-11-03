@@ -25,11 +25,32 @@ namespace Log
         std::wstring path;         // 最终用的目录
         bool fallback = false;     // true = 工具根写不了，用了 %LOCALAPPDATA%
         std::wstring primaryPath;  // 本来该用的目录（写进日志头，说明为什么换了地方）
-        DWORD primaryError = 0;    // 主位置建不出来的错误码；0 = 没失败
+        DWORD primaryError = 0;    // 主位置建不出来/不可写的错误码；0 = 没失败
+        std::wstring fallbackPath; // 实际尝试过的 %LOCALAPPDATA% 位置（诊断用）
+        DWORD fallbackError = 0;   // 回退位置也不可用时的错误码
     };
 
     namespace DirectoryDetail
     {
+        // SRW 独占锁的 noexcept RAII guard：锁住之后任何 wstring/容器分配
+        // 抛异常，析构也会释放锁，不会把后续 logger 永久挂死在同一条日志目录上。
+        struct SrwExclusiveGuard
+        {
+            SRWLOCK* lock;
+
+            explicit SrwExclusiveGuard(SRWLOCK* value) noexcept : lock(value)
+            {
+                ::AcquireSRWLockExclusive(lock);
+            }
+            ~SrwExclusiveGuard() noexcept
+            {
+                ::ReleaseSRWLockExclusive(lock);
+            }
+
+            SrwExclusiveGuard(const SrwExclusiveGuard&) = delete;
+            SrwExclusiveGuard& operator=(const SrwExclusiveGuard&) = delete;
+        };
+
         inline std::wstring StripTrailingSeparators(const std::wstring& path)
         {
             size_t end = path.size();
@@ -144,10 +165,86 @@ namespace Log
             }
             return std::wstring(buffer, length);
         }
+
+        // 目录存在 ≠ 能写：装在 Program Files、目录继承了一条只读 ACL、
+        // 或者被别的进程占着时，GetFileAttributesW 仍然会成功。
+        //
+        // 所以用一个**自己唯一命名**的 CREATE_NEW 小文件做真实写入探测：
+        //   - 不碰现有日志文件（不打开、不 rename、不删除任何既有文件）；
+        //   - 写完立即关闭并删除；CREATE_NEW 保证不会覆盖别人的东西；
+        //   - 只在解析日志目录时调一次（见 ResolveLogDirectory 的缓存），
+        //     不会变成每条日志都探测一次。
+        inline bool ProbeDirectoryWritable(const std::wstring& directory, DWORD* errorOut = nullptr)
+        {
+            if (errorOut != nullptr)
+            {
+                *errorOut = 0;
+            }
+            if (directory.empty())
+            {
+                if (errorOut != nullptr)
+                {
+                    *errorOut = ERROR_PATH_NOT_FOUND;
+                }
+                return false;
+            }
+
+            const std::wstring stem = directory + L"\\.yuaext-log-probe-" +
+                                      std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                                      std::to_wstring(::GetTickCount64()) + L"-";
+
+            for (int attempt = 0; attempt < 8; ++attempt)
+            {
+                const std::wstring probe = stem + std::to_wstring(attempt) + L".tmp";
+                HANDLE file = ::CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr,
+                                            CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+                if (file == INVALID_HANDLE_VALUE)
+                {
+                    const DWORD createError = ::GetLastError();
+                    if (createError == ERROR_FILE_EXISTS || createError == ERROR_ALREADY_EXISTS)
+                    {
+                        continue;  // 名字撞了，换一个；绝不打开已有文件
+                    }
+                    if (errorOut != nullptr)
+                    {
+                        *errorOut = createError;
+                    }
+                    return false;
+                }
+
+                const char marker = 'x';
+                DWORD written = 0;
+                const BOOL wrote = ::WriteFile(file, &marker, 1, &written, nullptr);
+                const DWORD writeError = wrote ? 0u : ::GetLastError();
+                ::CloseHandle(file);
+                // 探测文件由我们自己 CREATE_NEW 建出来的，删除失败也不影响结论
+                ::DeleteFileW(probe.c_str());
+
+                if (!wrote || written != 1)
+                {
+                    if (errorOut != nullptr)
+                    {
+                        *errorOut = writeError != 0 ? writeError : ERROR_WRITE_FAULT;
+                    }
+                    return false;
+                }
+                return true;
+            }
+
+            if (errorOut != nullptr)
+            {
+                *errorOut = ERROR_FILE_EXISTS;
+            }
+            return false;
+        }
     }
 
     // ownModuleDirectory：调用方自己的模块所在目录（DLL 目录就行，不必是 exe）。
-    inline LogDirectory ResolveLogDirectory(const std::wstring& ownModuleDirectory)
+    //
+    // 注意：这里会做一次**真实写探测**（CREATE_NEW 小文件），不是只看目录是否存在。
+    // 探测结果按输入目录缓存 —— 日志目录在一次进程生命周期里不会变，Loader 的
+    // Host::LogDirectory() 之类反复调用不会每次都落盘探测。
+    inline LogDirectory ResolveLogDirectoryUncached(const std::wstring& ownModuleDirectory)
     {
         using namespace DirectoryDetail;
 
@@ -160,7 +257,8 @@ namespace Log
         }
 
         result.primaryPath = root.empty() ? L"Log" : root + L"\\Log";
-        if (EnsureDirectory(result.primaryPath, &result.primaryError))
+        if (EnsureDirectory(result.primaryPath, &result.primaryError) &&
+            ProbeDirectoryWritable(result.primaryPath, &result.primaryError))
         {
             result.path = result.primaryPath;
             return result;
@@ -173,7 +271,9 @@ namespace Log
         {
             const std::wstring base = localAppData + L"\\KrkrExtract";
             const std::wstring alternative = base + L"\\Log";
-            if (EnsureDirectory(alternative))
+            result.fallbackPath = alternative;
+            if (EnsureDirectory(alternative, &result.fallbackError) &&
+                ProbeDirectoryWritable(alternative, &result.fallbackError))
             {
                 result.path = alternative;
                 result.fallback = true;
@@ -181,10 +281,42 @@ namespace Log
             }
         }
 
-        // 兜底：仍然用主位置，让后面的 Open 把真实错误码记下来
+        // 兜底：仍然用主位置，让后面的 Open 把真实错误码记下来。
+        // fallbackError 说明 %LOCALAPPDATA% 那条路为什么也不行。
         result.path = result.primaryPath;
         result.fallback = true;
         return result;
+    }
+
+    inline LogDirectory ResolveLogDirectory(const std::wstring& ownModuleDirectory)
+    {
+        // 只缓存最近一次输入（Loader 只用一个模块目录）。用 SRWLOCK 是因为
+        // UI 线程和后台任务都可能来取日志目录。
+        static SRWLOCK cacheLock = SRWLOCK_INIT;
+        static std::wstring cachedInput;
+        static LogDirectory cachedResult;
+        static bool cacheValid = false;
+
+        {
+            // 只读缓存也要 guard：返回时拷贝 cachedResult 可能因内存不足抛异常，
+            // 不能把锁留在这里（否则后续 logger 永久等锁）。
+            DirectoryDetail::SrwExclusiveGuard guard(&cacheLock);
+            if (cacheValid && cachedInput == ownModuleDirectory)
+            {
+                return cachedResult;
+            }
+        }
+
+        // 探测/建目录不在锁内做：它可能较慢，也不需要在持有缓存锁时分配。
+        const LogDirectory computed = ResolveLogDirectoryUncached(ownModuleDirectory);
+
+        {
+            DirectoryDetail::SrwExclusiveGuard guard(&cacheLock);
+            cachedInput = ownModuleDirectory;
+            cachedResult = computed;
+            cacheValid = true;
+        }
+        return computed;
     }
 
     inline std::wstring LogFilePath(const LogDirectory& directory, const wchar_t* fileName)

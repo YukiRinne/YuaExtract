@@ -1,6 +1,8 @@
 #include "pack_static/keystore.h"
 
 #include "crypto/blake2s.h"
+#include "NativeExecution.h"
+#include "PathSafety.h"
 
 #include <windows.h>
 
@@ -75,12 +77,24 @@ std::vector<uint8_t> CanonicalBytes(const Hxv4p::Parameters& p, bool use_keyed) 
 bool read_file(const fs::path& path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
+
     f.seekg(0, std::ios::end);
     const std::streamoff n = f.tellg();
+    if (n < 0) return false;
     f.seekg(0, std::ios::beg);
-    out.assign(static_cast<size_t>(n > 0 ? n : 0), 0);
-    if (!out.empty()) f.read(reinterpret_cast<char*>(out.data()), n);
-    return static_cast<bool>(f) || f.eof();
+    if (!f) return false;
+
+    out.assign(static_cast<size_t>(n), 0);
+    if (n > 0) {
+        f.read(reinterpret_cast<char*>(out.data()), n);
+        // 只接受"读完正好 n 字节"：短读说明文件在读取过程中变了/介质出错，
+        // 不能拿一段残缺内容当参数。
+        if (f.gcount() != n) {
+            out.clear();
+            return false;
+        }
+    }
+    return true;
 }
 
 std::string now_string() {
@@ -103,6 +117,51 @@ void sanitize(std::string& s) {
     }
 }
 
+// 只删**自己 CREATE_NEW 建出来**的临时目录。子项若是 junction/symlink，
+// 只删链接本身，绝不递归进去（避免顺着别人替换的重解析点删到仓库外）。
+// 本函数在 guard 析构里调用，必须 noexcept；内部 wstring/path 迭代可能因
+// 内存不足抛异常，一律 catch 掉，宁可留下临时目录也不 terminate 或删错目标。
+void RemoveOwnedTreeNoFollow(const fs::path& path) noexcept {
+    try {
+        const std::wstring wide = path.wstring();
+        const DWORD attributes = ::GetFileAttributesW(wide.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) return;
+
+        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            ::DeleteFileW(wide.c_str());
+            return;
+        }
+        // 自己这个目录若被替换成 junction/symlink，删除链接本身，不碰目标。
+        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            ::RemoveDirectoryW(wide.c_str());
+            return;
+        }
+
+        std::error_code ec;
+        for (fs::directory_iterator it(path, ec); !ec && it != fs::directory_iterator();
+             it.increment(ec)) {
+            RemoveOwnedTreeNoFollow(it->path());
+        }
+        ::RemoveDirectoryW(wide.c_str());
+    } catch (...) {
+        // 清理失败不扩大影响：不跟随、不重试、不抛出。
+    }
+}
+
+struct ModuleHandleGuard {
+    HMODULE module = nullptr;
+    ~ModuleHandleGuard() noexcept {
+        if (module != nullptr) ::FreeLibrary(module);
+    }
+};
+
+struct OwnedDirGuard {
+    fs::path path;
+    ~OwnedDirGuard() noexcept {
+        if (!path.empty()) RemoveOwnedTreeNoFollow(path);
+    }
+};
+
 }  // namespace
 
 bool FileDigest(const std::string& utf8_path, std::string& hex_out) {
@@ -116,6 +175,9 @@ bool FileDigest(const std::string& utf8_path, std::string& hex_out) {
         const std::streamsize got = f.gcount();
         if (got > 0) h.update(reinterpret_cast<const uint8_t*>(buf), static_cast<size_t>(got));
     }
+    // 只接受正常读到 EOF：badbit / 非 EOF 的 failbit 都是真实 IO 失败，
+    // 拿半个文件的摘要去建索引会永久指错参数。
+    if (!f.eof()) return false;
     uint8_t digest[32];
     h.finalize(digest);
     hex_out = hex_lower(digest, sizeof(digest));
@@ -369,19 +431,22 @@ bool HasProfileForExe(const std::string& utf8_exe, const std::string& keys_root)
 }
 
 bool DeriveProfile(const std::string& utf8_exe, const std::string& keys_root,
-                   std::string* note_out, std::string* why_out) {
+                   std::string* note_out, std::string* why_out,
+                   bool allow_native_execution) {
     auto fail = [&](const std::string& m) {
         if (why_out) *why_out = m;
         return false;
     };
     if (utf8_exe.empty()) return fail("没指定游戏 EXE");
+    if (keys_root.empty()) return fail("没指定参数仓库目录");
 
     // 先确认这个 EXE 读得出来：收编出来的条目是按 EXE 摘要建索引的，读不到摘要
     // 就只能按参数摘要存，那样永远命中不了 —— 与其悄悄成功，不如直接说清楚。
     std::string exe_digest;
     if (!FileDigest(utf8_exe, exe_digest)) return fail("读不到这个 EXE：" + utf8_exe);
 
-    // 1. 游戏目录旁已经生成过就直接收编 —— 同一个游戏不必派生两次
+    // 1. 游戏目录旁已经生成过就直接收编 —— 同一个游戏不必派生两次。
+    //    这一步只读文件、写仓库，不执行任何游戏代码，未授权也允许。
     std::string side;
     if (FindSideProduct(utf8_exe, side)) {
         std::string note, why;
@@ -392,32 +457,87 @@ bool DeriveProfile(const std::string& utf8_exe, const std::string& keys_root,
         // 那份收编不了（残缺或格式不对）就当没看见，照常现场派生
     }
 
-    // 2. 现场派生
+    // 2. 现场派生会执行游戏内嵌的 BOOTSTRAP DLL。没有显式授权就到此为止，
+    //    绝不悄悄回落内置参数、也不生成半成品。
+    if (!allow_native_execution) {
+        return fail(std::string("仓库里没有这个 EXE 的参数，从 EXE 现场派生需要执行游戏内嵌的原生代码。") +
+                    NativeExecution::DeniedMessage());
+    }
+
     std::wstring dir;
     if (!ModuleDir(dir)) return fail("取不到本模块所在目录");
     const std::wstring dll = dir + L"CxdecKeyStatic.dll";
 
-    HMODULE h = ::LoadLibraryW(dll.c_str());
-    if (h == nullptr) return fail("找不到密钥派生模块 CxdecKeyStatic.dll");
+    // 模块句柄用 RAII：下面任何 early return（缺导出、目录检查失败、CreateDirectory
+    // 失败、导入失败）都会 FreeLibrary，不再漏 HMODULE。
+    ModuleHandleGuard module;
+    module.module = ::LoadLibraryW(dll.c_str());
+    if (module.module == nullptr) return fail("找不到密钥派生模块 CxdecKeyStatic.dll");
 
-    typedef BOOL(__stdcall * tExtractKey)(const wchar_t*, const wchar_t*, char*, int);
-    auto fn = (tExtractKey)::GetProcAddress(h, "ExtractKey");
+    typedef BOOL(__stdcall * tExtractKeyEx)(const wchar_t*, const wchar_t*, DWORD, char*, int);
+    auto fn = (tExtractKeyEx)::GetProcAddress(module.module, "ExtractKeyEx");
     if (fn == nullptr) {
-        ::FreeLibrary(h);
-        return fail("CxdecKeyStatic.dll 缺少 ExtractKey 导出");
+        // 不回落旧 ExtractKey：旧入口固定 flags=0，本来就不会派生。
+        return fail("CxdecKeyStatic.dll 缺少 ExtractKeyEx 导出（旧版 DLL 不支持显式授权派生）");
     }
 
-    // 派生产物先落到仓库下的临时目录，成功后再把 .hxv4p 收进仓库、清掉临时目录——
-    // 整个过程不碰游戏目录。
+    // 派生产物先落到仓库下一个**本次调用独占**的临时子目录，成功后再把 .hxv4p
+    // 收进仓库、只清掉自己这一份。以前的 .derive 是共享的并先 remove_all：
+    // 两个调用并发时会互删产物，而且会顺着别人替换成 junction 的目录删到外面去。
     std::error_code ec;
-    const fs::path tmp = fs::u8path(keys_root) / ".derive";
-    fs::remove_all(tmp, ec);
-    fs::create_directories(tmp, ec);
+    const fs::path root = fs::u8path(keys_root);
+    const fs::path derive_root = root / ".derive";
+
+    // 关键：在**创建任何东西之前**把 derive_root 整条已存在路径上的重解析点都查一遍。
+    // HasReparsePoint 遇到第一个不存在的组件就停，所以 keys_root 是 junction 时这里
+    // 也会命中，不能只用"文件夹是否存在"来猜。
+    std::wstring offending;
+    if (PathSafety::HasReparsePoint(derive_root.wstring(), &offending)) {
+        return fail("参数仓库路径上有重解析点（junction/symlink），拒绝在其下派生：" +
+                    fs::path(offending).u8string());
+    }
+
+    const DWORD derive_attributes = ::GetFileAttributesW(derive_root.wstring().c_str());
+    if (derive_attributes != INVALID_FILE_ATTRIBUTES) {
+        if ((derive_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            return fail("参数仓库里的 .derive 不是目录");
+        }
+    } else {
+        fs::create_directories(derive_root, ec);
+        if (ec) return fail("建不出派生临时目录：" + derive_root.u8string());
+        // 新建后再确认一次（并发替换的情况）
+        if (PathSafety::HasReparsePoint(derive_root.wstring(), &offending)) {
+            return fail("参数仓库里的 .derive 是重解析点（junction/symlink），拒绝在其中派生");
+        }
+    }
+
+    fs::path tmp;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        wchar_t name[96] = {};
+        _snwprintf_s(name, _countof(name), _TRUNCATE, L"derive_%lu_%llu_%d",
+                     static_cast<unsigned long>(::GetCurrentProcessId()),
+                     static_cast<unsigned long long>(::GetTickCount64()), attempt);
+        const fs::path candidate = derive_root / name;
+        if (::CreateDirectoryW(candidate.wstring().c_str(), nullptr)) {
+            tmp = candidate;
+            break;
+        }
+        if (::GetLastError() != ERROR_ALREADY_EXISTS) {
+            return fail("建不出派生临时子目录：" + candidate.u8string());
+        }
+    }
+    if (tmp.empty()) {
+        return fail("建不出唯一的派生临时子目录（.derive 下冲突过多）");
+    }
+
+    // 只清自己这一个目录；子项遇到 reparse 只删链接本身，不递归跟随。
+    OwnedDirGuard tmp_guard;
+    tmp_guard.path = tmp;
 
     const std::wstring exe_w = fs::u8path(utf8_exe).wstring();
     const std::wstring tmp_w = tmp.wstring();
     char err[512] = {};
-    const BOOL ok = fn(exe_w.c_str(), tmp_w.c_str(), err, sizeof(err));
+    const BOOL ok = fn(exe_w.c_str(), tmp_w.c_str(), NativeExecution::kFlagAllow, err, sizeof(err));
 
     std::string hxv4p;
     if (fs::is_directory(tmp, ec)) {
@@ -431,15 +551,11 @@ bool DeriveProfile(const std::string& utf8_exe, const std::string& keys_root,
         }
     }
     if (hxv4p.empty()) {
-        fs::remove_all(tmp, ec);
-        ::FreeLibrary(h);
         return fail(ok ? "派生跑完了但没产出 .hxv4p" : (std::string("派生失败：") + err));
     }
 
     std::string note, why;
     const bool imported = ImportProfileHxv4p(hxv4p, utf8_exe, keys_root, &note, &why);
-    fs::remove_all(tmp, ec);
-    ::FreeLibrary(h);
     if (!imported) return fail(why);
     if (note_out) *note_out = "已现场派生并入库：" + note;
     return true;

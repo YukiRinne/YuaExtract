@@ -45,8 +45,12 @@ namespace Yua
     struct HashMapTables
     {
         std::unordered_map<std::wstring, std::wstring> directories; // 16 位 hex -> 明文目录（空 = 根域）
-        std::unordered_map<std::wstring, std::wstring> files;       // 64 位 hex -> 明文文件名
+        std::unordered_map<std::wstring, std::wstring> files;       // 64 位 hex -> 明文文件名（可带包内目录）
         std::vector<std::wstring> sources;                          // 实际读到的映射文件（写进报告，便于追溯）
+        // 被路径边界拒绝的映射条目。外部日志/lst 不可信，恶意名字不能被静默接受：
+        // 条数进报告与「映射概览」，前几条样本进日志，用户能看出是哪份来源出了问题。
+        unsigned int rejectedEntries = 0;
+        std::vector<std::wstring> rejectedSamples;
     };
 
     // 载入映射目录下所有映射来源（DirectoryHash.log / FileNameHash.log / *.lst）。
@@ -70,6 +74,20 @@ namespace Yua
         bool rootLevel = false;        // true = 只扫这个目录本层，不递归
         unsigned int fileCount = 0;    // 扫到的文件数（日志目录不计）
         unsigned long long bytes = 0;
+        // 预先枚举时遇到的错误（列目录失败/超深/取消）。任务照常返回，但界面必须
+        // 把它当"不完整"，不能显示成正常的 0/N。
+        std::wstring enumerationError;
+    };
+
+    // 一条真正落盘的交付记录：源文件相对路径（相对源根，含封包段）→ 实际输出相对路径。
+    //
+    // 为什么键是"源"而不是"目标基名"：两遍式还原第二遍可能把同一个源文件从
+    // <hash>.png 改成真名，目标变了但源没变。按目标基名记录会把它当成两个文件，
+    // 反复复制 / 反复造 __dupN。按源记录才能准确回答"这个源交付过没有、交付到哪"。
+    struct RestoreDelivery
+    {
+        std::wstring sourceRelative;   // 相对 RestoreOptions::sourceDirectory
+        std::wstring targetRelative;   // 相对 RestoreOptions::outputDirectory（实际落点）
     };
 
     // 根目录任务的显示名（带括号，一眼能看出这不是真的封包目录）。
@@ -105,7 +123,10 @@ namespace Yua
         // 本次实际交付进输出目录的目标相对路径（重名改名的记改名**前**的基名）。
         // 两遍式还原（先普通还原、再补充还原补漏）时，第二遍拿第一遍的这份集合
         // 判断"这个文件已经交付过了"，直接跳过 —— 不重拷、也不再造 __dupN。
+        // 旧字段保留供现有 UI 过渡；新代码请用 deliveries（按源+实际目标记录）。
         std::vector<std::wstring> deliveredRelative;
+        // 本遍真正交付的记录（按源相对路径 → 实际输出相对路径）。
+        std::vector<RestoreDelivery> deliveries;
 
         unsigned long long copiedBytes = 0;
 
@@ -139,7 +160,15 @@ namespace Yua
 
         // 前一遍已交付的目标相对路径集合（两遍式还原用）。本遍遇到同一目标直接跳过，
         // 不重拷也不再造副本 —— "补充还原"就是补漏，第二遍只处理第一遍没交付的。
+        // 旧字段：保留 ABI/调用点兼容，但内核新路径不再按目标键跳过（目标名可能因
+        // 两遍之间补全映射而变化；按目标跳过会把真名交付误判成"已做过"）。
         std::set<std::wstring> alreadyDelivered;
+
+        // 两遍式：第一遍的实际交付记录，键 = 源相对路径（相对 sourceDirectory，含封包段），
+        // 值 = 第一遍实际写出的输出相对路径。用于：
+        //   1) 同一源已交付且目标/内容仍正确时跳过；
+        //   2) 本遍把同一源交付到新目标后，只清理这条"本源自己的旧落点"（内容相等才删）。
+        std::map<std::wstring, std::wstring> previousDeliveries;
     };
 
     // 枚举封包（Extractor_Output 的顶层子目录，按名字排序，保证任务列表稳定）。
@@ -269,6 +298,7 @@ namespace Yua
         std::wstring message;
         unsigned int directoryEntries = 0;
         unsigned int fileNameEntries = 0;
+        unsigned int rejectedEntries = 0;
         std::vector<std::wstring> sources;
     };
 

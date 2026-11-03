@@ -36,12 +36,20 @@ namespace ModuleApi
                                 const wchar_t* mediaName, int modeOverride, int rescramble,
                                 char* detailOut, int detailOutSize, char* errorOut,
                                 int errorOutSize) = nullptr;
+        BOOL(__stdcall* RepackEx)(const wchar_t* inputDir, const wchar_t* outputXp3,
+                                  const wchar_t* exePath, const wchar_t* keysRoot,
+                                  const wchar_t* mediaName, int modeOverride, int rescramble,
+                                  DWORD flags, char* detailOut, int detailOutSize,
+                                  char* errorOut, int errorOutSize) = nullptr;
         unsigned int(__stdcall* NextRevision)(const wchar_t* gameDir) = nullptr;
         BOOL(__stdcall* ImportKey)(const wchar_t* hxv4pPath, const wchar_t* exePath,
                                    const wchar_t* keysRoot, char* noteOut, int noteOutSize,
                                    char* errorOut, int errorOutSize) = nullptr;
         BOOL(__stdcall* DeriveKeys)(const wchar_t* exePath, const wchar_t* keysRoot, char* noteOut,
                                     int noteOutSize, char* errorOut, int errorOutSize) = nullptr;
+        BOOL(__stdcall* DeriveKeysEx)(const wchar_t* exePath, const wchar_t* keysRoot, DWORD flags,
+                                      char* noteOut, int noteOutSize, char* errorOut,
+                                      int errorOutSize) = nullptr;
 
         bool Load(std::wstring& error);
         ~Repacker();
@@ -54,6 +62,8 @@ namespace ModuleApi
 
         BOOL(__stdcall* ExtractKey)(const wchar_t* exePath, const wchar_t* outputDir,
                                     char* errorOut, int errorOutSize) = nullptr;
+        BOOL(__stdcall* ExtractKeyEx)(const wchar_t* exePath, const wchar_t* outputDir, DWORD flags,
+                                      char* errorOut, int errorOutSize) = nullptr;
 
         bool Load(std::wstring& error);
         ~KeyStatic();

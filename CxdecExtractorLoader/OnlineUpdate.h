@@ -106,13 +106,21 @@ namespace Online
 
     struct DownloadResult
     {
-        std::wstring path;                 // 落盘的临时档案
+        std::wstring path;                 // 落盘的临时档案（调用方确认后不应再依赖它）
+        std::wstring stagingDirectory;     // 本次实际使用的 staging 根（owned session 或 explicit）
         unsigned long long bytes = 0;
         std::wstring sha256;               // 大写 hex
+        // **同一份字节**（与 path 里那份同源、与 sha256 同源）。2026-11 安全轮新增：
+        // 界面确认后必须用 VerifyArchiveBytes + InstallBytesToLibrary，**不要再读 path** ——
+        // 否则"校验 A、安装 B"的 TOCTOU 窗口就回来了。
+        std::vector<unsigned char> blob;
     };
 
-    // GET <base><会社>/<作品>/rules.int → 落 stagingDirectory\Online_<会社>_<作品>.rules.int。
-    // stagingDirectory 为空时用 DefaultStagingDirectory()。
+    // GET <base><会社>/<作品>/rules.int → 落 stagingDirectory 下的**唯一 CREATE_NEW** 文件。
+    //   · stagingDirectory 为空：用 DefaultStagingDirectory()（返回本次调用独占的 owned session）。
+    //   · stagingDirectory 非空：必须是已存在的普通目录且无重解析点；本层只写唯一文件名，
+    //     失败只删自己创建的文件。该 explicit 目录**不会**登记为 owned，
+    //     因此 CleanupStaging 会拒绝删除它；调用方若要清掉下载文件请自行删除 out.path。
     // 只负责「拿到字节」，**不做任何校验、不动本地库**。
     bool DownloadArchive(const std::wstring& base, const ExtensionSet::LibraryEntry& entry,
                          const std::wstring& stagingDirectory, DownloadResult& out,
@@ -126,15 +134,36 @@ namespace Online
     bool VerifyArchive(const std::wstring& archivePath, const ExtensionSet::LibraryEntry& entry,
                        std::wstring& detail, std::wstring& error);
 
-    // 写入<工具目录>\Log\OnlineStaging（工具目录不可写时回退 %TEMP%\YuaExtract\OnlineStaging）。
+    // 字节版（2026-11 安全轮，在线更新唯一应使用的校验入口）：
+    // sha256 与解码都针对**传入的同一份 blob**；内部不再打开任何路径。
+    // 其余信任链 §14.4 第 2–5 条与索引/档案会社作品交叉校验完全一致。
+    bool VerifyArchiveBytes(const std::vector<unsigned char>& blob,
+                            const ExtensionSet::LibraryEntry& entry,
+                            std::wstring& detail, std::wstring& error);
+
+    // 写入 <工具目录>\Log\OnlineStaging\session_<guid>（工具目录不可写时回退
+    // %TEMP%\YuaExtract\OnlineStaging\session_<guid>）。**每次调用生成一个全新的、
+    // 本进程独占的子目录**（CREATE_NEW 防碰撞），并登记为 owned；父根必须无重解析点、
+    // 真能创建（不能只靠 Exists 判断可写）。
     std::wstring DefaultStagingDirectory();
-    // 尽力删掉 staging 目录（失败不报错、不抛）。校验失败与入库成功后都应调用。
+
+    // 清理 staging。约束（2026-11 安全轮）：
+    //   · 空串 = no-op，**绝不**去碰 shared 默认根；
+    //   · 只清理本进程 DefaultStagingDirectory 创建并登记的 owned 目录；
+    //   · 调用方显式传入的 existing 目录若未被登记，拒绝清理（no-op）；
+    //   · 遇重解析点只 RemoveDirectoryW 解除链接，绝不递归进入链接目标；
+    //   · 绝不删除别实例目录或用户已有文件。
     void CleanupStaging(const std::wstring& stagingDirectory);
 
-    // 入库直接用既有的 ExtensionSet::InstallToLibrary（本层不再包一层同义函数）。
-    // **入库时要把 sourceLabel 传成 ArchiveUrl(base, 会社, 作品)**（2026-10-16，独立验证 P-3）：
-    // 传进来的 archivePath 是暂存文件，入库后立刻被 CleanupStaging 删掉，不换的话清单「来源」列
-    // 永远指向一个不存在的路径。
+#ifdef YUA_SECURITY_EXTENSION_TEST_SEAM
+    // **仅测试构建**：让 DownloadArchive 在建好 owned session 后、发网络请求前失败，
+    // 用来验证"失败时自动清理本次私有 staging"这条路径。生产构建不编译。
+    bool& TestFailDownloadAfterStaging();
+#endif
+
+    // 入库用 ExtensionSet::InstallBytesToLibrary（传 DownloadResult.blob）。
+    // **不要**在确认之后再读 DownloadResult.path：那会重新引入 TOCTOU。
+    // 清单「来源」列传 ArchiveUrl(base, 会社, 作品)，不要传暂存路径。
     // 覆盖前是否确认由**界面**决定：同 exe 摘要但档案摘要不同 → 先弹框列出新旧条数/摘要。
 }
 }

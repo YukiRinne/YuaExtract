@@ -1,4 +1,4 @@
-// YuaExtract 主界面。
+﻿// YuaExtract 主界面。
 //
 // 这一层只做三件事：把上游的功能组织成"解包 → 收集 Hash → 还原名字"三步流程、
 // 把每一步的结果随时显示在右侧概览里、把上游原版入口收进"高级操作"备查。
@@ -22,6 +22,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -173,6 +174,9 @@ namespace
     struct SetJob
     {
         JobKind Kind = JobKind::None;
+        // 任务序号：进度 / 完成消息都带着它。旧任务的迟到消息绝不能落到下一轮任务上
+        //（用户取消后马上再点开始，队列里可能还压着上一轮的 kSetDoneMessage）。
+        unsigned int Id = 0;
         HANDLE Thread = nullptr;
         volatile LONG Cancel = 0;  // 1 = 用户点了取消
         volatile LONG Done = 0;    // 1 = 线程体已跑完（结果字段此时已写完）
@@ -244,6 +248,7 @@ namespace
     struct OnlineJob
     {
         OnlineJobKind Kind = OnlineJobKind::None;
+        unsigned int Id = 0;
         HANDLE Thread = nullptr;
         volatile LONG Cancel = 0;
         volatile LONG Done = 0;
@@ -268,7 +273,9 @@ namespace
 
     constexpr wchar_t kWindowClass[] = L"YuaExtractMainWindow";
     constexpr UINT_PTR kRefreshTimerId = 1;
+    constexpr UINT_PTR kClosePollTimerId = 3;
     constexpr UINT kRefreshIntervalMs = 1500;
+    constexpr UINT kClosePollIntervalMs = 200;
 
     // 96 DPI 下的布局常量。
     constexpr int kMargin = 10;
@@ -420,6 +427,19 @@ namespace
         // 后台任务（生成 / 静态 Hash 表 / 干跑）。
         SetJob Job;
         bool JobActive = false;
+        // 用户已经确认关窗，但后台线程还没真正退出：此时保持窗口存活，
+        // 由定时器轮询线程句柄，只有 WAIT_OBJECT_0 之后才销毁窗口。
+        bool ClosePending = false;
+        unsigned int NextJobId = 0;
+        // 正在走关闭流程（可能弹出还原窗口的二次确认，而确认框会泵消息并允许 WM_CLOSE 重入）。
+        bool Closing = false;
+        // OnJobDone 里会弹结论框；模态框会继续派发本窗口的定时器消息。
+        // 这个标志让关闭轮询在结论框还开着时不要销毁窗口。
+        bool JobDoneUi = false;
+        // 反篡改预检（可能含 60 秒有界等待与多次确认框）正在本窗口线程里跑。
+        // 期间任何会 SyncTarget / ResetJob / 起进程的重入动作都必须拒掉，
+        // 避免第二次点击同时跑一遍预检。
+        bool PrepareBusy = false;
     };
 
     UiContext* ContextOf(HWND hwnd)
@@ -2448,10 +2468,105 @@ namespace
 
     void ApplyTarget(UiContext& context, const std::wstring& exePath); // 定义在后面，RequireTarget 要用
 
-    // 取当前目标 exe；没选就先把选择框弹出来（别让用户先去点"选择"再回来点步骤）。
-    // 返回空串表示放弃。
+    // ---------- 后台任务的重入闸门 ----------
+    //
+    // 任务跑起来之后，目标 / 模式 / 清理 / 生成 / 测试 / 安装这些动作都必须先停：
+    // 它们会 SyncTarget、ResetJob 或直接改磁盘，而工作线程手里的输入必须是不可变的快照。
+    // 光在 StartJob 里检查太晚 —— 那些动作在 StartJob 之前就已经改过 context 了。
+    bool JobBusy(const UiContext& context)
+    {
+        return context.JobActive || context.ClosePending;
+    }
+
+    bool RejectIfBusy(UiContext& context, const wchar_t* action)
+    {
+        if (!JobBusy(context) && !context.JobDoneUi)
+        {
+            return false;
+        }
+        Host::ShowInfo(context.Window,
+                       std::wstring(L"后台任务还在跑，暂时不能") + action +
+                           L"。\r\n\r\n等任务结束（或点「取消」并等它真正退出）之后再试。");
+        return true;
+    }
+
+    // 后台任务 / ClosePending / JobDoneUi 期间必须拒绝的控件与命令。
+    // **锁定与命令门禁共用这一份**：以前两处各写一份，NOTE / OPEN_LIB / ADVANCED /
+    // 打开工作区/还原目录/报告这些"只读但会弹模态框或碰磁盘"的 ID 漏了一边，
+    // 结论框还开着时仍可能重入。
+    constexpr int kJobSensitiveIds[] = {
+        IDC_YUA_EXE_EDIT,       IDC_YUA_EXE_BROWSE,      IDC_YUA_FUNC_SET_EXTRACT,
+        IDC_YUA_FUNC_SET_CRACK, IDC_YUA_FUNC_CLASSIC,    IDC_YUA_ADVANCED,
+        IDC_YUA_STEP1,          IDC_YUA_STEP2,           IDC_YUA_STEP3,
+        IDC_YUA_AUX_CHECK,      IDC_YUA_AUX_WORKSPACE,   IDC_YUA_AUX_CLEAN,
+        IDC_YUA_AUX_RESTOREDIR, IDC_YUA_AUX_REPORT,      IDC_YUA_SET_GENERATE,
+        IDC_YUA_SET_EDITINFO,   IDC_YUA_SET_TEST,        IDC_YUA_SET_INSTALL,
+        IDC_YUA_SET_OPEN_DRAFT, IDC_YUA_SET_OPEN_LIB,    IDC_YUA_SET_PICK_SOURCE,
+        IDC_YUA_SET_PICK_TEST,  IDC_YUA_SETM_REFRESH,    IDC_YUA_SETM_OPEN_ROOT,
+        IDC_YUA_SETM_OPEN_ENTRY, IDC_YUA_SETM_UPDATE,   IDC_YUA_SETM_SELFCHECK,
+        IDC_YUA_SETM_NOTE,      IDC_YUA_LIB_PUBLISHERS,  IDC_YUA_LIB_TITLES,
+    };
+
+    // 后台任务期间锁住会影响目标 / 模式 / 清理 / 生成 / 测试 / 安装 / 只读弹窗的控件。
+    // 用 ID 逐个开关而不是整窗禁用：日志、页签、概览还要能正常看。
+    void SetJobInteractionLocked(UiContext& context, bool locked)
+    {
+        for (const int id : kJobSensitiveIds)
+        {
+            HWND control = ::GetDlgItem(context.Window, id);
+            if (control)
+            {
+                ::EnableWindow(control, locked ? FALSE : TRUE);
+            }
+        }
+    }
+
+    bool IsJobSensitiveCommand(int command)
+    {
+        // 编辑框失焦（EN_KILLFOCUS）由 WM_COMMAND 分支单独静默拒绝，
+        // 不走这里 —— 否则每次失焦都会弹一个 busy 提示。
+        if (command == IDC_YUA_EXE_EDIT)
+        {
+            return false;
+        }
+        for (const int id : kJobSensitiveIds)
+        {
+            if (command == id)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 工作线程的 std::exception::what() 通常是 UTF-8；异常文本只用于报错，转换失败就退回原字节。
+    std::wstring ExceptionText(const char* text)
+    {
+        if (text == nullptr || *text == '\0')
+        {
+            return std::wstring();
+        }
+        const int length = ::MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+        if (length <= 0)
+        {
+            return std::wstring(text, text + std::strlen(text));
+        }
+        std::wstring wide(static_cast<size_t>(length), L'\0');
+        ::MultiByteToWideChar(CP_UTF8, 0, text, -1, &wide[0], length);
+        if (!wide.empty() && wide.back() == L'\0')
+        {
+            wide.pop_back();
+        }
+        return wide;
+    }
+
+
     std::wstring RequireTarget(UiContext& context)
     {
+        if (RejectIfBusy(context, L"切换目标游戏"))
+        {
+            return std::wstring();
+        }
         SyncTargetFromEdit(context);
         if (context.ExePath.empty())
         {
@@ -2487,6 +2602,10 @@ namespace
 
     void OnBrowseExe(UiContext& context)
     {
+        if (RejectIfBusy(context, L"切换目标游戏"))
+        {
+            return;
+        }
         std::wstring chosen;
         if (!Host::PickGameExe(context.Window, chosen))
         {
@@ -2506,6 +2625,19 @@ namespace
     // 返回 false = 本次启动应当中止。
     bool EnsureTargetReadyForLaunch(UiContext& context)
     {
+        if (context.PrepareBusy)
+        {
+            // 预检自己的确认框会泵消息；这里再兜一层，避免第二次点击并发跑预检。
+            Host::ShowInfo(context.Window, L"正在检查目标，请等这次预检结束。");
+            return false;
+        }
+        struct PrepareBusyGuard
+        {
+            bool& Flag;
+            explicit PrepareBusyGuard(bool& flag) : Flag(flag) { Flag = true; }
+            ~PrepareBusyGuard() { Flag = false; }
+        } prepareGuard(context.PrepareBusy);
+
         // 补丁流程可能要跑几秒，先把状态写进面板并强制重绘一次 ——
         // 否则这几秒里界面没有任何反馈，看起来就像"按钮坏了"。
         context.StageNote = L"正在检查目标（反篡改补丁流程）……";
@@ -2513,36 +2645,51 @@ namespace
         UpdateOverview(context);
         ::UpdateWindow(context.Window);
 
-        if (!Host::PrepareTargetExe(context.Window, context.ExePath))
+        std::wstring prepareError;
+        const Host::PrepareStatus status =
+            Host::PrepareTargetExe(context.Window, context.ExePath, prepareError);
+        if (status == Host::PrepareStatus::Ready)
         {
-            // 退出码 2/3：无需处理，或需要补但没补上（模块自己弹过警告了）。
-            // 按上游语义继续启动，不拦。
             return true;
         }
+        if (status == Host::PrepareStatus::Cancelled)
+        {
+            Host::LogLine(Log::Level::Warn, L"[YuaExtract] 用户取消了反篡改补丁流程，本次启动中止");
+            context.StageNote = L"启动已中止（用户取消了反篡改补丁流程）";
+            context.RenderedOverview.clear();
+            UpdateOverview(context);
+            return false;
+        }
+        if (status == Host::PrepareStatus::Failed)
+        {
+            Host::LogLine(Log::Level::Warn, L"[YuaExtract] 反篡改补丁流程失败：不继续启动： " + prepareError);
+            context.StageNote = L"启动已中止（反篡改补丁流程失败）";
+            context.RenderedOverview.clear();
+            UpdateOverview(context);
+            Host::ShowError(context.Window,
+                            L"目标没有通过反篡改补丁流程，本次启动已中止。\r\n\r\n" +
+                                (prepareError.empty() ? std::wstring(L"（没有给出原因）") : prepareError));
+            return false;
+        }
 
+        // Status == Patched：只认本次流程刚产出的 _crack.exe（PrepareTargetExe 已核对时间戳）。
         const std::wstring cracked = Host::CrackedExePath(context.ExePath);
-        if (!cracked.empty())
+        if (cracked.empty())
         {
-            Host::LogLine(Log::Level::Info,
-                          L"[YuaExtract] 补丁流程已产出 " + cracked + L"，自动改用该文件作为目标继续启动");
-            ApplyTarget(context, cracked);
-            context.StageNote = L"已自动改用补丁产物 " + cracked;
-            return true;
+            Host::LogLine(Log::Level::Warn,
+                          L"[YuaExtract] 补丁流程报告已产出 _crack.exe，但文件不存在，本次启动中止");
+            context.StageNote = L"启动已中止（找不到本次补丁产物）";
+            context.RenderedOverview.clear();
+            UpdateOverview(context);
+            Host::ShowError(context.Window, L"补丁流程报告成功，但找不到本次产出的 _crack.exe，启动已中止。");
+            return false;
         }
 
-        // 补丁流程接管了、但没产出成品：用户取消了脱壳确认，或者目标根本不是这个引擎的游戏。
-        Host::LogLine(Log::Level::Warn, L"[YuaExtract] 补丁流程未产出 _crack.exe，本次启动中止");
-        context.StageNote = L"启动已中止（反篡改补丁流程未产出 _crack.exe）";
-        context.RenderedOverview.clear();
-        UpdateOverview(context);
-        Host::ShowInfo(context.Window,
-                       L"目标没有通过反篡改补丁流程，本次启动已中止。\r\n\r\n"
-                       L"常见原因：\r\n"
-                       L"· 目标不是 KiriKiri / Hxv4 游戏（补丁流程找不到可补的东西）；\r\n"
-                       L"· 脱壳确认框被取消；\r\n"
-                       L"· 补丁没能应用（此时会有单独的警告提示）。\r\n\r\n"
-                       L"确认目标正确后可以再点一次本步骤重试。");
-        return false;
+        Host::LogLine(Log::Level::Info,
+                      L"[YuaExtract] 补丁流程已产出 " + cracked + L"，自动改用该文件作为目标继续启动");
+        ApplyTarget(context, cracked);
+        context.StageNote = L"已自动改用补丁产物 " + cracked;
+        return true;
     }
 
     void OnStep1(UiContext& context)
@@ -2651,6 +2798,7 @@ namespace
     void ResetJob(UiContext& context, JobKind kind, const std::wstring& stage)
     {
         SetJob& job = context.Job;
+        job.Id = ++context.NextJobId;
         ::InterlockedExchange(&job.Cancel, 0);
         ::InterlockedExchange(&job.Done, 0);
         ::InterlockedExchange(&job.Percent, 0);
@@ -2706,82 +2854,106 @@ namespace
         UiContext* context = static_cast<UiContext*>(parameter);
         SetJob& job = context->Job;
         const HWND notify = context->Window;
+        const unsigned int jobId = job.Id;
 
         const auto cancelled = [&job](void) -> bool
         {
             return ::InterlockedCompareExchange(&job.Cancel, 0, 0) != 0;
         };
-        const auto progress = [&job, notify](unsigned int percent, const std::wstring& stage)
+        const auto progress = [&job, notify, jobId](unsigned int percent, const std::wstring& stage)
         {
             SetJobStage(job, percent, stage);
-            ::PostMessageW(notify, kSetProgressMessage, 0, 0);
+            ::PostMessageW(notify, kSetProgressMessage, jobId, 0);
         };
 
-        switch (job.Kind)
+        try
         {
-            case JobKind::Generate:
+            switch (job.Kind)
             {
-                job.GenerateOptions.cancelRequested = cancelled;
-                job.GenerateOptions.progress = progress;
-                job.Generate = ExtensionSet::GenerateArchive(job.GenerateOptions, job.ArchivePath);
-                job.Ok = job.Generate.ok;
-                job.Error = job.Generate.error;
-                break;
-            }
-            case JobKind::StaticHash:
-            {
-                progress(3u, L"正在加载扩展集档案……");
-                job.Load = ExtensionSet::LoadArchiveFromLibrary(job.LibraryRoot, job.Publisher, job.Title,
-                                                               job.LoadOptions);
-                if (!job.Load.ok)
+                case JobKind::Generate:
                 {
-                    job.Error = job.Load.error.empty() ? job.Load.matchNote : job.Load.error;
-                    // "档案结构坏了"与"这是别的游戏的档案"要分开报，出路完全不同（验证 P-3）。
-                    job.Failure = job.Load.failure;
+                    // 输入快照：线程起来之后只读这一份，不再碰 context 里可能被改写的字段。
+                    ExtensionSet::GenerateOptions options = job.GenerateOptions;
+                    const std::wstring archivePath = job.ArchivePath;
+                    options.cancelRequested = cancelled;
+                    options.progress = progress;
+                    job.Generate = ExtensionSet::GenerateArchive(options, archivePath);
+                    job.Ok = job.Generate.ok;
+                    job.Error = job.Generate.error;
                     break;
                 }
-                job.UnverifiedLoad = IsUnverifiedLoad(job);
-                if (cancelled())
+                case JobKind::StaticHash:
                 {
-                    job.Error = L"已取消。";
+                    const ExtensionSet::LoadOptions loadOptions = job.LoadOptions;
+                    const std::wstring libraryRoot = job.LibraryRoot;
+                    const std::wstring publisher = job.Publisher;
+                    const std::wstring title = job.Title;
+                    const std::wstring outputDirectory = job.OutputDirectory;
+                    progress(3u, L"正在加载扩展集档案……");
+                    job.Load = ExtensionSet::LoadArchiveFromLibrary(libraryRoot, publisher, title, loadOptions);
+                    if (!job.Load.ok)
+                    {
+                        job.Error = job.Load.error.empty() ? job.Load.matchNote : job.Load.error;
+                        // "档案结构坏了"与"这是别的游戏的档案"要分开报，出路完全不同（验证 P-3）。
+                        job.Failure = job.Load.failure;
+                        break;
+                    }
+                    job.UnverifiedLoad = IsUnverifiedLoad(job);
+                    if (cancelled())
+                    {
+                        job.Error = L"已取消。";
+                        break;
+                    }
+                    // 加载没有进度回调（内核接口如此），所以这里按阶段报进度。
+                    progress(45u, L"正在用档案内嵌的盐展开静态 Hash 表……");
+                    job.Static = ExtensionSet::WriteStaticHashMap(job.Load.archive, outputDirectory);
+                    job.Ok = job.Static.ok;
+                    job.Error = job.Static.error;
                     break;
                 }
-                // 加载没有进度回调（内核接口如此），所以这里按阶段报进度。
-                progress(45u, L"正在用档案内嵌的盐展开静态 Hash 表……");
-                job.Static = ExtensionSet::WriteStaticHashMap(job.Load.archive, job.OutputDirectory);
-                job.Ok = job.Static.ok;
-                job.Error = job.Static.error;
-                break;
-            }
-            case JobKind::DryRun:
-            {
-                progress(3u, L"正在加载扩展集档案……");
-                job.Load = ExtensionSet::LoadArchiveFile(job.ArchivePath, job.LoadOptions);
-                if (!job.Load.ok)
+                case JobKind::DryRun:
                 {
-                    job.Error = job.Load.error.empty() ? job.Load.matchNote : job.Load.error;
+                    const ExtensionSet::LoadOptions loadOptions = job.LoadOptions;
+                    const std::wstring archivePath = job.ArchivePath;
+                    ExtensionSet::DryRunOptions dryRunOptions = job.DryRunOptions;
+                    progress(3u, L"正在加载扩展集档案……");
+                    job.Load = ExtensionSet::LoadArchiveFile(archivePath, loadOptions);
+                    if (!job.Load.ok)
+                    {
+                        job.Error = job.Load.error.empty() ? job.Load.matchNote : job.Load.error;
+                        break;
+                    }
+                    dryRunOptions.cancelRequested = cancelled;
+                    dryRunOptions.progress = progress;
+                    job.DryRun = ExtensionSet::DryRun(job.Load.archive, dryRunOptions);
+                    job.Ok = job.DryRun.ok;
+                    job.Error = job.DryRun.error;
                     break;
                 }
-                job.DryRunOptions.cancelRequested = cancelled;
-                job.DryRunOptions.progress = progress;
-                job.DryRun = ExtensionSet::DryRun(job.Load.archive, job.DryRunOptions);
-                job.Ok = job.DryRun.ok;
-                job.Error = job.DryRun.error;
-                break;
+                default:
+                    break;
             }
-            default:
-                break;
+        }
+        catch (const std::exception& exception)
+        {
+            job.Ok = false;
+            job.Error = L"后台任务抛出异常：" + ExceptionText(exception.what());
+        }
+        catch (...)
+        {
+            job.Ok = false;
+            job.Error = L"后台任务抛出未知异常。";
         }
 
         ::InterlockedExchange(&job.Done, 1);
-        ::PostMessageW(notify, kSetDoneMessage, 0, 0);
+        ::PostMessageW(notify, kSetDoneMessage, jobId, 0);
         return 0;
     }
 
     // 起线程。输入字段必须在这之前填好（线程一起来就会读）。
     bool StartJob(UiContext& context)
     {
-        if (context.JobActive)
+        if (JobBusy(context))
         {
             Host::ShowInfo(context.Window, L"已有后台任务在跑，等它结束或点「取消」之后再试。");
             return false;
@@ -2797,6 +2969,7 @@ namespace
         // 降一档优先级：这些任务都会吃满一个核（逐条哈希重算），别跟界面重绘抢 CPU。
         ::SetThreadPriority(job.Thread, THREAD_PRIORITY_BELOW_NORMAL);
         context.JobActive = true;
+        SetJobInteractionLocked(context, true);
         if (HWND cancel = ::GetDlgItem(context.Window, IDC_YUA_TASK_CANCEL))
         {
             ::EnableWindow(cancel, TRUE);
@@ -2806,9 +2979,14 @@ namespace
         return true;
     }
 
-    void OnJobProgress(UiContext& context)
+    void OnJobProgress(UiContext& context, unsigned int jobId)
     {
         SetJob& job = context.Job;
+        if (!context.JobActive || job.Id != jobId)
+        {
+            // 上一轮任务迟到的进度消息：丢弃，别把新任务的进度条改回旧值。
+            return;
+        }
         unsigned int percent = 0u;
         std::wstring stage;
         if (job.LockReady)
@@ -2829,6 +3007,10 @@ namespace
     // allowUnverified 只在用户明确同意"不做归属校验"时为 true（设计稿 §2.1）。
     bool BeginStaticHashJob(UiContext& context, bool allowUnverified)
     {
+        if (JobBusy(context))
+        {
+            return false;
+        }
         ResetJob(context, JobKind::StaticHash, L"正在加载扩展集档案……");
         ExtensionSet::LoadOptions options = ExtensionSet::ResolveLoadOptions(
             context.ExePath, Host::LogDirectory(),
@@ -2843,17 +3025,57 @@ namespace
     }
 
     // 任务收尾：结论落到界面状态与右侧概览。
-    void OnJobDone(UiContext& context)
+    void OnJobDone(UiContext& context, unsigned int jobId)
     {
         SetJob& job = context.Job;
+        if (job.Id != jobId)
+        {
+            // 上一轮任务迟到的完成消息：结果早已处理过，不能拿它去改下一轮的状态。
+            return;
+        }
+        if (!context.JobActive)
+        {
+            // 关闭路径已经 join 过线程并释放了 JobActive。这里仍做一次无副作用的
+            // 结果清理，不能因为 JobActive=false 就把迟到 Done 当成"什么都不用做"。
+            job.Kind = JobKind::None;
+            job.Generate = ExtensionSet::GenerateResult{};
+            job.Static = ExtensionSet::StaticHashResult{};
+            job.DryRun = ExtensionSet::DryRunResult{};
+            job.Load = ExtensionSet::LoadResult{};
+            return;
+        }
         if (job.Thread)
         {
-            ::WaitForSingleObject(job.Thread, 5000);
+            // Done 是在线程体最后置位的，这里 join 立即返回；用 INFINITE 是为了
+            // 无论调度多慢都真正等到线程退出，之后才关闭句柄、才允许复用 Job。
+            ::WaitForSingleObject(job.Thread, INFINITE);
             ::CloseHandle(job.Thread);
             job.Thread = nullptr;
         }
         context.JobActive = false;
+        SetJobInteractionLocked(context, false);
         SetTaskIdle(context);
+
+        // 结论框（模态）会派发本窗口的定时器；关闭轮询看到这个标志就暂缓销毁窗口。
+        struct DoneUiGuard
+        {
+            bool& Flag;
+            explicit DoneUiGuard(bool& flag) : Flag(flag) { Flag = true; }
+            ~DoneUiGuard() { Flag = false; }
+        } doneUiGuard(context.JobDoneUi);
+
+        if (context.ClosePending)
+        {
+            // 用户已经确认关闭：不要弹任何结论框（模态框会拖住关闭流程），只记日志。
+            job.Kind = JobKind::None;
+            job.Generate = ExtensionSet::GenerateResult{};
+            job.Static = ExtensionSet::StaticHashResult{};
+            job.DryRun = ExtensionSet::DryRunResult{};
+            job.Load = ExtensionSet::LoadResult{};
+            Host::LogLine(Log::Level::Info,
+                          L"[YuaExtract] 后台任务结束；关闭请求已挂起，跳过结果弹框");
+            return;
+        }
 
         const JobKind kind = job.Kind;
         job.Kind = JobKind::None;
@@ -2963,7 +3185,14 @@ namespace
                                 context.RenderedOverview.clear();
                                 UpdateOverview(context);
                                 ::UpdateWindow(context.Window);
-                                Host::RunStaticKeyExtractionForTarget(context.Window);
+                                if (!Host::RunStaticKeyExtractionForTarget(context.Window))
+                                {
+                                    // 用户没确认 / 提取失败：不得无条件重试。
+                                    context.StageNote = L"静态 Key 提取未执行或失败，已停止本次步骤1。";
+                                    context.RenderedOverview.clear();
+                                    UpdateOverview(context);
+                                    return;
+                                }
                                 BeginStaticHashJob(context, false);
                                 return;
                             }
@@ -3126,20 +3355,27 @@ namespace
         UpdateOverview(context);
     }
 
-    // 关窗兜底：置取消标志并等线程退出来。内核的取消回调是按条检查的，
-    // 正常几百毫秒内就能退出；这里给 30 秒兜底，免得某次磁盘 I/O 卡住时窗口关不掉。
-    void StopJobForClose(UiContext& context)
+    // 关窗前的收尾。**超时不等于线程结束**：只有 WAIT_OBJECT_0 才关闭句柄并释放 Job；
+    // 超时就把句柄、Job 与 Lock 原样保留，由调用方保持窗口存活、稍后重试。
+    // 返回 true = 线程已经真正退出，可以安全销毁窗口。
+    bool TryStopJobForClose(UiContext& context)
     {
         if (!context.Job.Thread)
         {
-            return;
+            return true;
         }
         ::InterlockedExchange(&context.Job.Cancel, 1);
-        SetTaskText(context, L"正在等待后台任务结束……");
-        ::WaitForSingleObject(context.Job.Thread, 30000);
+        const DWORD wait = ::WaitForSingleObject(context.Job.Thread, 0u);
+        if (wait != WAIT_OBJECT_0)
+        {
+            SetTaskText(context, L"正在等待后台任务退出……（超时也不会强行结束线程）");
+            return false;
+        }
         ::CloseHandle(context.Job.Thread);
         context.Job.Thread = nullptr;
         context.JobActive = false;
+        SetJobInteractionLocked(context, false);
+        return true;
     }
 
     // ---------- 首页模式（设计稿 §8.3） ----------
@@ -3266,6 +3502,10 @@ namespace
 
     void OnAuxCheck(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         SyncTargetFromEdit(context);
         if (context.Paths.GameDir.empty())
         {
@@ -3281,6 +3521,10 @@ namespace
 
     void OnAuxOpenWorkspace(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         SyncTargetFromEdit(context);
         if (context.Paths.GameDir.empty())
         {
@@ -3292,6 +3536,10 @@ namespace
 
     void OnAuxOpenRestoreDir(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         SyncTargetFromEdit(context);
         if (!context.RestoreProbe.exists)
         {
@@ -3303,6 +3551,10 @@ namespace
 
     void OnAuxOpenReport(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         SyncTargetFromEdit(context);
         if (context.Paths.RestoreReport.empty() ||
             ::GetFileAttributesW(context.Paths.RestoreReport.c_str()) == INVALID_FILE_ATTRIBUTES)
@@ -3315,6 +3567,10 @@ namespace
 
     void OnAuxClean(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         SyncTargetFromEdit(context);
         if (context.Paths.GameDir.empty())
         {
@@ -3779,6 +4035,10 @@ namespace
 
     void OnSetGenerate(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         const std::wstring exe = RequireTarget(context);
         if (exe.empty())
         {
@@ -3821,6 +4081,10 @@ namespace
 
     void OnSetEditInfo(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         SyncTargetFromEdit(context);
         if (context.Meta.title.empty())
         {
@@ -3875,6 +4139,10 @@ namespace
 
     void OnSetTest(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         SyncTargetFromEdit(context);
         if (!FileExistsAt(context.DraftArchive))
         {
@@ -3904,6 +4172,10 @@ namespace
 
     void OnSetOpenDraft(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         SyncTargetFromEdit(context);
         if (context.DraftDir.empty())
         {
@@ -3921,6 +4193,10 @@ namespace
 
     void OnSetInstall(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         SyncTargetFromEdit(context);
         if (!FileExistsAt(context.DraftArchive))
         {
@@ -3935,14 +4211,8 @@ namespace
             context.LibraryRoot = ExtensionSet::DefaultLibraryRoot(Host::LoaderDirectory());
         }
         std::wstring error;
-        if (!EnsureDirectory(context.LibraryRoot, error))
-        {
-            // 设计稿 §6 / §9：工具目录不可写时不静默回落，明确报错让用户自己决定放哪儿。
-            Host::ShowError(context.Window, L"扩展集库目录不可写：\r\n" + context.LibraryRoot + L"\r\n\r\n" +
-                                                error +
-                                                L"\r\n\r\n请把本工具挪到可写的目录（例如桌面或 D 盘），再重新安装。");
-            return;
-        }
+        // 库目录的创建 / 回滚交给内核事务：UI 先建目录会在失败回滚后留下一个空目录，
+        // 而用户看到的却是"什么都没装"。失败原因一律以内核 error 为准。
         if (!ExtensionSet::InstallToLibrary(context.LibraryRoot, context.DraftArchive, error))
         {
             Host::ShowError(context.Window, L"安装到扩展集库失败：\r\n" +
@@ -3963,6 +4233,10 @@ namespace
 
     void OnSetOpenLibrary(UiContext& context)
     {
+        if (RejectIfBusy(context, L"打开扩展集库目录"))
+        {
+            return;
+        }
         if (context.LibraryRoot.empty())
         {
             context.LibraryRoot = ExtensionSet::DefaultLibraryRoot(Host::LoaderDirectory());
@@ -3978,6 +4252,10 @@ namespace
 
     void OnSetPickSource(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         const std::wstring chosen =
             Host::BrowseForFolder(context.Window, L"选择扩展集来源目录（默认 Restored_Extractor_Output）");
         if (chosen.empty())
@@ -3992,6 +4270,10 @@ namespace
 
     void OnSetPickTest(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         const std::wstring chosen =
             Host::BrowseForFolder(context.Window, L"选择测试来源目录（默认跟随采集来源）");
         if (chosen.empty())
@@ -4268,6 +4550,10 @@ namespace
     // 刷新列表：重扫库清单 → 落到详情面板（UpdateOverview 按当前页签分发，本页签落在 IDC_YUA_PAGE）。
     void OnSetRefresh(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         RefreshLibrary(context);
         if (!context.Catalog.ok)
         {
@@ -4306,6 +4592,10 @@ namespace
     // 该建目录的是安装与在线更新那两条路（它们建完就有东西）。
     void OnSetOpenLibraryRoot(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         if (context.LibraryRoot.empty())
         {
             context.LibraryRoot = ExtensionSet::DefaultLibraryRoot(Host::LoaderDirectory());
@@ -4330,6 +4620,10 @@ namespace
     // 打开选中的那一个扩展集目录：<库根>\<会社>\<作品>。
     void OnSetOpenEntry(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         if (context.SelectedPublisher.empty() || context.SelectedTitle.empty())
         {
             Host::ShowInfo(context.Window, L"先在左侧「扩展集选择」里选一个会社，再选一个作品。");
@@ -4363,6 +4657,10 @@ namespace
     // 成功也弹的话，每点一次就要多点一次"确定"，很快就被无视了）。
     void OnSetSelfCheck(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         context.SelfCheck = RunEnvironmentSelfCheck(context);
         context.HasSelfCheck = true;
         const unsigned int problems = SelfCheckProblemCount(context.SelfCheck);
@@ -4392,6 +4690,10 @@ namespace
     // 这个只是把选中档案里已经写着的留言读出来给人看。
     void OnSetShowNote(UiContext& context)
     {
+        if (RejectIfBusy(context, L"查看扩展集留言"))
+        {
+            return;
+        }
         if (context.SelectedPublisher.empty() || context.SelectedTitle.empty())
         {
             Host::ShowInfo(context.Window, L"先在左侧「扩展集选择」里选一个会社，再选一个作品，\r\n"
@@ -4463,6 +4765,10 @@ namespace
     // 免得"刚装完却在列表里看不到"。
     void OnSetOnlineUpdate(UiContext& context)
     {
+        if (RejectIfBusy(context, L"执行这个操作"))
+        {
+            return;
+        }
         OnlineUpdateDialog(context);
         RefreshLibrary(context);
         context.RenderedOverview.clear();
@@ -4680,6 +4986,37 @@ namespace
         std::vector<ExtensionSet::LibraryEntry> Entries; // 远端索引
         OnlineJob Job;
         bool JobActive = false;
+        unsigned int NextJobId = 0;
+        // 已确认关闭、但联网线程还没真正退出：窗口保持存活，定时器轮询句柄。
+        bool ClosePending = false;
+        bool Closing = false;
+        bool JobDoneUi = false;
+
+        ~OnlineDialogState()
+        {
+            if (Job.Thread)
+            {
+                ::CloseHandle(Job.Thread);
+                Job.Thread = nullptr;
+            }
+            if (Job.LockReady)
+            {
+                ::DeleteCriticalSection(&Job.Lock);
+                Job.LockReady = false;
+            }
+        }
+    };
+
+    // 弹窗状态由 shared_ptr 持有：窗口先销毁、联网线程还没退出时，线程自己那份引用
+    // 保证 State 不会析构；线程结束后最后一个引用释放，才拆锁。
+    struct OnlineDialogHost
+    {
+        std::shared_ptr<OnlineDialogState> State;
+    };
+
+    struct OnlineThreadContext
+    {
+        std::shared_ptr<OnlineDialogState> State;
     };
 
     void PlaceOnlineControl(HWND control, int x, int y, int width, int height)
@@ -4764,13 +5101,48 @@ namespace
         SetOnlineStatus(state, text);
     }
 
+    // 弹窗里所有会起任务 / 改配置 / 入库的入口共用这一条门禁。
+    // 关闭挂起、正在关闭、结论框模态期间一律不许重入 shared job。
+    bool OnlineActionBlocked(const OnlineDialogState& state)
+    {
+        return state.JobActive || state.ClosePending || state.Closing || state.JobDoneUi;
+    }
+
+    // 下载任务即使 worker job.Ok=true，只要本次被取消 / 关窗挂起 / 正在关闭 /
+    // 结论框还开着，就绝不 InstallBytesToLibrary。生产入口与 headless 测试共用。
+    //
+    // includeDoneUi：OnOnlineJobDone 自己会置 JobDoneUi 来保护结论/覆盖确认框；
+    // 在"最终入库前复核"时必须忽略这个自置标志（否则永远为 true），
+    // 但仍要检查 cancelled / ClosePending / Closing —— 用户在覆盖确认框打开期间
+    // 关窗或 automation 发起关闭，会让 ClosePending 变为 true。
+    bool OnlineDownloadMustSkipInstall(const OnlineDialogState& state, OnlineJobKind kind,
+                                       bool cancelled, bool includeDoneUi = true)
+    {
+        return kind == OnlineJobKind::Download &&
+               (cancelled || state.ClosePending || state.Closing ||
+                (includeDoneUi && state.JobDoneUi));
+    }
+
+    // 真正写库前的最终复核：OnOnlineJobDone 自己会把 JobDoneUi 置 true 来保护确认框，
+    // 所以这里必须忽略它，只看 Cancel / ClosePending / Closing 这些在模态框打开期间
+    // 可能新到达的取消信号。生产 InstallVerifiedArchive 与 headless 测试共用。
+    bool OnlineInstallRecheckAborts(const OnlineDialogState& state, const OnlineJob& job)
+    {
+        const bool cancelled =
+            ::InterlockedCompareExchange(const_cast<volatile LONG*>(&job.Cancel), 0, 0) != 0;
+        return OnlineDownloadMustSkipInstall(state, OnlineJobKind::Download, cancelled,
+                                             false /* includeDoneUi */);
+    }
+
     // 忙碌时两个动作按钮都禁用；空闲时按"有没有远端条目"决定 INSTALL 能不能点。
     // §8.5 驱动约定 5：驱动方就是靠 IDC_YUA_ONLINE_INSTALL 的 enable 状态判联网动作结束。
     void RefreshOnlineButtons(OnlineDialogState& state)
     {
-        ::EnableWindow(::GetDlgItem(state.Window, IDC_YUA_ONLINE_REFRESH), state.JobActive ? FALSE : TRUE);
+        const bool blocked = OnlineActionBlocked(state);
+        ::EnableWindow(::GetDlgItem(state.Window, IDC_YUA_ONLINE_REFRESH), blocked ? FALSE : TRUE);
         ::EnableWindow(::GetDlgItem(state.Window, IDC_YUA_ONLINE_INSTALL),
-                       (state.JobActive || state.Entries.empty()) ? FALSE : TRUE);
+                       (blocked || state.Entries.empty()) ? FALSE : TRUE);
+        ::EnableWindow(::GetDlgItem(state.Window, IDC_YUA_ONLINE_CLOSE), state.Closing ? FALSE : TRUE);
     }
 
     int OnlineSelectedIndex(const OnlineDialogState& state)
@@ -4864,68 +5236,110 @@ namespace
     // 所以这里只做"拿到字节 + 校验"，决策与入库回界面线程做。
     DWORD WINAPI OnlineJobThreadProc(LPVOID parameter)
     {
-        OnlineDialogState* state = static_cast<OnlineDialogState*>(parameter);
+        // 线程自己持有一份 State 引用：窗口先关掉也不会把正在写的对象析构掉。
+        std::unique_ptr<OnlineThreadContext> context(static_cast<OnlineThreadContext*>(parameter));
+        OnlineDialogState* state = context->State.get();
         OnlineJob& job = state->Job;
         const HWND notify = state->Window;
+        const unsigned int jobId = job.Id;
 
         const auto cancelled = [&job](void) -> bool
         {
             return ::InterlockedCompareExchange(&job.Cancel, 0, 0) != 0;
         };
-        const auto progress = [&job, notify](int percent, const std::wstring& stage)
+        const auto progress = [&job, notify, jobId](int percent, const std::wstring& stage)
         {
             SetOnlineJobStage(job, percent < 0 ? 0u : static_cast<unsigned int>(percent), stage);
-            ::PostMessageW(notify, kOnlineProgressMessage, 0, 0);
+            ::PostMessageW(notify, kOnlineProgressMessage, jobId, 0);
         };
 
         Online::Request request;
         request.cancel = cancelled;
         request.progress = progress;
 
-        switch (job.Kind)
+        try
         {
-            case OnlineJobKind::FetchIndex:
+            switch (job.Kind)
             {
-                job.Entries.clear();
-                job.Ok = Online::FetchIndex(job.Base, job.Entries, job.Index, job.Error, request);
-                break;
-            }
-            case OnlineJobKind::Download:
-            {
-                // 自己一份条目：线程里只读，不跟界面线程共用同一个对象。
-                const ExtensionSet::LibraryEntry entry = job.Entry;
-                if (!Online::DownloadArchive(job.Base, entry, job.StagingDirectory, job.Download, job.Error,
-                                             request))
+                case OnlineJobKind::FetchIndex:
                 {
-                    break; // Ok 保持 false
+                    job.Entries.clear();
+                    job.Ok = Online::FetchIndex(job.Base, job.Entries, job.Index, job.Error, request);
+                    break;
                 }
-                job.Ok = Online::VerifyArchive(job.Download.path, entry, job.VerifyDetail, job.Error);
-                break;
+                case OnlineJobKind::Download:
+                {
+                    // 自己一份条目：线程里只读，不跟界面线程共用同一个对象。
+                    const ExtensionSet::LibraryEntry entry = job.Entry;
+                    const std::wstring base = job.Base;
+                    const std::wstring staging = job.StagingDirectory;
+                    const bool downloaded =
+                        Online::DownloadArchive(base, entry, staging, job.Download, job.Error, request);
+                    if (downloaded)
+                    {
+                        // 校验**同一份内存字节**，不再按路径重读暂存文件。
+                        job.Ok = Online::VerifyArchiveBytes(job.Download.blob, entry, job.VerifyDetail, job.Error);
+                    }
+                    // 取消可能在下载后、校验后任意时刻到达：取消 = 零提交。
+                    if (cancelled())
+                    {
+                        job.Ok = false;
+                        job.Error = L"已取消。";
+                    }
+                    // worker 在退出前保证清掉本次 owned 暂存目录（成功/失败/取消都一样；
+                    // 入库只用内存 blob，不依赖暂存路径）。界面侧退出路径仍会再清一次。
+                    Online::CleanupStaging(staging);
+                    break;
+                }
+                default:
+                    break;
             }
-            default:
-                break;
+        }
+        catch (const std::exception& exception)
+        {
+            job.Ok = false;
+            job.Error = L"联网任务抛出异常：" + ExceptionText(exception.what());
+        }
+        catch (...)
+        {
+            job.Ok = false;
+            job.Error = L"联网任务抛出未知异常。";
         }
 
         ::InterlockedExchange(&job.Done, 1);
-        ::PostMessageW(notify, kOnlineDoneMessage, 0, 0);
+        ::PostMessageW(notify, kOnlineDoneMessage, jobId, 0);
         return 0;
     }
 
-    bool StartOnlineJob(OnlineDialogState& state)
+    bool StartOnlineJob(const std::shared_ptr<OnlineDialogState>& statePtr)
     {
-        if (state.JobActive)
+        if (!statePtr)
         {
-            return false; // 忙时按钮本来就是禁用的，这里只是兜底
+            return false;
+        }
+        OnlineDialogState& state = *statePtr;
+        if (OnlineActionBlocked(state))
+        {
+            return false; // 关闭挂起 / 结论框期间绝不重入 shared job
         }
         OnlineJob& job = state.Job;
+        job.Id = ++state.NextJobId;
         ::InterlockedExchange(&job.Cancel, 0);
         ::InterlockedExchange(&job.Done, 0);
         ::InterlockedExchange(&job.Percent, 0);
         job.Ok = false;
         job.Error.clear();
-        job.Thread = ::CreateThread(nullptr, 0u, OnlineJobThreadProc, &state, 0u, nullptr);
+        auto* threadContext = new (std::nothrow) OnlineThreadContext{ statePtr };
+        if (!threadContext)
+        {
+            job.Kind = OnlineJobKind::None;
+            Host::ShowError(state.Window, L"内存不足，启动联网任务失败。");
+            return false;
+        }
+        job.Thread = ::CreateThread(nullptr, 0u, OnlineJobThreadProc, threadContext, 0u, nullptr);
         if (!job.Thread)
         {
+            delete threadContext;
             job.Kind = OnlineJobKind::None;
             Host::ShowError(state.Window, L"启动联网任务线程失败。");
             return false;
@@ -4938,19 +5352,23 @@ namespace
         return true;
     }
 
-    // 收线程。窗口销毁之前**必须**调：线程会往 state 里写结果，而 state 是
-    // OnlineUpdateDialog 的栈对象 —— 线程还没退就销毁窗口，之后它就在往已经析构的对象上写。
-    void StopOnlineJob(OnlineDialogState& state)
+    // 收线程。只有 WAIT_OBJECT_0 才关闭句柄并认为线程真的结束了；
+    // 超时保留句柄 / State（shared_ptr 仍由线程持有），窗口保持打开，由定时器重试。
+    bool TryStopOnlineJob(OnlineDialogState& state)
     {
         if (!state.Job.Thread)
         {
-            return;
+            return true;
         }
         ::InterlockedExchange(&state.Job.Cancel, 1);
-        ::WaitForSingleObject(state.Job.Thread, 30000);
+        if (::WaitForSingleObject(state.Job.Thread, 0u) != WAIT_OBJECT_0)
+        {
+            return false;
+        }
         ::CloseHandle(state.Job.Thread);
         state.Job.Thread = nullptr;
         state.JobActive = false;
+        return true;
     }
 
     // 把「仓库地址」输入框里的值回写 ini（失败明确提示）。离开输入框、或点动作按钮时都调一次。
@@ -4964,6 +5382,10 @@ namespace
     // 同一件事连弹两个框只会让人把第一个关掉、然后对着第二个发呆。
     void ApplyOnlineEndpoint(OnlineDialogState& state, bool reportFailure)
     {
+        if (OnlineActionBlocked(state))
+        {
+            return;
+        }
         HWND edit = ::GetDlgItem(state.Window, IDC_YUA_ONLINE_ENDPOINT);
         const std::wstring typed = GetControlText(edit);
         if (typed.empty())
@@ -5010,8 +5432,13 @@ namespace
     }
 
     // 拉索引（4141）。
-    void OnOnlineRefresh(OnlineDialogState& state)
+    void OnOnlineRefresh(OnlineDialogHost& host)
     {
+        OnlineDialogState& state = *host.State;
+        if (OnlineActionBlocked(state))
+        {
+            return;
+        }
         // 用户可能改完地址没离开输入框就直接点按钮，所以动作入口也要落实一次基址
         //（失败不在这里报，交给下面的联网步骤报）。
         ApplyOnlineEndpoint(state, false);
@@ -5024,10 +5451,9 @@ namespace
 
         OnlineJob& job = state.Job;
         job.Kind = OnlineJobKind::FetchIndex;
-        // **传框里的原文**（P-2）：不可用的地址由内核在自己的入口上报，
-        // 报错里才引得到用户填的那一串，而不是一个空串。
+        // **拉索引不建暂存目录**：这一步没有下载产物，创建默认根只会在磁盘上留下空目录。
+        job.StagingDirectory.clear();
         job.Base = EndpointForRequest(state);
-        job.StagingDirectory = Online::DefaultStagingDirectory();
         job.Entry = ExtensionSet::LibraryEntry{};
         job.Entries.clear();
         job.Index = Online::IndexResult{};
@@ -5042,15 +5468,20 @@ namespace
                         L"正在拉取索引：\r\n" + DescribeRequestUrl(Online::IndexUrl(job.Base)) +
                             L"\r\n\r\n请求基址：" + DescribeBase(job.Base) + L"\r\n当前生效基址：" +
                             DescribeBase(state.EffectiveBase) + L"\r\n配置文件：" + Online::ConfigFilePath());
-        if (StartOnlineJob(state))
+        if (StartOnlineJob(host.State))
         {
             Host::LogLine(Log::Level::Info, L"[YuaExtract] 在线更新：拉取索引（请求基址 " + job.Base + L"）");
         }
     }
 
     // 下载并安装选中（4143）：下载 + 校验在后台线程，覆盖决策与入库回界面线程（见线程体注释）。
-    void OnOnlineInstall(OnlineDialogState& state)
+    void OnOnlineInstall(OnlineDialogHost& host)
     {
+        OnlineDialogState& state = *host.State;
+        if (OnlineActionBlocked(state))
+        {
+            return;
+        }
         ApplyOnlineEndpoint(state, false);
 
         const int index = OnlineSelectedIndex(state);
@@ -5092,10 +5523,14 @@ namespace
                             DescribeRequestUrl(Online::ArchiveUrl(job.Base, entry.publisher, entry.title)) +
                             L"\r\n\r\n请求基址：" + DescribeBase(job.Base) + L"\r\n暂存目录：" +
                             job.StagingDirectory);
-        if (StartOnlineJob(state))
+        if (StartOnlineJob(host.State))
         {
             Host::LogLine(Log::Level::Info,
                           L"[YuaExtract] 在线更新：开始下载 " + entry.publisher + L" / " + entry.title);
+        }
+        else
+        {
+            Online::CleanupStaging(job.StagingDirectory);
         }
     }
 
@@ -5105,34 +5540,90 @@ namespace
         UiContext& context = *state.Context;
         const ExtensionSet::LibraryEntry remote = job.Entry;
 
+        // 最终入库门禁：OnOnlineJobDone 里的初始 skipInstall 只是收到 Done 那一刻的快照。
+        // 覆盖确认框是模态的，会泵消息：用户点「是」之前，WM_CLOSE / automation 完全可能
+        // 把 ClosePending 置 true（或 Cancel 置位）。每次将要进入下一阶段（确认框前、
+        // 确认框点「是」后、真正 InstallBytesToLibrary 前）都必须重新核对。
+        // 这里忽略 OnOnlineJobDone 自己置的 JobDoneUi（否则永远为 true），
+        // 但仍检查 cancelled / ClosePending / Closing。
+        const auto installMustAbort = [&]() -> bool
+        {
+            if (!OnlineInstallRecheckAborts(state, job))
+            {
+                return false;
+            }
+            Online::CleanupStaging(job.StagingDirectory);
+            const std::wstring text = L"已取消：关闭 / 取消请求已到达，下载结果不会写入本地库。";
+            SetOnlineStatus(state, text);
+            Host::LogLine(Log::Level::Info,
+                          L"[YuaExtract] 在线更新：最终复核为取消 / 关闭，跳过入库（" +
+                              remote.publisher + L" / " + remote.title + L"）");
+            return true;
+        };
+
         // 库根不存在就建（与「安装到扩展集库」同一口径：建不出来明确报错，不静默回落）。
         if (context.LibraryRoot.empty())
         {
             context.LibraryRoot = ExtensionSet::DefaultLibraryRoot(Host::LoaderDirectory());
         }
+        // **不在这里 EnsureDirectory(libraryRoot)**：事务由内核负责。
+        // UI 先建目录，失败回滚后就会留下一个空目录，而结论却是"零改动"。
         std::wstring error;
-        if (!EnsureDirectory(context.LibraryRoot, error))
+        if (installMustAbort())
+        {
+            return;
+        }
+        if (job.Download.blob.empty())
         {
             Online::CleanupStaging(job.StagingDirectory);
-            const std::wstring text = L"扩展集库目录不可写：\r\n" + context.LibraryRoot + L"\r\n" + error +
-                                      L"\r\n\r\n本地库未被改动。";
+            const std::wstring text = L"安装失败：下载结果为空（没有可写入库的字节）。";
             SetOnlineStatus(state, text);
-            Host::LogLine(Log::Level::Warn, L"[YuaExtract] 在线更新：入库失败（库目录不可写）" + error);
+            Host::LogLine(Log::Level::Warn, L"[YuaExtract] 在线更新：" + text);
             Host::ShowError(state.Window, text);
             return;
         }
 
         const ExtensionSet::LibraryCatalog local = ExtensionSet::EnumerateLibrary(context.LibraryRoot);
         const Online::EntryState entryState = Online::Classify(remote, local);
-        const ExtensionSet::LibraryEntry* previous = FindLibraryEntry(local, remote.publisher, remote.title);
+        const std::wstring remoteSlot = ExtensionSet::LibrarySlotKey(remote.publisher, remote.title);
+        auto sameExeDigest = [&remote](const ExtensionSet::LibraryEntry& entry) -> bool
+        {
+            const std::wstring r1 = remote.exeDigest;
+            const std::wstring r2 = remote.siblingDigest;
+            const std::wstring e1 = entry.exeDigest;
+            const std::wstring e2 = entry.siblingDigest;
+            return (!r1.empty() && (r1 == e1 || r1 == e2)) || (!r2.empty() && (r2 == e1 || r2 == e2));
+        };
+        // 所有会被这次安装替换掉的旧项：同 slot（sanitize+casefold 后的物理槽位）
+        // 或同 exe 摘要。**全部列出来** —— 只报第一条会漏掉 sameExe 的其它副本，
+        // 用户看到的"旧条数/旧摘要"就和实际被替换的东西对不上。
+        std::vector<const ExtensionSet::LibraryEntry*> replaced;
+        for (const ExtensionSet::LibraryEntry& entry : local.entries)
+        {
+            const std::wstring slot = ExtensionSet::LibrarySlotKey(entry.publisher, entry.title);
+            if ((!remoteSlot.empty() && slot == remoteSlot) || sameExeDigest(entry))
+            {
+                replaced.push_back(&entry);
+            }
+        }
 
         // §14.4 第 7 条：本地已有、但档案摘要不同 → 先问用户（列出新旧条数/摘要），不静默覆盖。
-        if (entryState == Online::EntryState::Update || entryState == Online::EntryState::LocalNewer)
+        // "新增"不能覆盖已有项：只要 replaced 非空（同 slot 或同 exe），就一律按覆盖确认。
+        if (installMustAbort())
         {
-            std::wstring question = L"本地已经有这一份扩展集，且与远端这份的档案摘要不同：\r\n\r\n";
-            question += L"本地：" + FormatCount(previous ? previous->entryCount : 0u) + L" 条，档案摘要 " +
-                        ShortDigest(previous ? previous->archiveDigest : std::wstring()) + L"\r\n";
-            question += L"远端：" + FormatCount(remote.entryCount) + L" 条，档案摘要 " +
+            return;
+        }
+        if (!replaced.empty() && entryState != Online::EntryState::Same)
+        {
+            std::wstring question = L"本地已经有这一份扩展集（或同 EXE 的副本），且与远端这份的档案摘要不同：\r\n\r\n";
+            for (const ExtensionSet::LibraryEntry* previous : replaced)
+            {
+                question += L"本地：" + previous->publisher + L" / " + previous->title + L"，" +
+                            FormatCount(previous->entryCount) + L" 条，档案摘要 " +
+                            ShortDigest(previous->archiveDigest) + L"\r\n";
+            }
+            question += L"\r\n远端：" + remote.publisher + L" / " + remote.title + L"，" +
+                        FormatCount(remote.entryCount) + L" 条，档案摘要 " +
                         ShortDigest(remote.archiveDigest) + L"\r\n\r\n";
             if (entryState == Online::EntryState::LocalNewer)
             {
@@ -5140,7 +5631,7 @@ namespace
                 question += L"注意：远端这份的条数比本地少 —— 覆盖之后本地能解出的名字会变少"
                             L"（覆盖度下降，且本地那份找不回来）。\r\n\r\n";
             }
-            question += L"点「是」= 用远端这份覆盖本地；点「否」= 不动本地（暂存文件照旧清掉）。";
+            question += L"点「是」= 用远端这份覆盖上面列出的本地项；点「否」= 不动本地（暂存文件照旧清掉）。";
 
             if (!Host::Confirm(state.Window, question, L"覆盖本地扩展集？"))
             {
@@ -5152,21 +5643,24 @@ namespace
                                                     L" / " + remote.title);
                 return;
             }
+            // 用户点了「是」，但确认框期间可能已经收到 WM_CLOSE / 取消：重新核对后才允许入库。
+            if (installMustAbort())
+            {
+                return;
+            }
         }
 
-        // 清单的「来源」列写**远端 URL**，不写 job.Download.path：
-        // 那个路径是暂存文件，下面 CleanupStaging 一走就没了，写进清单等于记一个死路径
-        //（独立验证 P-3；本地制作那条路没这个问题，它传的草案档案本来就长期留在盘上）。
-        // ArchiveUrl 拼不出名字时返回空串 → 内核自动回退成 archivePath，不会写出半截值。
-        if (!ExtensionSet::InstallToLibrary(context.LibraryRoot, job.Download.path, error,
-                                            Online::ArchiveUrl(job.Base, remote.publisher, remote.title)))
+        // 用**下载并校验过的同一份内存字节**入库：不再按 job.Download.path 重读，
+        // 避免"校验的是 A、写进库的是 B"。sourceLabel 仍用远端 URL（暂存文件马上被清掉）。
+        if (installMustAbort())
+        {
+            return;
+        }
+        if (!ExtensionSet::InstallBytesToLibrary(context.LibraryRoot, job.Download.blob, error,
+                                                 Online::ArchiveUrl(job.Base, remote.publisher, remote.title)))
         {
             Online::CleanupStaging(job.StagingDirectory);
-            // **不在这里替内核下断言**：本地库到底动没动，只有 InstallToLibrary 自己知道 ——
-            // 它可能已经写完 rules.int 才在清单那一步失败（那种回不去，error 里会写明
-            // "本地库与操作前不一致"）。UI 再无条件下补一句"本地库未被改动"，
-            // 就会在同一个弹窗里和它自相矛盾：等于对用户说两种结论（独立验证 P-3 的后续）。
-            // 本地库状态一律以 error 里那句为准，这里只负责把 error 原样摆出来。
+            // 本地库状态以内核 error 里那句为准，UI 不再替它下"未被改动"的断言。
             const std::wstring text = L"安装失败：\r\n" +
                                       (error.empty() ? std::wstring(L"（内核没有给出原因）") : error);
             SetOnlineStatus(state, text);
@@ -5176,15 +5670,19 @@ namespace
         }
         Online::CleanupStaging(job.StagingDirectory);
 
-        // 结论要能区分「新增」与「更新（覆盖了哪一条、旧档案摘要是什么）」（§14.6）。
+        // 结论要能区分「新增」与「更新（覆盖了哪些旧项、旧档案摘要是什么）」（§14.6）。
         std::wstring text;
-        if (previous)
+        if (!replaced.empty())
         {
-            text = L"已更新：" + remote.publisher + L" / " + remote.title + L"\r\n"
-                   L"旧档案摘要：" + ShortDigest(previous->archiveDigest) + L"（" +
-                       FormatCount(previous->entryCount) + L" 条）\r\n"
-                   L"新档案摘要：" + ShortDigest(remote.archiveDigest) + L"（" +
-                       FormatCount(remote.entryCount) + L" 条）\r\n";
+            text = L"已更新：" + remote.publisher + L" / " + remote.title + L"\r\n";
+            for (const ExtensionSet::LibraryEntry* previous : replaced)
+            {
+                text += L"旧项：" + previous->publisher + L" / " + previous->title + L"，档案摘要 " +
+                        ShortDigest(previous->archiveDigest) + L"（" +
+                        FormatCount(previous->entryCount) + L" 条）\r\n";
+            }
+            text += L"新档案摘要：" + ShortDigest(remote.archiveDigest) + L"（" +
+                    FormatCount(remote.entryCount) + L" 条）\r\n";
         }
         else
         {
@@ -5198,8 +5696,11 @@ namespace
         //（`..\..\Windows\Temp` 落库是 `WindowsTemp`，验证 P-4）。刚装完的人最需要知道的就是
         // "东西到底进了哪个目录"，所以这里给实际路径，改写过就明说。
         {
+            // 物理槽位以内核的 LibrarySlotKey（sanitize + casefold）为准；界面自己拿原始名
+            // 拼路径会在大小写/非法字符上跟实际落盘分叉。
+            const std::wstring slot = ExtensionSet::LibrarySlotKey(remote.publisher, remote.title);
             const std::wstring installedDirectory =
-                LibraryDirectoryFor(context.LibraryRoot, remote.publisher, remote.title);
+                slot.empty() ? std::wstring() : JoinPath(context.LibraryRoot, slot);
             if (installedDirectory.empty())
             {
                 text += L"实际落库目录：（做不出目录名 —— 会社或作品名里全是非法字符）\r\n";
@@ -5230,22 +5731,58 @@ namespace
         Host::ShowInfo(state.Window, text);
     }
 
-    void OnOnlineJobDone(OnlineDialogState& state)
+    void OnOnlineJobDone(OnlineDialogState& state, unsigned int jobId)
     {
         OnlineJob& job = state.Job;
+        if (job.Id != jobId)
+        {
+            return; // 上一轮联网任务迟到的完成消息（generation 不匹配）
+        }
+        if (!state.JobActive)
+        {
+            // 关闭路径已经 join 过线程、清过句柄。这里仍要兜底清一次本次 owned 暂存，
+            // 且绝不再进 Install；不能因为 JobActive=false 就跳过 cleanup。
+            Online::CleanupStaging(job.StagingDirectory);
+            return;
+        }
         if (job.Thread)
         {
-            ::WaitForSingleObject(job.Thread, 5000);
+            ::WaitForSingleObject(job.Thread, INFINITE);
             ::CloseHandle(job.Thread);
             job.Thread = nullptr;
         }
         state.JobActive = false;
 
         const OnlineJobKind kind = job.Kind;
-        job.Kind = OnlineJobKind::None;
         const bool ok = job.Ok;
         const std::wstring error = job.Error;
         const bool cancelled = ::InterlockedCompareExchange(&job.Cancel, 0, 0) != 0;
+        // 必须在 DoneUiGuard 之前判断：guard 会把 JobDoneUi 置 true，而它们语义不同
+        //（一个是"本条 Done 之前用户/关闭流程的状态"，一个是"本条 Done 正在弹模态框"）。
+        const bool skipInstall = OnlineDownloadMustSkipInstall(state, kind, cancelled);
+
+        // 结论可能有模态框；关闭轮询看到这个标志就不销毁窗口。
+        struct DoneUiGuard
+        {
+            bool& Flag;
+            explicit DoneUiGuard(bool& flag) : Flag(flag) { Flag = true; }
+            ~DoneUiGuard() { Flag = false; }
+        } doneUiGuard(state.JobDoneUi);
+
+        job.Kind = OnlineJobKind::None;
+
+        // 取消 / 关闭挂起 / 正在关闭 = 零提交：即使 worker 已经校验成功（ok=true）
+        // 也绝不 InstallBytesToLibrary，只清本次 owned 暂存。
+        if (skipInstall)
+        {
+            Online::CleanupStaging(job.StagingDirectory);
+            SetOnlineStatus(state, L"已取消：下载 / 校验结果不会写入本地库。");
+            Host::LogLine(Log::Level::Info,
+                          L"[YuaExtract] 在线更新：任务已取消，跳过入库（" + job.Entry.publisher + L" / " +
+                              job.Entry.title + L"）");
+            RefreshOnlineButtons(state);
+            return;
+        }
 
         if (kind == OnlineJobKind::FetchIndex)
         {
@@ -5320,12 +5857,22 @@ namespace
         RefreshOnlineButtons(state);
     }
 
-    void CloseOnlineDialog(OnlineDialogState& state)
+    void CloseOnlineDialog(OnlineDialogHost& host)
     {
+        OnlineDialogState& state = *host.State;
+        if (state.Closing)
+        {
+            return;
+        }
+        if (state.JobDoneUi)
+        {
+            // 结论 / 覆盖确认框还开着：别销毁它脚下的窗口，等框关掉后由定时器收尾。
+            state.ClosePending = true;
+            ::SetTimer(state.Window, kClosePollTimerId, kClosePollIntervalMs, nullptr);
+            return;
+        }
         if (state.JobActive)
         {
-            // 线程会往 state 里写结果，而 state 是调用方的栈对象：必须等它退出来才能销毁窗口。
-            // 先问一句 —— 一次下载可能就差最后几秒。
             if (!Host::Confirm(state.Window,
                                L"联网任务还在跑（拉索引 / 下载）。关闭这个窗口会中止它。\r\n\r\n"
                                L"已经装进库的扩展集不受影响，未装进去的临时文件会被清掉。\r\n\r\n确认关闭？",
@@ -5334,9 +5881,22 @@ namespace
                 return;
             }
             Host::LogLine(Log::Level::Warn, L"[YuaExtract] 在线更新：用户关闭弹窗，已中止联网任务");
-            StopOnlineJob(state);
+            ::InterlockedExchange(&state.Job.Cancel, 1);
+            if (!TryStopOnlineJob(state))
+            {
+                // 线程还没退出：窗口与 State 都保持存活，等它真正结束后再销毁。
+                state.ClosePending = true;
+                SetOnlineStatus(state, L"正在等待联网任务退出……（不会强行结束线程）");
+                ::SetTimer(state.Window, kClosePollTimerId, kClosePollIntervalMs, nullptr);
+                return;
+            }
+            // 只有线程真退出后才清它这次登记的暂存目录。
+            Online::CleanupStaging(state.Job.StagingDirectory);
         }
+        state.Closing = true;
+        ::KillTimer(state.Window, kClosePollTimerId);
         ::DestroyWindow(state.Window);
+        state.Closing = false;
     }
 
     LRESULT CALLBACK OnlineDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -5344,14 +5904,15 @@ namespace
         if (msg == WM_NCCREATE)
         {
             CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
-            OnlineDialogState* state = static_cast<OnlineDialogState*>(create->lpCreateParams);
-            state->Window = hwnd;
-            ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+            OnlineDialogHost* host = static_cast<OnlineDialogHost*>(create->lpCreateParams);
+            host->State->Window = hwnd;
+            ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(host));
             return ::DefWindowProcW(hwnd, msg, wParam, lParam);
         }
 
-        OnlineDialogState* state =
-            reinterpret_cast<OnlineDialogState*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        OnlineDialogHost* host =
+            reinterpret_cast<OnlineDialogHost*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        OnlineDialogState* state = host ? host->State.get() : nullptr;
         if (!state)
         {
             return ::DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -5433,14 +5994,14 @@ namespace
                 switch (LOWORD(wParam))
                 {
                     case IDC_YUA_ONLINE_REFRESH:
-                        OnOnlineRefresh(*state);
+                        OnOnlineRefresh(*host);
                         return 0;
                     case IDC_YUA_ONLINE_INSTALL:
-                        OnOnlineInstall(*state);
+                        OnOnlineInstall(*host);
                         return 0;
                     case IDCANCEL:
                     case IDC_YUA_ONLINE_CLOSE:
-                        CloseOnlineDialog(*state);
+                        CloseOnlineDialog(*host);
                         return 0;
                     case IDC_YUA_ONLINE_ENDPOINT:
                         if (HIWORD(wParam) == EN_KILLFOCUS)
@@ -5457,6 +6018,10 @@ namespace
             case kOnlineProgressMessage:
             {
                 OnlineJob& job = state->Job;
+                if (!state->JobActive || job.Id != static_cast<unsigned int>(wParam))
+                {
+                    return 0; // 上一轮任务的迟到进度
+                }
                 unsigned int percent = 0u;
                 std::wstring stage;
                 if (job.LockReady)
@@ -5480,25 +6045,46 @@ namespace
             }
             case kOnlineDoneMessage:
             {
-                OnOnlineJobDone(*state);
+                OnOnlineJobDone(*state, static_cast<unsigned int>(wParam));
+                return 0;
+            }
+            case WM_TIMER:
+            {
+                if (wParam != kClosePollTimerId || !state->ClosePending)
+                {
+                    break;
+                }
+                if (state->JobDoneUi)
+                {
+                    return 0;
+                }
+                if (!TryStopOnlineJob(*state))
+                {
+                    return 0;
+                }
+                Online::CleanupStaging(state->Job.StagingDirectory);
+                state->ClosePending = false;
+                ::KillTimer(hwnd, kClosePollTimerId);
+                CloseOnlineDialog(*host);
                 return 0;
             }
             case WM_KEYDOWN:
             {
                 if (wParam == VK_ESCAPE)
                 {
-                    CloseOnlineDialog(*state);
+                    CloseOnlineDialog(*host);
                     return 0;
                 }
                 break;
             }
             case WM_CLOSE:
             {
-                CloseOnlineDialog(*state);
+                CloseOnlineDialog(*host);
                 return 0;
             }
             case WM_DESTROY:
             {
+                ::KillTimer(hwnd, kClosePollTimerId);
                 state->Done = true;
                 return 0;
             }
@@ -5535,7 +6121,9 @@ namespace
             return;
         }
 
-        OnlineDialogState state;
+        auto statePtr = std::make_shared<OnlineDialogState>();
+        OnlineDialogHost host{ statePtr };
+        OnlineDialogState& state = *statePtr;
         state.Context = &context;
         // 生效基址 = 配置解析出来的那个（环境变量 → ini → 常量，§14.5 的顺序在内核里）。
         // 它是**归一化之后**的值：配置里写的是 http/ftp 时它就在这里变成空串，
@@ -5549,14 +6137,10 @@ namespace
         HWND dialog = ::CreateWindowExW(WS_EX_DLGMODALFRAME, kOnlineDialogClass, L"在线更新扩展集",
                                         WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT,
                                         rect.right - rect.left, rect.bottom - rect.top, context.Window, nullptr,
-                                        context.Instance, &state);
+                                        context.Instance, &host);
         if (!dialog)
         {
-            if (state.Job.LockReady)
-            {
-                ::DeleteCriticalSection(&state.Job.Lock);
-                state.Job.LockReady = false;
-            }
+            // state 是 shared_ptr：worker 若已起来也持有引用，锁由最后一个引用释放时拆掉。
             Host::ShowError(context.Window, L"无法创建「在线更新」窗口。");
             return;
         }
@@ -5592,20 +6176,24 @@ namespace
             }
         }
 
-        // WM_QUIT 那条路不会走 CloseOnlineDialog，所以这里再兜一次：循环退出时线程必须已经收干净
-        //（state 是栈对象，线程活着就是往已析构的对象上写）。
-        StopOnlineJob(state);
+        // 循环退出时如果线程还活着，**不销毁它正在写的 State**：worker 的
+        // OnlineThreadContext 持有 shared_ptr。这里最多等一小会儿收句柄；
+        // 等不到就保持原样返回，最后一个引用释放时才拆锁、析构。
+        if (state.Job.Thread)
+        {
+            ::InterlockedExchange(&state.Job.Cancel, 1);
+            if (::WaitForSingleObject(state.Job.Thread, 1000) == WAIT_OBJECT_0)
+            {
+                ::CloseHandle(state.Job.Thread);
+                state.Job.Thread = nullptr;
+            }
+        }
         if (!state.Done && ::IsWindow(dialog))
         {
             ::DestroyWindow(dialog);
         }
         ::EnableWindow(context.Window, TRUE);
         ::SetActiveWindow(context.Window);
-        if (state.Job.LockReady)
-        {
-            ::DeleteCriticalSection(&state.Job.Lock);
-            state.Job.LockReady = false;
-        }
     }
 
     void UpdateHint(UiContext& context)
@@ -5629,6 +6217,36 @@ namespace
             text = L"提示：步骤1 解包、步骤2 收集 Hash、步骤3 离线还原；默认只输出名字全是真名的文件。";
         }
         ::SetWindowTextW(hint, text.c_str());
+    }
+
+    // 关窗前真正走完的三步：等后台线程退出 → 关还原窗口（用户可在二次确认点「否」）
+    // → 销毁主窗口。返回 false = 用户取消了关窗，窗口与所有句柄都必须保持原样。
+    bool FinishCloseAfterJob(UiContext& context)
+    {
+        if (!TryStopJobForClose(context))
+        {
+            return false;
+        }
+        if (context.RestoreWindow && ::IsWindow(context.RestoreWindow))
+        {
+            if (!Host::Confirm(context.Window,
+                               L"资源名还原窗口还开着。关闭主程序会一并关掉它，"
+                               L"正在进行的还原会被中止（已复制出去的文件保留）。\r\n\r\n确认关闭？",
+                               L"确认关闭"))
+            {
+                return false;
+            }
+            Restore::CloseRestoreWindow(context.RestoreWindow);
+            // 还原窗口的 WM_CLOSE 也有自己的二次确认；用户在那里点「否」时窗口仍然存在。
+            // 这时绝不能丢句柄、更不能销毁 owner —— 主窗口保持打开，下次再关。
+            if (::IsWindow(context.RestoreWindow))
+            {
+                return false;
+            }
+            context.RestoreWindow = nullptr;
+        }
+        ::DestroyWindow(context.Window);
+        return true;
     }
 
     // ---------- 窗口过程 ----------
@@ -5730,6 +6348,35 @@ namespace
 
             case WM_TIMER:
             {
+                if (wParam == kClosePollTimerId)
+                {
+                    if (!context->ClosePending)
+                    {
+                        ::KillTimer(hwnd, kClosePollTimerId);
+                        return 0;
+                    }
+                    if (context->JobDoneUi)
+                    {
+                        return 0;
+                    }
+                    if (!TryStopJobForClose(*context))
+                    {
+                        // 线程还没退：保持窗口和句柄，下一拍再看。绝不在这里盲关句柄或销毁上下文。
+                        return 0;
+                    }
+                    ::KillTimer(hwnd, kClosePollTimerId);
+                    context->ClosePending = false;
+                    context->Closing = true;
+                    if (!FinishCloseAfterJob(*context))
+                    {
+                        // 用户在还原窗口的二次确认里点了「否」：主窗口保持打开。
+                        context->Closing = false;
+                        SetTaskIdle(*context);
+                        context->RenderedOverview.clear();
+                        UpdateOverview(*context);
+                    }
+                    return 0;
+                }
                 if (wParam != kRefreshTimerId)
                 {
                     break;
@@ -5755,13 +6402,13 @@ namespace
 
             case kSetProgressMessage:
             {
-                OnJobProgress(*context);
+                OnJobProgress(*context, static_cast<unsigned int>(wParam));
                 return 0;
             }
 
             case kSetDoneMessage:
             {
-                OnJobDone(*context);
+                OnJobDone(*context, static_cast<unsigned int>(wParam));
                 return 0;
             }
 
@@ -5773,7 +6420,25 @@ namespace
 
             case WM_COMMAND:
             {
-                switch (LOWORD(wParam))
+                const int command = LOWORD(wParam);
+                if (context->Closing)
+                {
+                    // 关闭流程已建立 guard（Confirm 会泵消息）：命令一律不重入。
+                    return 0;
+                }
+                if (context->PrepareBusy && IsJobSensitiveCommand(command))
+                {
+                    Host::ShowInfo(context->Window, L"正在检查目标（反篡改预检），请稍候再操作。");
+                    return 0;
+                }
+                if ((JobBusy(*context) || context->JobDoneUi) && IsJobSensitiveCommand(command))
+                {
+                    // 控件在任务期间已被禁用，这里再兜一层：键盘 / 自动化仍可能投递命令。
+                    // 关键点是**在任何 SyncTarget / ResetJob / 磁盘改动之前**就拒掉。
+                    RejectIfBusy(*context, L"执行这个操作");
+                    return 0;
+                }
+                switch (command)
                 {
                     case IDC_YUA_TAB_HOME:
                     case IDC_YUA_TAB_MAKE_SET:
@@ -5789,6 +6454,11 @@ namespace
                     case IDC_YUA_EXE_EDIT:
                         if (HIWORD(wParam) == EN_KILLFOCUS)
                         {
+                            if (JobBusy(*context) || context->JobDoneUi || context->PrepareBusy ||
+                                context->Closing)
+                            {
+                                return 0;
+                            }
                             SyncTargetFromEdit(*context);
                             RefreshProbes(*context, true);
                             context->RenderedOverview.clear();
@@ -5947,6 +6617,18 @@ namespace
             case WM_DROPFILES:
             {
                 HDROP drop = reinterpret_cast<HDROP>(wParam);
+                if (context->Closing)
+                {
+                    // 关闭流程中的拖放不改变目标，也不弹额外模态框。
+                    ::DragFinish(drop);
+                    return 0;
+                }
+                if (JobBusy(*context) || context->JobDoneUi || context->PrepareBusy)
+                {
+                    ::DragFinish(drop);
+                    RejectIfBusy(*context, L"切换目标游戏");
+                    return 0;
+                }
                 const UINT count = ::DragQueryFileW(drop, 0xFFFFFFFFu, nullptr, 0u);
                 std::wstring path;
                 if (count > 0u)
@@ -5972,55 +6654,94 @@ namespace
 
             case WM_CLOSE:
             {
+                if (context->ClosePending || context->Closing)
+                {
+                    // 已经确认过关闭、正在等线程退出或正在弹二次确认：忽略重复的关闭请求。
+                    return 0;
+                }
+                if (context->PrepareBusy)
+                {
+                    // 预检是同步的、只泵 paint/timer；把 WM_CLOSE 原样放回队列，
+                    // 预检里的有界等待会用 PM_NOREMOVE 探测到它并按 cancel 中止。
+                    ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    return 0;
+                }
+                if (context->JobDoneUi)
+                {
+                    // 结论 / 错误框还开着：只登记 pending，绝不销毁确认框脚下的窗口。
+                    context->ClosePending = true;
+                    SetTaskText(*context, L"正在等待任务结论框关闭……");
+                    ::SetTimer(hwnd, kClosePollTimerId, kClosePollIntervalMs, nullptr);
+                    return 0;
+                }
+                // 从第一次 Confirm 之前就置 Closing：模态框会泵消息，重复 WM_CLOSE 不能重入。
+                context->Closing = true;
                 if (context->JobActive)
                 {
-                    // 生成 / 静态 Hash 表 / 干跑都跑在自己的线程里，关窗前必须问一句并等它退出来。
+                    // 生成 / 静态 Hash 表 / 干跑都跑在自己的线程里，关窗前必须问一句。
                     if (!Host::Confirm(hwnd,
                                        L"后台任务还在跑（生成扩展集 / 生成静态 Hash 表 / 干跑测试）。"
                                        L"关闭主程序会中止它（已经写出的文件保留）。\r\n\r\n确认关闭？",
                                        L"确认关闭"))
                     {
+                        context->Closing = false;
                         return 0;
                     }
-                    StopJobForClose(*context);
-                }
-                if (context->RestoreWindow && ::IsWindow(context->RestoreWindow))
-                {
-                    // 还原窗口是本进程的另一个顶层窗口，它自己会在关闭时停掉所有工作线程。
-                    // 先问一句再关，免得用户以为主界面关了还原还在跑。
-                    if (!Host::Confirm(hwnd,
-                                       L"资源名还原窗口还开着。关闭主程序会一并关掉它，"
-                                       L"正在进行的还原会被中止（已复制出去的文件保留）。\r\n\r\n确认关闭？",
-                                       L"确认关闭"))
+                    ::InterlockedExchange(&context->Job.Cancel, 1);
+                    if (!TryStopJobForClose(*context))
                     {
+                        // 取消是按条检查的，给线程一点时间真正退出；窗口保持打开，
+                        // 句柄 / Job / Lock 全部保留，等它退出后由定时器重新走关闭流程。
+                        context->ClosePending = true;
+                        SetTaskText(*context, L"正在等待后台任务退出……（不会强行结束线程）");
+                        ::SetTimer(hwnd, kClosePollTimerId, kClosePollIntervalMs, nullptr);
+                        Host::LogLine(Log::Level::Warn,
+                                      L"[YuaExtract] 关闭请求已挂起：后台线程尚未退出，窗口保持打开");
                         return 0;
                     }
-                    Restore::CloseRestoreWindow(context->RestoreWindow);
-                    context->RestoreWindow = nullptr;
                 }
-                ::DestroyWindow(hwnd);
+                if (!FinishCloseAfterJob(*context))
+                {
+                    context->Closing = false;
+                }
                 return 0;
             }
 
             case WM_DESTROY:
             {
                 ::KillTimer(hwnd, kRefreshTimerId);
-                StopJobForClose(*context);
+                ::KillTimer(hwnd, kClosePollTimerId);
+                // WM_CLOSE 正常路径已经 join 过线程；这里只做兜底。**绝不**在线程还活着时
+                // 释放 Lock / context：如果 0 等待拿不到，就保留句柄与 Lock，让进程退出时
+                // 一并结束。TerminateThread 会把线程丢在持锁状态，坚决不用。
+                if (!TryStopJobForClose(*context))
+                {
+                    Host::LogLine(Log::Level::Error,
+                                  L"[YuaExtract] WM_DESTROY 时后台线程仍在运行；保留线程句柄与锁，不释放活动对象");
+                }
                 if (context->RestoreWindow && ::IsWindow(context->RestoreWindow))
                 {
                     Restore::CloseRestoreWindow(context->RestoreWindow);
-                    context->RestoreWindow = nullptr;
+                    if (!::IsWindow(context->RestoreWindow))
+                    {
+                        context->RestoreWindow = nullptr;
+                    }
                 }
-                if (context->Job.LockReady)
+                if (context->Job.Thread == nullptr && context->Job.LockReady)
                 {
                     ::DeleteCriticalSection(&context->Job.Lock);
                     context->Job.LockReady = false;
                 }
-                if (context->FontUi) ::DeleteObject(context->FontUi);
-                if (context->FontBold) ::DeleteObject(context->FontBold);
-                if (context->FontMono) ::DeleteObject(context->FontMono);
-                if (context->WhiteBrush) ::DeleteObject(context->WhiteBrush);
-                if (context->LogBrush) ::DeleteObject(context->LogBrush);
+                // worker 还活着时它仍可能读 context.Job（Stage/Percent 等）。此时宁可让
+                // UI 资源短暂泄漏到进程退出，也不能释放任何它可能触碰的东西。
+                if (context->Job.Thread == nullptr)
+                {
+                    if (context->FontUi) ::DeleteObject(context->FontUi);
+                    if (context->FontBold) ::DeleteObject(context->FontBold);
+                    if (context->FontMono) ::DeleteObject(context->FontMono);
+                    if (context->WhiteBrush) ::DeleteObject(context->WhiteBrush);
+                    if (context->LogBrush) ::DeleteObject(context->LogBrush);
+                }
                 ::PostQuitMessage(0);
                 return 0;
             }
@@ -6090,15 +6811,44 @@ int RunMainWindow(HINSTANCE instance, const std::wstring& initialExe)
     ::UpdateWindow(window);
 
     MSG message{};
-    while (BOOL result = ::GetMessageW(&message, nullptr, 0u, 0u))
+    int exitCode = 0;
+    for (;;)
     {
+        const BOOL result = ::GetMessageW(&message, nullptr, 0u, 0u);
+        if (result == 0)
+        {
+            exitCode = static_cast<int>(message.wParam);
+            break;
+        }
         if (result == -1)
         {
-            return -1;
+            exitCode = -1;
+            break;
         }
         ::TranslateMessage(&message);
         ::DispatchMessageW(&message);
     }
-    return static_cast<int>(message.wParam);
+
+    // WM_QUIT / GetMessage 失败不会走 WM_CLOSE 的 join 流程。这里兜底：
+    // 先请求取消并**有界安全等待** worker 真正退出（不 TerminateThread）；
+    // 等不到才 ExitProcess —— 静态 UiContext 绝不能在线程还读它时开始析构。
+    if (context.Job.Thread)
+    {
+        ::InterlockedExchange(&context.Job.Cancel, 1);
+        const DWORD wait = ::WaitForSingleObject(context.Job.Thread, 15000u);
+        if (wait == WAIT_OBJECT_0)
+        {
+            ::CloseHandle(context.Job.Thread);
+            context.Job.Thread = nullptr;
+            context.JobActive = false;
+        }
+        else
+        {
+            Host::LogLine(Log::Level::Error,
+                          L"[YuaExtract] 消息循环退出时后台线程仍未退出；使用 ExitProcess 避免静态上下文析构与线程读写竞争");
+            ::ExitProcess(static_cast<UINT>(exitCode));
+        }
+    }
+    return exitCode;
 }
 }

@@ -273,50 +273,93 @@ namespace
         }
     }
 
-    // 递归收集文件：跳过 excludeNames 里的目录名
-    void CollectFiles(const std::wstring& directory, const std::vector<std::wstring>& excludeNames,
-                      std::vector<std::wstring>& files)
+    // 递归收集文件：跳过 excludeNames 里的目录名。
+    // 重解析点目录不跟进去（可能指向父目录形成环，也可能指向工作区外）；
+    // 深度有上限，FindNext 的非正常失败会返回 false 由调用方报出来。
+    constexpr unsigned int kMaxScanDepth = 64u;
+
+    bool CollectFiles(const std::wstring& directory, const std::vector<std::wstring>& excludeNames,
+                      std::vector<std::wstring>& files, unsigned int depth,
+                      const std::function<bool()>& cancelRequested, std::wstring& error)
     {
+        if (depth > kMaxScanDepth)
+        {
+            error = L"扫描目录超过深度上限：" + directory;
+            return false;
+        }
+        if (cancelRequested && cancelRequested())
+        {
+            return false;
+        }
+
         WIN32_FIND_DATAW data{};
         const std::wstring pattern = directory + L"\\*";
         HANDLE find = ::FindFirstFileW(pattern.c_str(), &data);
         if (find == INVALID_HANDLE_VALUE)
         {
-            return;
+            const DWORD code = ::GetLastError();
+            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
+            {
+                return true;
+            }
+            error = L"列目录失败（code=" + std::to_wstring(code) + L"）：" + directory;
+            return false;
         }
 
-        do
+        bool ok = true;
+        for (;;)
         {
-            const std::wstring name = data.cFileName;
-            if (name == L"." || name == L"..")
+            if (cancelRequested && cancelRequested())
             {
-                continue;
+                ok = false;
+                break;
             }
 
-            const std::wstring full = directory + L"\\" + name;
-            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            const std::wstring name = data.cFileName;
+            if (name != L"." && name != L"..")
             {
-                bool excluded = false;
-                for (const std::wstring& item : excludeNames)
+                const std::wstring full = directory + L"\\" + name;
+                if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
                 {
-                    if (EqualsIgnoreCase(item, name))
+                    const bool reparse = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                    bool excluded = false;
+                    for (const std::wstring& item : excludeNames)
                     {
-                        excluded = true;
-                        break;
+                        if (EqualsIgnoreCase(item, name))
+                        {
+                            excluded = true;
+                            break;
+                        }
+                    }
+                    if (!excluded && !reparse)
+                    {
+                        if (!CollectFiles(full, excludeNames, files, depth + 1u, cancelRequested, error))
+                        {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
-                if (!excluded)
+                else
                 {
-                    CollectFiles(full, excludeNames, files);
+                    files.push_back(full);
                 }
             }
-            else
+
+            if (!::FindNextFileW(find, &data))
             {
-                files.push_back(full);
+                const DWORD code = ::GetLastError();
+                if (code != ERROR_NO_MORE_FILES)
+                {
+                    error = L"枚举目录失败（code=" + std::to_wstring(code) + L"）：" + directory;
+                    ok = false;
+                }
+                break;
             }
-        } while (::FindNextFileW(find, &data));
+        }
 
         ::FindClose(find);
+        return ok;
     }
 
     // 文件名哈希：BLAKE2s-256(key = FileNameHasherSalt, message = UTF16LE(名字 + seed))
@@ -595,7 +638,19 @@ namespace Yua
                 }
 
                 std::vector<std::wstring> files;
-                CollectFiles(root, options.excludeNames, files);
+                std::wstring scanError;
+                if (!CollectFiles(root, options.excludeNames, files, 0u, options.cancelRequested, scanError))
+                {
+                    if (options.cancelRequested && options.cancelRequested())
+                    {
+                        result.message = L"用户中止";
+                    }
+                    else
+                    {
+                        result.message = scanError.empty() ? L"扫描目录失败：" + root : scanError;
+                    }
+                    return result;
+                }
 
                 for (const std::wstring& file : files)
                 {

@@ -1,6 +1,7 @@
 #include "ExportApi.h"
 
 #include "TryExport.h"
+#include "NativeExecution.h"
 
 #include "pack_static/keystore.h"
 #include "pack_static/pack_static.h"
@@ -34,44 +35,20 @@ std::string JoinProblems(const std::vector<std::string>& problems) {
     return s;
 }
 
-}  // namespace
-
-extern "C" BOOL __stdcall SniffInputDir(const wchar_t* inputDir, int* modeOut, char* detailOut,
-                                        int detailOutSize, char* errorOut, int errorOutSize) {
-    const bool ok = ExportGuard::Run(
-        [&](const std::string& m) { WriteAnsi(m, errorOut, errorOutSize); },
-        [&]() -> bool {
-            if (inputDir == nullptr) {
-                WriteAnsi("输入目录为空", errorOut, errorOutSize);
-                return false;
-            }
-
-            const hxv4::pack_static::SniffResult s =
-                hxv4::pack_static::sniff_directory(ToUtf8(inputDir));
-            if (modeOut != nullptr) *modeOut = static_cast<int>(s.mode);
-            WriteAnsi(s.detail, detailOut, detailOutSize);
-
-            if (!s.ok()) {
-                std::string w = "无法判定目录形态";
-                if (!s.problems.empty()) w += "：" + JoinProblems(s.problems);
-                WriteAnsi(w, errorOut, errorOutSize);
-                return false;
-            }
-            return true;
-        });
-    return ok ? TRUE : FALSE;
-}
-
-extern "C" BOOL __stdcall Repack(const wchar_t* inputDir, const wchar_t* outputXp3,
-                                 const wchar_t* exePath, const wchar_t* keysRoot,
-                                 const wchar_t* mediaName, int modeOverride, int rescramble,
-                                 char* detailOut, int detailOutSize, char* errorOut,
-                                 int errorOutSize) {
+// Repack / RepackEx 的公共实现：旧入口固定 flags = 0。
+BOOL RunRepack(const wchar_t* inputDir, const wchar_t* outputXp3, const wchar_t* exePath,
+               const wchar_t* keysRoot, const wchar_t* mediaName, int modeOverride,
+               int rescramble, DWORD flags, char* detailOut, int detailOutSize,
+               char* errorOut, int errorOutSize) {
     const bool ok = ExportGuard::Run(
         [&](const std::string& m) { WriteAnsi(m, errorOut, errorOutSize); },
         [&]() -> bool {
             if (inputDir == nullptr || outputXp3 == nullptr) {
                 WriteAnsi("输入目录或输出路径为空", errorOut, errorOutSize);
+                return false;
+            }
+            if (NativeExecution::HasUnknownFlags(flags)) {
+                WriteAnsi(NativeExecution::UnknownFlagsMessage(flags), errorOut, errorOutSize);
                 return false;
             }
 
@@ -84,6 +61,7 @@ extern "C" BOOL __stdcall Repack(const wchar_t* inputDir, const wchar_t* outputX
             }
             opts.mode_override = modeOverride;
             opts.rescramble = (rescramble != 0);
+            opts.allow_native_execution = NativeExecution::IsAllowed(flags);
 
             const hxv4::pack_static::PackReport r =
                 hxv4::pack_static::pack_static(ToUtf8(inputDir), ToUtf8(outputXp3), opts);
@@ -126,6 +104,81 @@ extern "C" BOOL __stdcall Repack(const wchar_t* inputDir, const wchar_t* outputX
     return ok ? TRUE : FALSE;
 }
 
+// DeriveKeys / DeriveKeysEx 的公共实现：旧入口固定 flags = 0。
+BOOL RunDeriveKeys(const wchar_t* exePath, const wchar_t* keysRoot, DWORD flags, char* noteOut,
+                   int noteOutSize, char* errorOut, int errorOutSize) {
+    const bool ok = ExportGuard::Run(
+        [&](const std::string& m) { WriteAnsi(m, errorOut, errorOutSize); },
+        [&]() -> bool {
+            if (exePath == nullptr || keysRoot == nullptr) {
+                WriteAnsi("游戏 EXE 或仓库目录为空", errorOut, errorOutSize);
+                return false;
+            }
+            if (NativeExecution::HasUnknownFlags(flags)) {
+                WriteAnsi(NativeExecution::UnknownFlagsMessage(flags), errorOut, errorOutSize);
+                return false;
+            }
+
+            std::string note;
+            std::string why;
+            if (!hxv4::pack_static::DeriveProfile(ToUtf8(exePath), ToUtf8(keysRoot), &note, &why,
+                                                  NativeExecution::IsAllowed(flags))) {
+                WriteAnsi(why, errorOut, errorOutSize);
+                return false;
+            }
+            WriteAnsi(note, noteOut, noteOutSize);
+            return true;
+        });
+    return ok ? TRUE : FALSE;
+}
+
+}  // namespace
+
+extern "C" BOOL __stdcall SniffInputDir(const wchar_t* inputDir, int* modeOut, char* detailOut,
+                                        int detailOutSize, char* errorOut, int errorOutSize) {
+    const bool ok = ExportGuard::Run(
+        [&](const std::string& m) { WriteAnsi(m, errorOut, errorOutSize); },
+        [&]() -> bool {
+            if (inputDir == nullptr) {
+                WriteAnsi("输入目录为空", errorOut, errorOutSize);
+                return false;
+            }
+
+            const hxv4::pack_static::SniffResult s =
+                hxv4::pack_static::sniff_directory(ToUtf8(inputDir));
+            if (modeOut != nullptr) *modeOut = static_cast<int>(s.mode);
+            WriteAnsi(s.detail, detailOut, detailOutSize);
+
+            if (!s.ok()) {
+                std::string w = "无法判定目录形态";
+                if (!s.problems.empty()) w += "：" + JoinProblems(s.problems);
+                WriteAnsi(w, errorOut, errorOutSize);
+                return false;
+            }
+            return true;
+        });
+    return ok ? TRUE : FALSE;
+}
+
+extern "C" BOOL __stdcall Repack(const wchar_t* inputDir, const wchar_t* outputXp3,
+                                 const wchar_t* exePath, const wchar_t* keysRoot,
+                                 const wchar_t* mediaName, int modeOverride, int rescramble,
+                                 char* detailOut, int detailOutSize, char* errorOut,
+                                 int errorOutSize) {
+    // 旧入口固定 flags = 0：兼容签名，但不会隐式执行游戏内嵌 DLL。
+    return RunRepack(inputDir, outputXp3, exePath, keysRoot, mediaName, modeOverride, rescramble,
+                     0u, detailOut, detailOutSize, errorOut, errorOutSize);
+}
+
+extern "C" BOOL __stdcall RepackEx(const wchar_t* inputDir, const wchar_t* outputXp3,
+                                   const wchar_t* exePath, const wchar_t* keysRoot,
+                                   const wchar_t* mediaName, int modeOverride, int rescramble,
+                                   DWORD flags, char* detailOut, int detailOutSize,
+                                   char* errorOut, int errorOutSize) {
+    return RunRepack(inputDir, outputXp3, exePath, keysRoot, mediaName, modeOverride, rescramble,
+                     flags, detailOut, detailOutSize, errorOut, errorOutSize);
+}
+
 // 这个导出没有错误出参，异常只能吞掉返回 1 —— 代价是可能覆盖已存在的 patch@r1.xp3。
 // 内部走的全是 error_code 重载，实际上很难抛。
 extern "C" unsigned int __stdcall NextPatchRevision(const wchar_t* gameDir) {
@@ -165,22 +218,12 @@ extern "C" BOOL __stdcall ImportKeyFile(const wchar_t* hxv4pPath, const wchar_t*
 extern "C" BOOL __stdcall DeriveKeys(const wchar_t* exePath, const wchar_t* keysRoot,
                                      char* noteOut, int noteOutSize, char* errorOut,
                                      int errorOutSize) {
-    const bool ok = ExportGuard::Run(
-        [&](const std::string& m) { WriteAnsi(m, errorOut, errorOutSize); },
-        [&]() -> bool {
-            if (exePath == nullptr || keysRoot == nullptr) {
-                WriteAnsi("游戏 EXE 或仓库目录为空", errorOut, errorOutSize);
-                return false;
-            }
+    // 旧入口固定 flags = 0：只允许旁侧产物收编 / 已有参数复用，不现场派生。
+    return RunDeriveKeys(exePath, keysRoot, 0u, noteOut, noteOutSize, errorOut, errorOutSize);
+}
 
-            std::string note;
-            std::string why;
-            if (!hxv4::pack_static::DeriveProfile(ToUtf8(exePath), ToUtf8(keysRoot), &note, &why)) {
-                WriteAnsi(why, errorOut, errorOutSize);
-                return false;
-            }
-            WriteAnsi(note, noteOut, noteOutSize);
-            return true;
-        });
-    return ok ? TRUE : FALSE;
+extern "C" BOOL __stdcall DeriveKeysEx(const wchar_t* exePath, const wchar_t* keysRoot,
+                                       DWORD flags, char* noteOut, int noteOutSize,
+                                       char* errorOut, int errorOutSize) {
+    return RunDeriveKeys(exePath, keysRoot, flags, noteOut, noteOutSize, errorOut, errorOutSize);
 }

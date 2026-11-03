@@ -5,12 +5,21 @@
 #include "diag.h"
 #include "path.h"
 #include "stringhelper.h"
+#include "PathSafety.h"
 #include "ExtendUtils.h"
 
 #include <cstdarg>
+#include <algorithm>
+#include <new>
 
 namespace
 {
+    // 单个资源允许的最大原始体积（1 GiB）。超过就不是正常资源，直接失败而不是
+    // 先按声明做一次巨量分配。x86 进程里 2 GiB 级 vector 往往直接崩。
+    constexpr unsigned long long kMaxRawFileBytes = 1ull * 1024ull * 1024ull * 1024ull;
+    // 文本解密分支的输出上限：正常 krkr 文本远小于它。
+    constexpr unsigned long long kMaxTextBytes = 64ull * 1024ull * 1024ull;
+
     // TVP 同时支持绝对路径和相对 app path，这里先做一个轻量判断，
     // 后续再统一交给 TVP 的标准化逻辑处理。
     bool IsAbsolutePath(const std::wstring& path)
@@ -177,6 +186,19 @@ namespace Engine
 
         // .alst 保存“目录哈希 / 文件哈希”映射，便于后续结合 hash 日志回填路径。
         std::wstring packageName = Path::GetFileNameWithoutExtension(packageDisplayName);
+        // 包名会直接当输出目录的第一段。文件名形如 "..xp3"/".xp3" 时去扩展会得到 ".." / "."
+        // 这类危险名字；真正落盘前拒绝，不能让它把输出目录抬到父级。
+        {
+            std::wstring packageNameWhy;
+            if (!PathSafety::ValidateRelativeName(packageName, PathSafety::Kind::File, &packageNameWhy))
+            {
+                const std::wstring detail = L"封包名不能作为输出目录：" + packageNameWhy;
+                this->WriteLogLevel(Log::Level::Error, L"Extract Failed: %s | %s",
+                                    packageDisplayName.c_str(), detail.c_str());
+                this->NotifyProgress(taskId, packagePath, ExtractTaskFailed, 0u, 0u, detail);
+                return false;
+            }
+        }
         std::wstring extractOutput = Path::Combine(effectiveOutputDirectory, packageName);
         std::wstring fileTableOutput = extractOutput + L".alst";
 
@@ -418,12 +440,32 @@ namespace Engine
 
 	bool ExtractCore::ExtractFile(IStream* stream, const std::wstring& extractPath, const std::wstring& relativePath)
 	{
-		unsigned long long size = StreamUtils::IStreamEx::Length(stream);
+        if (stream == nullptr)
+        {
+            this->WriteLogLevel(Log::Level::Error, L"Invaild File (null stream): %s", relativePath.c_str());
+            return false;
+        }
+
+		ULONGLONG size = 0u;
+        if (!StreamUtils::IStreamEx::LengthEx(stream, size))
+        {
+            ++this->mFailures.invalid;
+            this->WriteLogLevel(Log::Level::Error, L"Invaild File (length/seek failed): %s",
+                                relativePath.c_str());
+            return false;
+        }
 		if (size == 0)
 		{
             this->WriteLogLevel(Log::Level::Warn, L"Empty File: %s", relativePath.c_str());
             return false;
 		}
+        if (size > kMaxRawFileBytes)
+        {
+            ++this->mFailures.invalid;
+            this->WriteLogLevel(Log::Level::Error, L"Invaild File (too large): %s | %llu 字节",
+                                relativePath.c_str(), size);
+            return false;
+        }
 
         std::wstring outputDir = Path::GetDirectoryName(extractPath);
         if (!outputDir.empty())
@@ -451,13 +493,45 @@ namespace Engine
 		}
 		else
 		{
-			buffer.resize((size_t)size);
-
-			stream->Seek(LARGE_INTEGER{ }, STREAM_SEEK_SET, nullptr);
-					if (StreamUtils::IStreamEx::Read(stream, buffer.data(), (ULONG)size) == (ULONG)size)
-			{
-				success = true;
-			}
+            // 原始流：长度是 64 位，不能直接窄化成 ULONG/size_t 再一次性读。
+            // 分块读、每块都要求读满；短读/失败就整条失败，不能拿零填的尾巴当成功。
+            if (size > static_cast<unsigned long long>(static_cast<size_t>(-1)))
+            {
+                this->WriteLogLevel(Log::Level::Error, L"Invaild File (too large): %s | %llu 字节",
+                                    relativePath.c_str(), size);
+            }
+            else if (!StreamUtils::IStreamEx::SeekEx(stream, 0, STREAM_SEEK_SET))
+            {
+                this->WriteLogLevel(Log::Level::Error, L"Invaild File (seek failed): %s",
+                                    relativePath.c_str());
+            }
+            else
+            {
+                try
+                {
+                    buffer.resize(static_cast<size_t>(size));
+                    size_t offset = 0u;
+                    bool readOk = true;
+                    while (offset < buffer.size())
+                    {
+                        const DWORD chunk =
+                            static_cast<DWORD>(std::min<size_t>(buffer.size() - offset, 1u << 20));
+                        if (!StreamUtils::IStreamEx::ReadExact(stream, buffer.data() + offset, chunk))
+                        {
+                            readOk = false;
+                            break;
+                        }
+                        offset += chunk;
+                    }
+                    success = readOk;
+                }
+                catch (const std::bad_alloc&)
+                {
+                    success = false;
+                    this->WriteLogLevel(Log::Level::Error, L"Invaild File (allocation failed): %s",
+                                        relativePath.c_str());
+                }
+            }
 		}
 
 		if (success && !buffer.empty())
@@ -503,15 +577,27 @@ namespace Engine
 
 	bool ExtractCore::TryDecryptText(IStream* stream, std::vector<uint8_t>& output)
 	{
+        auto readExact = [stream](void* dest, ULONG length) -> bool
+        {
+            return StreamUtils::IStreamEx::ReadExact(stream, dest, length);
+        };
+
 		uint8_t mark[2]{ };
-		StreamUtils::IStreamEx::Read(stream, mark, 2ul);
+        // 每个头部字段都必须读满才能使用；短读直接判"不是文本加密"，让上层按原始流处理。
+        if (!readExact(mark, 2ul))
+        {
+            return false;
+        }
 
 		if (mark[0] == 0xfe && mark[1] == 0xfe)
 		{
             // Krkr 文本流头: FE FE + mode + FF FE
             // mode 0/1 为逐字符变换，mode 2 为 zlib 压缩后的 UTF-16 文本。
-			uint8_t mode;
-			StreamUtils::IStreamEx::Read(stream, &mode, 1ul);
+			uint8_t mode = 0xffu;
+            if (!readExact(&mode, 1ul))
+            {
+                return false;
+            }
 
 			if (mode != 0 && mode != 1 && mode != 2)
 			{
@@ -519,7 +605,10 @@ namespace Engine
 			}
 
 			ZeroMemory(mark, sizeof(mark));
-			StreamUtils::IStreamEx::Read(stream, mark, 2ul);
+            if (!readExact(mark, 2ul))
+            {
+                return false;
+            }
 
 			if (mark[0] != 0xff || mark[1] != 0xfe)
 			{
@@ -530,17 +619,33 @@ namespace Engine
 			{
 				long long compressed = 0;
 				long long uncompressed = 0;
-				StreamUtils::IStreamEx::Read(stream, &compressed, sizeof(long long));
-				StreamUtils::IStreamEx::Read(stream, &uncompressed, sizeof(long long));
+                if (!readExact(&compressed, sizeof(long long)) ||
+                    !readExact(&uncompressed, sizeof(long long)))
+                {
+                    return false;
+                }
 
-				if (compressed <= 0 || compressed >= INT_MAX || uncompressed <= 0 || uncompressed >= INT_MAX)
+				if (compressed <= 0 || uncompressed <= 0 ||
+                    static_cast<unsigned long long>(compressed) > kMaxTextBytes ||
+                    static_cast<unsigned long long>(uncompressed) > kMaxTextBytes)
 				{
 					return false;
 				}
 
+                // 声明的压缩长度不能超过流的真实剩余，避免先按声明分配再看读取失败。
+                ULONGLONG positionAfterHeader = 0u;
+                ULONGLONG totalLength = 0u;
+                if (!StreamUtils::IStreamEx::PositionEx(stream, positionAfterHeader) ||
+                    !StreamUtils::IStreamEx::LengthEx(stream, totalLength) ||
+                    positionAfterHeader > totalLength ||
+                    static_cast<unsigned long long>(compressed) > totalLength - positionAfterHeader)
+                {
+                    return false;
+                }
+
 				std::vector<uint8_t> data = std::vector<uint8_t>((size_t)compressed);
 
-				if (StreamUtils::IStreamEx::Read(stream, data.data(), (ULONG)compressed) != compressed)
+                if (!readExact(data.data(), (ULONG)compressed))
 				{
 					return false;
 				}
@@ -563,25 +668,40 @@ namespace Engine
 				return true;
 			}
 
-			long long startpos = StreamUtils::IStreamEx::Position(stream);
-			long long endpos = StreamUtils::IStreamEx::Length(stream);
+            ULONGLONG startpos = 0u;
+            ULONGLONG endpos = 0u;
+			if (!StreamUtils::IStreamEx::PositionEx(stream, startpos) ||
+                !StreamUtils::IStreamEx::LengthEx(stream, endpos))
+            {
+                return false;
+            }
+            if (endpos < startpos)
+            {
+                return false;
+            }
 
-			StreamUtils::IStreamEx::Seek(stream, startpos, STREAM_SEEK_SET);
+            if (!StreamUtils::IStreamEx::SeekEx(stream, static_cast<LONGLONG>(startpos), STREAM_SEEK_SET))
+            {
+                return false;
+            }
 
-			long long size = endpos - startpos;
-			if (size <= 0 || size >= INT_MAX)
+			const ULONGLONG size = endpos - startpos;
+			if (size == 0u || size > kMaxTextBytes || (size % sizeof(wchar_t)) != 0u)
 			{
 				return false;
 			}
 
-			size_t count = (size_t)(size / sizeof(wchar_t));
-			if (count == 0)
+			const size_t count = static_cast<size_t>(size / sizeof(wchar_t));
+			if (count == 0u)
 			{
 				return false;
 			}
 
 			std::vector<wchar_t> buffer(count + 1);
-			StreamUtils::IStreamEx::Read(stream, buffer.data(), (ULONG)size);
+            if (!readExact(buffer.data(), static_cast<ULONG>(size)))
+            {
+                return false;
+            }
 
 			if (mode == 0)
 			{

@@ -1,4 +1,4 @@
-#include <windows.h>
+﻿#include <windows.h>
 #include <commctrl.h>
 #include <detours.h>
 #include "detour_section.h"
@@ -20,6 +20,7 @@
 #include "log.h"
 #include "logdir.h"
 #include "resource.h"
+#include "SteamApiSwap.h"
 #include "TryExport.h"
 #include "YuaExtractHost.h"
 #include "YuaExtractMainWindow.h"
@@ -989,6 +990,8 @@ namespace
     typedef int(__stdcall* RepackSniffFn)(const wchar_t*, int*, char*, int, char*, int);
     typedef int(__stdcall* RepackPackFn)(const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t*,
                                          const wchar_t*, int, int, char*, int, char*, int);
+    typedef int(__stdcall* RepackPackExFn)(const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t*,
+                                           const wchar_t*, int, int, DWORD, char*, int, char*, int);
     typedef unsigned int(__stdcall* RepackNextRevisionFn)(const wchar_t*);
 
     struct RepackerApi
@@ -996,6 +999,7 @@ namespace
         HMODULE Module;
         RepackSniffFn Sniff;
         RepackPackFn Pack;
+        RepackPackExFn PackEx;
         RepackNextRevisionFn NextRevision;
     };
 
@@ -1021,6 +1025,7 @@ namespace
             {
                 api.Sniff = (RepackSniffFn)::GetProcAddress(api.Module, "SniffInputDir");
                 api.Pack = (RepackPackFn)::GetProcAddress(api.Module, "Repack");
+                api.PackEx = (RepackPackExFn)::GetProcAddress(api.Module, "RepackEx");
                 api.NextRevision = (RepackNextRevisionFn)::GetProcAddress(api.Module, "NextPatchRevision");
                 if (api.Sniff == nullptr || api.Pack == nullptr)
                 {
@@ -1056,6 +1061,9 @@ namespace
         // 盐（pathHash/fileHash 的额外输入串）。留空就用参数里带的那个。
         std::wstring MediaName;
         bool Rescramble;
+        // 是否允许为了取参数执行游戏内嵌原生代码。默认 false，只有界面在
+        // 用户逐次确认后才置 true。
+        bool AllowNative = false;
     };
 
     // 输出默认名：<游戏目录>\patch.xp3。
@@ -1159,8 +1167,8 @@ namespace
         std::wstring KeysRoot;
         std::wstring MediaName;
         bool Rescramble;
+        bool AllowNative = false;
     };
-
     // 连一个错误串都构造不出来时（内存耗尽）也不能让它再抛一次——
     // 退化成一条不带消息的完成通知，界面那边对 payload == nullptr 有处理，
     // 至少别让对话框一直等下去。
@@ -1218,9 +1226,26 @@ namespace
                     const wchar_t* exePath = job->ExePath.empty() ? nullptr : job->ExePath.c_str();
                     const wchar_t* keysRoot = job->KeysRoot.empty() ? nullptr : job->KeysRoot.c_str();
                     const wchar_t* mediaName = job->MediaName.empty() ? nullptr : job->MediaName.c_str();
-                    if (api->Pack(job->InputDirectory.c_str(), job->OutputXp3.c_str(), exePath,
-                                  keysRoot, mediaName, -1, job->Rescramble ? 1 : 0, result,
-                                  sizeof(result), packError, sizeof(packError)))
+                    const DWORD flags = job->AllowNative ? 1u : 0u;
+                    BOOL packed = FALSE;
+                    if (api->PackEx != nullptr)
+                    {
+                        packed = api->PackEx(job->InputDirectory.c_str(), job->OutputXp3.c_str(), exePath,
+                                             keysRoot, mediaName, -1, job->Rescramble ? 1 : 0, flags,
+                                             result, sizeof(result), packError, sizeof(packError));
+                    }
+                    else if (!job->AllowNative)
+                    {
+                        // 旧模块没有 RepackEx：只允许安全默认（flags=0）路径。
+                        packed = api->Pack(job->InputDirectory.c_str(), job->OutputXp3.c_str(), exePath,
+                                           keysRoot, mediaName, -1, job->Rescramble ? 1 : 0, result,
+                                           sizeof(result), packError, sizeof(packError));
+                    }
+                    else
+                    {
+                        strcpy_s(packError, "封包模块版本过旧（缺少 RepackEx），不能执行原生参数派生。");
+                    }
+                    if (packed)
                     {
                         ok = true;
                         message = L"封包完成。\r\n\r\n";
@@ -1502,6 +1527,29 @@ namespace
                             return 0;
                         }
 
+                        bool allowNative = false;
+                        if (!context->Options.ExePath.empty())
+                        {
+                            // 仓库里已有该 EXE 参数、或游戏目录旁已有生成的 hxv4p 时，
+                            // 这一步不会执行原生代码；否则会调 CxdecKeyStatic 现场派生，
+                            // 那会把游戏内嵌 bootstrap DLL 载入本进程执行 —— 必须逐次确认。
+                            context->Busy = true;
+                            const std::wstring nativeQuestion =
+                                L"本次封包指定了游戏 EXE：\r\n" + context->Options.ExePath +
+                                L"\r\n\r\n如果参数仓库里没有它的参数、游戏目录旁也没有生成的 hxv4p，"
+                                L"工具会现场派生参数 —— 这一步会加载游戏内嵌的 bootstrap DLL，"
+                                L"并在本工具进程里执行其中的原生代码。\r\n\r\n"
+                                L"· 工具进程拥有当前用户权限；原生代码出错可能使工具崩溃。\r\n"
+                                L"· 请只在你合法拥有、且信任来源的游戏副本上执行。\r\n"
+                                L"· 这不是沙箱。\r\n\r\n"
+                                L"点「是」= 允许在需要时执行（推荐给可信副本）；\r\n"
+                                L"点「否」= 只走安全路径：已有参数可继续，缺参数则明确失败并说明需要授权。";
+                            allowNative = ::MessageBoxW(hwnd, nativeQuestion.c_str(),
+                                                        L"确认是否允许执行游戏内嵌原生代码",
+                                                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+                            context->Busy = false;
+                        }
+
                         RepackJob* job = new RepackJob{};
                         job->Owner = hwnd;
                         job->InputDirectory = context->Options.InputDirectory;
@@ -1510,6 +1558,7 @@ namespace
                         job->KeysRoot = context->Options.KeysRoot;
                         job->MediaName = context->Options.MediaName;
                         job->Rescramble = context->Options.Rescramble;
+                        job->AllowNative = allowNative;
 
                         DWORD threadId = 0u;
                         HANDLE thread = ::CreateThread(nullptr, 0u, RepackThreadProc, job, 0u, &threadId);
@@ -1528,6 +1577,13 @@ namespace
                         return 0;
                     }
                     case IDCANCEL:
+                        if (context != nullptr && context->Busy)
+                        {
+                            // 与 WM_CLOSE 一致：封包线程还在写盘时不允许绕过去销毁窗口。
+                            ::MessageBoxW(hwnd, L"正在封包，等它写完再关。", L"Cxdec 封包",
+                                          MB_OK | MB_ICONINFORMATION);
+                            return 0;
+                        }
                         ::DestroyWindow(hwnd);
                         return 0;
                 }
@@ -1699,43 +1755,65 @@ namespace
         SetProgressPercentText(hwnd, percent);
     }
 
-    void RunStaticKeyExtraction(HWND hwnd)
+    // 静态 Key 提取会加载游戏内嵌的 bootstrap DLL 并在本进程里执行其中的原生函数。
+    // 这不是沙箱：必须逐次、显式地取得用户同意，默认路径绝不执行。
+    void LoaderLog(const wchar_t* text); // 定义在下方日志初始化之后
+    bool RunStaticKeyExtraction(HWND hwnd)
     {
         if (g_KrkrExeFullPath.empty())
         {
             ::MessageBoxW(hwnd, L"未指定游戏 EXE。请先在 YuaExtract 主界面里选择目标游戏主程序。", L"YuaExtract", MB_OK | MB_ICONERROR);
-            return;
+            return false;
         }
 
         std::wstring keyStaticDll = GetModuleDllPath(L"CxdecKeyStatic.dll");
+        std::wstring staticOutput = CombinePathLocal(g_KrkrExeDirectory, L"ExtractKey_Output\\Static");
+        const std::wstring warning =
+            L"即将从目标游戏内嵌资源中提取静态 Key。\r\n\r\n"
+            L"目标 EXE：\r\n" + g_KrkrExeFullPath + L"\r\n\r\n"
+            L"输出目录：\r\n" + staticOutput + L"\r\n\r\n"
+            L"这一步会加载游戏内嵌的 bootstrap DLL，并在本工具进程里执行其中的原生代码。\r\n"
+            L"· 工具进程拥有当前用户权限；原生代码出错可能使工具崩溃。\r\n"
+            L"· 请只在你合法拥有、且信任来源的游戏副本上执行。\r\n"
+            L"· 这不是沙箱：工具无法隔离这段原生代码。\r\n\r\n"
+            L"点「是」= 确认并执行；点「否」= 什么都不做（不会创建输出或临时 DLL）。";
+        if (::MessageBoxW(hwnd, warning.c_str(), L"确认执行游戏内嵌原生代码",
+                          MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        {
+            LoaderLog(L"[Loader] Static key extraction cancelled by user (native code not executed)");
+            return false;
+        }
+
         HMODULE hKeyStatic = ::LoadLibraryW(keyStaticDll.c_str());
         if (!hKeyStatic)
         {
             ::MessageBoxW(hwnd, FormatString(L"无法加载静态提取模块：\r\n%s", keyStaticDll.c_str()).c_str(), L"YuaExtract", MB_OK | MB_ICONERROR);
-            return;
+            return false;
         }
 
-        auto extractKey = (BOOL(__stdcall*)(const wchar_t*, const wchar_t*, char*, int))::GetProcAddress(hKeyStatic, "ExtractKey");
-        if (!extractKey)
+        typedef BOOL(__stdcall * tExtractKeyEx)(const wchar_t*, const wchar_t*, DWORD, char*, int);
+        auto extractKeyEx = (tExtractKeyEx)::GetProcAddress(hKeyStatic, "ExtractKeyEx");
+        if (!extractKeyEx)
         {
+            // 旧 ABI 的 ExtractKey 默认拒绝原生执行，不能在这里隐式回退。
             ::FreeLibrary(hKeyStatic);
-            ::MessageBoxW(hwnd, L"静态提取模块缺少 ExtractKey 导出接口。", L"YuaExtract", MB_OK | MB_ICONERROR);
-            return;
+            ::MessageBoxW(hwnd, L"静态提取模块版本过旧（缺少 ExtractKeyEx）。请使用与本程序配套的模块。",
+                          L"YuaExtract", MB_OK | MB_ICONERROR);
+            return false;
         }
 
-        std::wstring staticOutput = CombinePathLocal(g_KrkrExeDirectory, L"ExtractKey_Output\\Static");
         char errorBuf[2048]{};
-        BOOL ok = extractKey(g_KrkrExeFullPath.c_str(), staticOutput.c_str(), errorBuf, sizeof(errorBuf));
+        const BOOL ok = extractKeyEx(g_KrkrExeFullPath.c_str(), staticOutput.c_str(), 1u /*allow trusted native*/,
+                                     errorBuf, sizeof(errorBuf));
         ::FreeLibrary(hKeyStatic);
 
         if (ok)
         {
             ::MessageBoxW(hwnd, FormatString(L"静态提取完成。\r\n输出目录：%s", staticOutput.c_str()).c_str(), L"YuaExtract", MB_OK | MB_ICONINFORMATION);
+            return true;
         }
-        else
-        {
-            ::MessageBoxA(hwnd, errorBuf[0] ? errorBuf : "Unknown error", "YuaExtract", MB_OK | MB_ICONERROR);
-        }
+        ::MessageBoxA(hwnd, errorBuf[0] ? errorBuf : "Unknown error", "YuaExtract", MB_OK | MB_ICONERROR);
+        return false;
     }
 
     // ---------- 目标 EXE 导入 ----------
@@ -1818,30 +1896,76 @@ namespace
                        Win32Error::FailureLine(what, path, Win32Error::Capture()).c_str());
     }
 
-    // 检测并处理 SteamStub 保护壳。
-    // 返回 true 表示本次运行已交给脱壳流程（无论用户确认还是取消），调用方应关闭窗口并退出。
-    bool RunSteamStubPrecheck(HWND owner, const std::wstring& exePath)
+    // 有界等待一个句柄（remote thread / 预检进程），deadline 覆盖调用方整个阶段。
+    // 实现在 YuaExtractHost.h 的 Detail:: 下：headless 测试直接编入同一份实现，
+    // 避免"测试测的是另一套等待循环"。
+    bool WaitForHandleResponsive(HWND owner, HANDLE handle, ULONGLONG deadline, bool& cancelRequested)
     {
+        return Yua::Host::Detail::WaitForHandleResponsive(owner, handle, deadline, cancelRequested);
+    }
+
+    bool WaitForOwnedProcessResponsive(HWND owner, HANDLE process, DWORD totalTimeoutMs)
+    {
+        bool cancelled = false;
+        return WaitForHandleResponsive(owner, process, ::GetTickCount64() + totalTimeoutMs, cancelled);
+    }
+
+    // 检测并处理 SteamStub 保护壳。
+    // 返回真实状态；失败时 error 写明原因。调用方据此决定继续 / 中止，不能把失败当"继续"。
+    Yua::Host::PrepareStatus RunSteamStubPrecheck(HWND owner, const std::wstring& exePath,
+                                                  std::wstring& error)
+    {
+        error.clear();
         if (exePath.empty())
         {
-            return false;
+            error = L"目标 EXE 为空。";
+            return Yua::Host::PrepareStatus::Failed;
         }
 
         std::wstring loaderDir = Path::GetDirectoryName(g_LoaderFullPath) + L"\\";
         const std::wstring unpackerPath = loaderDir + L"CxdecExtractordll\\CxdecPeUnpacker.dll";
+        const std::wstring antiMalformDll = loaderDir + L"CxdecExtractordll\\CxdecAntiMalform.dll";
         HMODULE hUnp = ::LoadLibraryW(unpackerPath.c_str());
         if (!hUnp)
         {
             LoaderLogFailure(L"LoadLibrary CxdecPeUnpacker.dll", unpackerPath);
-            return false;
+            error = L"无法加载脱壳模块：" + unpackerPath;
+            return Yua::Host::PrepareStatus::Failed;
         }
+        struct UnpackerGuard
+        {
+            HMODULE Module;
+            ~UnpackerGuard() { if (Module) ::FreeLibrary(Module); }
+        } unpackerGuard{ hUnp };
 
         auto D = (bool(*)(const wchar_t*))::GetProcAddress(hUnp, "CxdecPeUnpacker_Detect");
         auto P = (bool(*)(const wchar_t*, const wchar_t*))::GetProcAddress(hUnp, "CxdecPeUnpacker_Process");
         auto lastErr = (const wchar_t * (*)())::GetProcAddress(hUnp, "CxdecPeUnpacker_LastError");
+        if (D == nullptr || P == nullptr)
+        {
+            // 默认负例：导出缺失必须在写 steam / 创建进程之前失败。
+            error = L"脱壳模块缺少 CxdecPeUnpacker_Detect / Process 导出，已中止（未改动任何游戏文件）。";
+            return Yua::Host::PrepareStatus::Failed;
+        }
+        if (::GetFileAttributesW(antiMalformDll.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            error = L"缺少反篡改注入模块，已中止（未改动任何游戏文件）：" + antiMalformDll;
+            return Yua::Host::PrepareStatus::Failed;
+        }
+        // 只按数据文件映射，不执行 DllMain：确认它确实是一份可被系统 LoadLibrary 的 PE。
+        // 这一步必须在任何 steam_api / 工作副本改动之前完成。
+        {
+            HMODULE probe = ::LoadLibraryExW(antiMalformDll.c_str(), nullptr,
+                                             LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+            if (probe == nullptr)
+            {
+                error = L"反篡改注入模块无法映射（不是有效的 PE DLL），已中止（未改动任何游戏文件）：" +
+                        antiMalformDll;
+                return Yua::Host::PrepareStatus::Failed;
+            }
+            ::FreeLibrary(probe);
+        }
 
-        // 那个模块的失败原因以前只写进它自己的静态串、没人读，等于报不出来。
-        // 返回 false 多半是「本来就没壳」这种正常情况，所以只在真有原因时才记一行。
         auto LogLastError = [&](const wchar_t* prefix)
         {
             if (lastErr == nullptr)
@@ -1860,8 +1984,6 @@ namespace
 
         if (!packed)
         {
-            // 已经脱过壳（或本来就没壳）的 exe 也要继续走后面的「注入 + 打补丁」：
-            // 反篡改校验跟壳没有关系，不补一样会在启动的最后一步撞上。
             LogLastError(L"[Loader] detect: ");
             LoaderLog(L"[Loader] Not packed - will still inject and patch");
         }
@@ -1873,11 +1995,11 @@ namespace
                                        L"检测到保护壳", MB_YESNO | MB_ICONQUESTION))
             {
                 LoaderLog(L"[Loader] User cancelled");
-                ::FreeLibrary(hUnp);
-                return true;
+                return Yua::Host::PrepareStatus::Cancelled;
             }
             LoaderLog(L"[Loader] User confirmed");
         }
+
         std::wstring gameDir = Path::GetDirectoryName(exePath) + L"\\";
         std::wstring stem = exePath;
         size_t dot = stem.rfind(L'.');
@@ -1887,43 +2009,72 @@ namespace
         }
         std::wstring unpacked = stem + L"_unp.exe";
         std::wstring api = gameDir + L"steam_api.dll";
-        std::wstring apiBak = api + L".bak";
         std::wstring crackedApi = loaderDir + L"CxdecExtractordll\\steamapi_cra\\steam_api.dll";
+        std::wstring crackExe = stem + L"_crack.exe";
 
         // 只有「游戏目录本来就有 steam_api.dll」**且**「破解版 dll 存在」时才替换。
-        // 缺任一个都什么都不做——不能在非 Steam 游戏的目录里凭空造一个 steam_api.dll。
         const bool haveCracked = (::GetFileAttributesW(crackedApi.c_str()) != INVALID_FILE_ATTRIBUTES);
         const bool haveGameApi = (::GetFileAttributesW(api.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+        // 记录本次开始前 _crack.exe 的状态：只有本次真的写/改过它，才能报 Patched。
+        WIN32_FILE_ATTRIBUTE_DATA crackedBefore{};
+        const bool hadCracked = ::GetFileAttributesExW(crackExe.c_str(), GetFileExInfoStandard, &crackedBefore) != FALSE;
+
+        // 可测试的替换事务：唯一 backup、CREATE_NEW 唯一 staging、MoveFileEx 原子替换；
+        // 析构时未 Commit 则回滚，回滚失败保留唯一 backup 并如实写 error。
+        Yua::Host::SteamSwap::Transaction steamSwap;
+        auto failAfterSwap = [&](const std::wstring& reason) -> Yua::Host::PrepareStatus
+        {
+            std::wstring rollbackError;
+            steamSwap.Rollback(rollbackError);
+            error = reason;
+            if (!rollbackError.empty())
+            {
+                error += L" " + rollbackError;
+            }
+            LoaderLog(FormatString(L"[Loader] %s %s", error.c_str(), rollbackError.c_str()).c_str());
+            return Yua::Host::PrepareStatus::Failed;
+        };
+        // 用户取消（关窗 / WM_QUIT）不是"检测失败"：回滚后按 Cancelled 上报，
+        // 界面不会弹一个不必要的错误框。
+        auto cancelAfterSwap = [&](const std::wstring& reason) -> Yua::Host::PrepareStatus
+        {
+            std::wstring rollbackError;
+            steamSwap.Rollback(rollbackError);
+            error = reason;
+            if (!rollbackError.empty())
+            {
+                error += L" " + rollbackError;
+                LoaderLog(FormatString(L"[Loader] %s %s", error.c_str(), rollbackError.c_str()).c_str());
+                return Yua::Host::PrepareStatus::Failed;
+            }
+            LoaderLog(FormatString(L"[Loader] %s", error.c_str()).c_str());
+            return Yua::Host::PrepareStatus::Cancelled;
+        };
+
         if (haveCracked && haveGameApi)
         {
-            if (::GetFileAttributesW(apiBak.c_str()) == INVALID_FILE_ATTRIBUTES)
+            const std::wstring backupHint = api + L".yua-bak-<本次PID/时间戳>";
+            const std::wstring question =
+                L"本流程会临时替换游戏目录里的 steam_api.dll，以便完成反篡改补丁。\r\n\r\n"
+                L"将被修改：\r\n" + api + L"\r\n\r\n"
+                L"原始文件会先完整移到一个**本次独有的备份**（形如 " + backupHint +
+                L"），替换文件先写入唯一 staging 文件，再原子改名；后续任一步失败会尝试回滚。\r\n\r\n"
+                L"确认继续？";
+            if (::MessageBoxW(owner, question.c_str(), L"确认替换 steam_api.dll",
+                              MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
             {
-                if (::MoveFileW(api.c_str(), apiBak.c_str()))
-                {
-                    LoaderLog(L"[Loader] Backed up steam_api.dll -> .bak");
-                }
-                else
-                {
-                    LoaderLogFailure(L"MoveFile 备份 steam_api.dll", api);
-                }
+                LoaderLog(L"[Loader] User declined steam_api.dll replacement");
             }
-
-            if (!::CopyFileW(crackedApi.c_str(), api.c_str(), FALSE))
+            else
             {
-                // 先把错误码抓下来，后面的探测会把它冲掉
-                const Win32Error::Info copyError = Win32Error::Capture();
-
-                // 拷贝失败且新 dll 没到位时，把备份移回来
-                if (::GetFileAttributesW(apiBak.c_str()) != INVALID_FILE_ATTRIBUTES &&
-                    ::GetFileAttributesW(api.c_str()) == INVALID_FILE_ATTRIBUTES)
+                std::wstring transactionError;
+                if (!steamSwap.Begin(api, crackedApi, transactionError))
                 {
-                    if (!::MoveFileW(apiBak.c_str(), api.c_str()))
-                    {
-                        LoaderLogFailure(L"MoveFile 回滚 steam_api.dll", api);
-                    }
+                    error = L"准备 steam_api.dll 替换事务失败：" + transactionError;
+                    return Yua::Host::PrepareStatus::Failed;
                 }
-                LoaderLogLevel(Log::Level::Error,
-                               Win32Error::FailureLine(L"CopyFile steam_api.dll", api, copyError).c_str());
+                LoaderLog(L"[Loader] steam_api.dll backed up to a unique current backup");
             }
         }
         else
@@ -1936,119 +2087,270 @@ namespace
         if (packed)
         {
             LoaderLog(L"[Loader] Unpacking...");
+            // 先清掉可能残留的旧工作副本：脱壳函数即便返回 true，也不能让上一次的
+            // 旧文件冒充本次产物。
+            if (::GetFileAttributesW(unpacked.c_str()) != INVALID_FILE_ATTRIBUTES &&
+                !::DeleteFileW(unpacked.c_str()))
+            {
+                LoaderLogFailure(L"DeleteFile 旧脱壳工作副本", unpacked);
+                return failAfterSwap(L"旧工作副本删不掉，无法安全生成新副本。");
+            }
             if (!P(exePath.c_str(), unpacked.c_str()))
             {
                 LoaderLogLevel(Log::Level::Error, L"[Loader] FAIL: unpack");
                 LogLastError(L"[Loader] unpack: ");
-                ::FreeLibrary(hUnp);
-                return true;
+                return failAfterSwap(L"脱壳失败，未产出工作副本。");
             }
         }
         else
         {
-            // 没壳：复制工作副本走同一条注入流程，原 exe 全程不动
             LoaderLog(L"[Loader] Copying working copy...");
-
-            // 上一轮可能留下同名工作副本且仍被占用：删不掉时把原因记下来再拷，
-            // 否则后面 CopyFileW 失败只会报"复制失败"，看不出是卡在删除这一步。
-            if (!::DeleteFileW(unpacked.c_str()) && ::GetLastError() != ERROR_FILE_NOT_FOUND)
+            if (::GetFileAttributesW(unpacked.c_str()) != INVALID_FILE_ATTRIBUTES)
             {
-                LoaderLogFailure(L"DeleteFile 旧工作副本", unpacked);
+                if (!::DeleteFileW(unpacked.c_str()))
+                {
+                    LoaderLogFailure(L"DeleteFile 旧工作副本", unpacked);
+                    return failAfterSwap(L"旧工作副本删不掉，无法安全复制新副本。");
+                }
             }
-
             if (!::CopyFileW(exePath.c_str(), unpacked.c_str(), FALSE))
             {
                 LoaderLogFailure(L"CopyFile 工作副本", unpacked);
-                ::FreeLibrary(hUnp);
-                return false;
+                return failAfterSwap(L"复制工作副本失败。");
             }
+        }
+        if (::GetFileAttributesW(unpacked.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            LoaderLog(L"[Loader] FAIL: working copy missing after unpack/copy");
+            return failAfterSwap(L"没有生成本次补丁工作副本，已中止。");
         }
 
         LoaderLog(L"[Loader] Injecting...");
-        std::wstring dll = loaderDir + L"CxdecExtractordll\\CxdecAntiMalform.dll";
+        std::wstring dll = antiMalformDll;
         std::wstring cmd = L"\"" + unpacked + L"\"";
         std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
         cmdline.push_back(L'\0');
 
+        // 预检总 deadline：remote thread 加载 + 主进程执行共用一个 60s 预算。
+        const ULONGLONG deadline = ::GetTickCount64() + 60000ull;
+        bool cancelRequested = false;
+
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
-        if (::CreateProcessW(unpacked.c_str(), cmdline.data(), nullptr, nullptr, FALSE,
-                             CREATE_SUSPENDED, nullptr, gameDir.c_str(), &si, &pi))
+        if (!::CreateProcessW(unpacked.c_str(), cmdline.data(), nullptr, nullptr, FALSE,
+                              CREATE_SUSPENDED, nullptr, gameDir.c_str(), &si, &pi))
         {
-            LoaderLog(L"[Loader] Process created suspended");
-            uint8_t detourData[0x678] = {};
-            *(uint32_t*)detourData = 0x678;
-            CreateDetourSection(pi.hProcess, detourData, sizeof(detourData));
+            LoaderLogFailure(L"CreateProcess", unpacked);
+            ::DeleteFileW(unpacked.c_str());
+            return failAfterSwap(L"创建补丁工作进程失败。");
+        }
+        LoaderLog(L"[Loader] Process created suspended");
 
-            SIZE_T bytes = (dll.length() + 1) * sizeof(wchar_t);
-            LPVOID remote = ::VirtualAllocEx(pi.hProcess, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (remote)
+        struct ProcessGuard
+        {
+            PROCESS_INFORMATION* Info;
+            ~ProcessGuard()
             {
-                ::WriteProcessMemory(pi.hProcess, remote, dll.c_str(), bytes, nullptr);
+                if (Info->hThread)
+                {
+                    ::CloseHandle(Info->hThread);
+                    Info->hThread = nullptr;
+                }
+                if (Info->hProcess)
+                {
+                    ::CloseHandle(Info->hProcess);
+                    Info->hProcess = nullptr;
+                }
+            }
+        } processGuard{ &pi };
+
+        auto terminateOwnedChildAndWait = [&]()
+        {
+            if (pi.hProcess)
+            {
+                ::TerminateProcess(pi.hProcess, 1u);
+                ::WaitForSingleObject(pi.hProcess, 5000u);
+            }
+        };
+
+        uint8_t detourData[0x678] = {};
+        *(uint32_t*)detourData = 0x678;
+        if (CreateDetourSection(pi.hProcess, detourData, sizeof(detourData)) == nullptr)
+        {
+            // 远端 .detour 载荷写不进去，后续注入注定失败：立刻停掉本次自建 child，
+            // 不继续分配/写注入参数，也不把它报成成功。
+            LoaderLog(L"[Loader] FAIL: CreateDetourSection");
+            terminateOwnedChildAndWait();
+            ::DeleteFileW(unpacked.c_str());
+            return failAfterSwap(L"无法在补丁工作进程中写入 .detour 节，已中止。");
+        }
+
+        bool injectionFailed = false;
+        std::wstring injectionError;
+        SIZE_T bytes = (dll.length() + 1) * sizeof(wchar_t);
+        LPVOID remote = ::VirtualAllocEx(pi.hProcess, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        HANDLE remoteThread = nullptr;
+        bool remoteThreadCreated = false;
+        bool remoteThreadExited = false;
+        if (remote)
+        {
+            if (::WriteProcessMemory(pi.hProcess, remote, dll.c_str(), bytes, nullptr))
+            {
                 auto* loadLibrary = (LPTHREAD_START_ROUTINE)::GetProcAddress(
                     ::GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
-                HANDLE thread = ::CreateRemoteThread(pi.hProcess, nullptr, 0, loadLibrary, remote, 0, nullptr);
-                if (thread)
+                remoteThread = loadLibrary != nullptr
+                    ? ::CreateRemoteThread(pi.hProcess, nullptr, 0, loadLibrary, remote, 0, nullptr)
+                    : nullptr;
+                remoteThreadCreated = remoteThread != nullptr;
+                if (remoteThread)
                 {
-                    ::WaitForSingleObject(thread, INFINITE);
-                    ::CloseHandle(thread);
-                    LoaderLog(L"[Loader] DLL injected");
+                    // remote 必须在等待结束、确认线程退出后才允许释放参数内存。
+                    if (!WaitForHandleResponsive(owner, remoteThread, deadline, cancelRequested))
+                    {
+                        injectionFailed = true;
+                        injectionError = cancelRequested ? L"用户请求取消预检"
+                                                         : L"等待远程加载线程超时";
+                    }
+                    else
+                    {
+                        remoteThreadExited = true;
+                        DWORD moduleHandle = 0;
+                        if (!::GetExitCodeThread(remoteThread, &moduleHandle) || moduleHandle == 0)
+                        {
+                            injectionFailed = true;
+                            injectionError = L"注入模块没有成功加载（LoadLibraryW 返回空）";
+                        }
+                    }
                 }
                 else
                 {
                     LoaderLogFailure(L"CreateRemoteThread 加载注入模块", dll);
+                    injectionFailed = true;
+                    injectionError = L"创建远程线程失败";
                 }
-                ::VirtualFreeEx(pi.hProcess, remote, 0, MEM_RELEASE);
             }
             else
             {
-                LoaderLogFailure(L"VirtualAllocEx 分配注入参数", unpacked);
+                LoaderLogFailure(L"WriteProcessMemory 写入注入参数", dll);
+                injectionFailed = true;
+                injectionError = L"写入注入参数失败";
             }
-
-            ::ResumeThread(pi.hThread);
-            LoaderLog(L"[Loader] Process resumed");
-            ::WaitForSingleObject(pi.hProcess, INFINITE);
-
-            DWORD exitCode = 0;
-            ::GetExitCodeProcess(pi.hProcess, &exitCode);
-            ::CloseHandle(pi.hProcess);
-            ::CloseHandle(pi.hThread);
-
-            if (!::DeleteFileW(unpacked.c_str()) && ::GetLastError() != ERROR_FILE_NOT_FOUND)
-            {
-                LoaderLogFailure(L"DeleteFile 清理工作副本", unpacked);
-            }
-            else
-            {
-                LoaderLog(L"[Loader] Cleaned working copy");
-            }
-
-            if (exitCode == 2 || exitCode == 3)
-            {
-                // 2 = 这个 exe 已经不需要处理；3 = 需要补但没补上（警告已经弹过了）。
-                // 两种都直接进主界面，不再提示"拖回来"，避免套娃。
-                LoaderLog(exitCode == 2
-                              ? L"[Loader] Nothing to patch, going to main window"
-                              : L"[Loader] Patch could not be applied, going to main window");
-                ::FreeLibrary(hUnp);
-                return false;
-            }
-
-            // 这里原来是「补丁注入完成，已生成 <stem>_crack.exe，请把它拖到本程序上继续」
-            // 的弹框。YuaExtract 主界面已经改成自动接上补丁产物继续启动
-            // （见 YuaExtractMainWindow.cpp 的 EnsureTargetReadyForLaunch），
-            // 再让用户"拖回来"就成了多余且自相矛盾的一步，所以只记日志、不弹框。
-            LoaderLog(FormatString(L"[Loader] Anti-malform patch done, cracked exe: %s_crack.exe",
-                                   stem.c_str()).c_str());
         }
         else
         {
-            LoaderLogFailure(L"CreateProcess", unpacked);
+            LoaderLogFailure(L"VirtualAllocEx 分配注入参数", dll);
+            injectionFailed = true;
+            injectionError = L"分配注入参数内存失败";
         }
 
-        ::FreeLibrary(hUnp);
-        return true;
+        if (injectionFailed)
+        {
+            terminateOwnedChildAndWait();
+            if (remoteThread)
+            {
+                if (::WaitForSingleObject(remoteThread, 5000u) == WAIT_OBJECT_0)
+                {
+                    remoteThreadExited = true;
+                }
+                ::CloseHandle(remoteThread);
+                remoteThread = nullptr;
+            }
+            // 远程线程尚未确认退出时绝不释放它的参数内存（进程已终止也按最保守处理）。
+            if (remote && (!remoteThreadCreated || remoteThreadExited))
+            {
+                ::VirtualFreeEx(pi.hProcess, remote, 0, MEM_RELEASE);
+            }
+            ::DeleteFileW(unpacked.c_str());
+            if (cancelRequested)
+            {
+                return cancelAfterSwap(L"用户请求取消预检，已终止本次工作副本。");
+            }
+            return failAfterSwap(L"注入反篡改模块失败；已终止本次预检工作进程：" + injectionError);
+        }
+        if (remoteThread)
+        {
+            remoteThreadExited = true; // 上面的成功等待已确认线程退出
+            ::CloseHandle(remoteThread);
+            remoteThread = nullptr;
+        }
+        if (remote)
+        {
+            ::VirtualFreeEx(pi.hProcess, remote, 0, MEM_RELEASE);
+        }
+
+        if (::ResumeThread(pi.hThread) == static_cast<DWORD>(-1))
+        {
+            LoaderLogFailure(L"ResumeThread", unpacked);
+            terminateOwnedChildAndWait();
+            ::DeleteFileW(unpacked.c_str());
+            return failAfterSwap(L"恢复预检工作进程失败。");
+        }
+        LoaderLog(L"[Loader] Process resumed");
+
+        if (!WaitForHandleResponsive(owner, pi.hProcess, deadline, cancelRequested))
+        {
+            LoaderLog(L"[Loader] Precheck timed out or cancelled; terminating its own working copy");
+            terminateOwnedChildAndWait();
+            ::DeleteFileW(unpacked.c_str());
+            if (cancelRequested)
+            {
+                return cancelAfterSwap(L"用户请求取消预检，已终止本次工作副本。");
+            }
+            return failAfterSwap(L"反篡改预检超过 60 秒未结束，已终止本次工作副本。");
+        }
+
+        DWORD exitCode = 0;
+        if (!::GetExitCodeProcess(pi.hProcess, &exitCode))
+        {
+            const DWORD code = ::GetLastError();
+            terminateOwnedChildAndWait();
+            ::DeleteFileW(unpacked.c_str());
+            return failAfterSwap(L"读取预检进程退出码失败（错误码 " + std::to_wstring(code) + L"）。");
+        }
+        ::CloseHandle(pi.hProcess);
+        pi.hProcess = nullptr;
+        ::DeleteFileW(unpacked.c_str());
+
+        if (exitCode == 2)
+        {
+            LoaderLog(L"[Loader] Nothing to patch");
+            std::wstring rollbackError;
+            if (!steamSwap.Rollback(rollbackError))
+            {
+                error = L"无需补丁，但恢复原 steam_api.dll 失败：" + rollbackError;
+                return Yua::Host::PrepareStatus::Failed;
+            }
+            return Yua::Host::PrepareStatus::Ready;
+        }
+        if (exitCode == 3)
+        {
+            LoaderLog(L"[Loader] Patch could not be applied");
+            return failAfterSwap(L"检测到需要补丁，但补丁没有应用成功（详见日志）。");
+        }
+        if (exitCode != 0)
+        {
+            return failAfterSwap(L"预检进程异常退出（退出码 " + std::to_wstring(exitCode) + L"），不视为成功。");
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA crackedAfter{};
+        const bool hasCrackedNow =
+            ::GetFileAttributesExW(crackExe.c_str(), GetFileExInfoStandard, &crackedAfter) != FALSE;
+        const bool crackedIsFresh =
+            hasCrackedNow &&
+            (!hadCracked ||
+             ::CompareFileTime(&crackedAfter.ftLastWriteTime, &crackedBefore.ftLastWriteTime) > 0);
+        if (!crackedIsFresh)
+        {
+            // 旧 _crack.exe 仍然在盘上，不能拿它当本次成功。
+            LoaderLog(L"[Loader] No fresh _crack.exe produced; not treating as success");
+            return failAfterSwap(L"补丁流程结束，但本次没有产出新的 _crack.exe；不会沿用旧文件。");
+        }
+
+        // 本次确实产出了新 _crack.exe：保留备份（原 steam_api.dll 仍可由用户找回）。
+        steamSwap.Commit();
+        LoaderLog(FormatString(L"[Loader] Anti-malform patch done, cracked exe: %s", crackExe.c_str()).c_str());
+        return Yua::Host::PrepareStatus::Patched;
     }
 
     std::wstring BrowseForExe(HWND owner)
@@ -2161,7 +2463,7 @@ namespace
     //
     // 注入失败时**仍然让游戏跑起来**（与上游一致）：游戏本身没问题，失败的只是"模块没进去"，
     // 怎么提示交给调用方。返回 false 时 errorOut 是给用户看的原因，细节在日志里。
-    bool StartGameAndInjectDll(const std::wstring& injectDllFullPath, std::wstring& errorOut)
+    bool StartGameAndInjectDll(HWND owner, const std::wstring& injectDllFullPath, std::wstring& errorOut)
     {
         errorOut.clear();
 
@@ -2178,13 +2480,30 @@ namespace
             return false;
         }
 
+        // 只终止**本函数刚创建的这个**阻塞中的子进程；绝不碰用户已有的游戏进程。
+        auto abandonChild = [&pi](const wchar_t* reason)
+        {
+            // 只终止本次新建的挂起 child，并等它真正退出后才收句柄。
+            ::TerminateProcess(pi.hProcess, 1u);
+            ::WaitForSingleObject(pi.hProcess, 5000u);
+            ::CloseHandle(pi.hThread);
+            ::CloseHandle(pi.hProcess);
+            pi.hThread = nullptr;
+            pi.hProcess = nullptr;
+            LoaderLog(reason);
+        };
+
         bool injected = false;
+        std::wstring failureDetail;
         const SIZE_T pathBytes = (injectDllFullPath.length() + 1) * sizeof(wchar_t);
         LPVOID pRemote = ::VirtualAllocEx(pi.hProcess, NULL, pathBytes, MEM_COMMIT | MEM_RESERVE,
                                           PAGE_READWRITE);
+        bool remoteMemorySafeToFree = false;
         if (pRemote)
         {
-            if (::WriteProcessMemory(pi.hProcess, pRemote, injectDllFullPath.c_str(), pathBytes, NULL))
+            SIZE_T written = 0;
+            if (::WriteProcessMemory(pi.hProcess, pRemote, injectDllFullPath.c_str(), pathBytes, &written) &&
+                written == pathBytes)
             {
                 auto* loadLibrary = (LPTHREAD_START_ROUTINE)::GetProcAddress(
                     ::GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
@@ -2193,36 +2512,83 @@ namespace
                                     : nullptr;
                 if (remote)
                 {
-                    ::WaitForSingleObject(remote, INFINITE);
+                    bool cancelRequested = false;
+                    const bool loaded = WaitForHandleResponsive(
+                        owner, remote, ::GetTickCount64() + 30000ull, cancelRequested);
+                    bool remoteExited = loaded;
+                    if (!loaded)
+                    {
+                        // remote 未退出前不释放参数内存：先终止本次 child 并等线程退出。
+                        ::TerminateProcess(pi.hProcess, 1u);
+                        ::WaitForSingleObject(pi.hProcess, 5000u);
+                        remoteExited = ::WaitForSingleObject(remote, 5000u) == WAIT_OBJECT_0;
+                    }
+                    DWORD moduleHandle = 0;
+                    const bool gotExit = loaded && ::GetExitCodeThread(remote, &moduleHandle) != FALSE;
                     ::CloseHandle(remote);
-                    injected = true;
+                    // 只有确认远程线程已经退出，才允许释放它正在读取的参数内存。
+                    remoteMemorySafeToFree = remoteExited;
+                    if (loaded && gotExit && moduleHandle != 0)
+                    {
+                        injected = true;
+                    }
+                    else
+                    {
+                        LoaderLog(L"[Loader] FAIL: injected module did not load (null/exit or timeout)");
+                        failureDetail = cancelRequested
+                                            ? L"用户请求取消启动"
+                                            : L"注入模块没有成功加载（LoadLibraryW 返回空或等待超时）";
+                    }
                 }
                 else
                 {
+                    // CreateRemoteThread 没成功 = 没有线程在读参数内存，可以安全释放。
+                    remoteMemorySafeToFree = true;
                     LoaderLogFailure(L"CreateRemoteThread 加载注入模块", injectDllFullPath);
+                    failureDetail = L"创建远程线程失败";
                 }
             }
             else
             {
+                remoteMemorySafeToFree = true;
                 LoaderLogFailure(L"WriteProcessMemory 写入注入参数", injectDllFullPath);
+                failureDetail = L"写入注入参数失败";
             }
-            ::VirtualFreeEx(pi.hProcess, pRemote, 0, MEM_RELEASE);
+            if (remoteMemorySafeToFree)
+            {
+                ::VirtualFreeEx(pi.hProcess, pRemote, 0, MEM_RELEASE);
+            }
+            else
+            {
+                // 进程已被终止但远程线程未在窗口内退出：宁可泄漏这块远端内存，
+                // 也不能释放线程还在使用的参数（进程退出时系统会整体回收）。
+                LoaderLog(L"[Loader] remote thread did not exit; skip VirtualFreeEx on its parameter block");
+            }
         }
         else
         {
             LoaderLogFailure(L"VirtualAllocEx 分配注入参数", injectDllFullPath);
+            failureDetail = L"分配注入参数内存失败";
         }
-
-        ::ResumeThread(pi.hThread);
-        ::CloseHandle(pi.hThread);
-        ::CloseHandle(pi.hProcess);
 
         if (!injected)
         {
-            errorOut = FormatString(L"游戏已启动，但模块注入失败。\r\n\r\n模块：%s\r\n\r\n详见日志。",
-                                    injectDllFullPath.c_str());
+            abandonChild(L"[Loader] Injection failed; terminated the suspended child we created");
+            errorOut = L"游戏进程未被启动：模块注入失败。\r\n\r\n模块：" + injectDllFullPath +
+                       L"\r\n原因：" + (failureDetail.empty() ? std::wstring(L"详见日志") : failureDetail);
+            return false;
         }
-        return injected;
+
+        if (::ResumeThread(pi.hThread) == static_cast<DWORD>(-1))
+        {
+            LoaderLogFailure(L"ResumeThread", g_KrkrExeFullPath);
+            abandonChild(L"[Loader] ResumeThread failed; terminated the suspended child we created");
+            errorOut = L"游戏进程未被启动：恢复主线程失败。\r\n\r\n详见日志。";
+            return false;
+        }
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+        return true;
     }
 }
 
@@ -2326,7 +2692,7 @@ INT_PTR CALLBACK LoaderDialogWindProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 }
 
                 std::wstring launchError;
-                if (StartGameAndInjectDll(injectDllFullPath, launchError))
+                if (StartGameAndInjectDll(hwnd, injectDllFullPath, launchError))
                 {
                     if (!runtimeHashTargetDirectory.empty())
                     {
@@ -2475,9 +2841,26 @@ namespace Host
         return BrowseFolder(owner, title);
     }
 
-    bool PrepareTargetExe(HWND owner, const std::wstring& exePath)
+    PrepareStatus PrepareTargetExe(HWND owner, const std::wstring& exePath, std::wstring& error)
     {
-        return RunSteamStubPrecheck(owner, exePath);
+        // 预检内部有 Steam API 替换事务（RAII 回滚）。任何 std::bad_alloc 之类从
+        // 事务之后抛出时，栈展开会先执行 Transaction 析构完成回滚；这里再把异常
+        // 变成明确的 Failed，绝不让它穿进窗口过程。
+        try
+        {
+            return RunSteamStubPrecheck(owner, exePath, error);
+        }
+        catch (const std::exception& exception)
+        {
+            error = L"反篡改预检流程异常，已中止（替换事务按 RAII 回滚）：";
+            error += Encoding::AnsiToUnicode(std::string(exception.what()), Encoding::ACP);
+            return PrepareStatus::Failed;
+        }
+        catch (...)
+        {
+            error = L"反篡改预检流程发生未知异常，已中止（替换事务按 RAII 回滚）。";
+            return PrepareStatus::Failed;
+        }
     }
 
     std::wstring CrackedExePath(const std::wstring& exePath)
@@ -2547,7 +2930,7 @@ namespace Host
                       .c_str());
 
         std::wstring failure;
-        const bool injected = StartGameAndInjectDll(dllPath, failure);
+        const bool injected = StartGameAndInjectDll(owner, dllPath, failure);
 
         // 环境变量是给子进程继承用的，注入完成就得清掉：不清的话后面从本进程再起的
         // 任何子进程都会继承这个开关（原版功能窗口的"运行时恢复"就会变成只收集）。
@@ -2585,9 +2968,9 @@ namespace Host
         ::ShowWindow(legacyWindow, SW_SHOWNORMAL);
     }
 
-    void RunStaticKeyExtractionForTarget(HWND owner)
+    bool RunStaticKeyExtractionForTarget(HWND owner)
     {
-        RunStaticKeyExtraction(owner);
+        return RunStaticKeyExtraction(owner);
     }
 
     void EnableDropOnWindow(HWND hwnd)

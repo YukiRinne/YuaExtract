@@ -19,6 +19,8 @@
 
 #include "Blake2s.h"
 
+#include "AtomicFile.h"
+#include "PathSafety.h"
 #include "crypto/siphash.h"
 #include "zlib.h"
 
@@ -33,10 +35,13 @@
 #include <cstring>
 #include <cwctype>
 #include <map>
+#include <new>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace Yua
@@ -57,6 +62,17 @@ namespace Yua
             constexpr const wchar_t* kRootDirectoryName = L"%EmptyString%";
 
             constexpr unsigned long long kMaxReadBytes = 512ull * 1024ull * 1024ull;
+
+            // 扩展集档案的硬上限（2026-11 安全轮）：
+            //   · 输入档案（磁盘字节）64 MiB —— 正常远端档案约 0.25 MiB，留足余量；
+            //   · 解压后 payload 64 MiB —— 压缩包不能靠"小输入 → 巨大输出"撑爆内存。
+            // 任何超过上限的输入都明确报错，不尝试分配。
+            constexpr size_t kMaxArchiveInputBytes = 64ull * 1024ull * 1024ull;
+            constexpr size_t kMaxArchivePayloadBytes = 64ull * 1024ull * 1024ull;
+            constexpr size_t kInflateChunkBytes = 64ull * 1024ull;
+            // 64 MiB 输入理论上能塞 5m+ 个 12 字节表项。正常档案只有个位数 chunk，
+            // 这里给一个远高于真实用量的结构上限，避免 ranges/sort 吃掉几十 MB。
+            constexpr uint32_t kMaxChunkCount = 65536u;
 
             std::wstring CombinePath(const std::wstring& directory, const std::wstring& name)
             {
@@ -224,8 +240,25 @@ namespace Yua
                 error = 0;
                 out.clear();
 
-                HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (path.empty())
+                {
+                    error = ERROR_INVALID_PARAMETER;
+                    return false;
+                }
+
+                // 不跟随重解析点（junction / symlink）：路径上任何一级已存在的是链接就拒绝。
+                std::wstring offending;
+                if (PathSafety::HasReparsePoint(path, &offending))
+                {
+                    error = ERROR_CANT_ACCESS_FILE;
+                    return false;
+                }
+
+                // 共享读、不允许写：别的进程不能在我们读的同时改写这个文件。
+                HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                            OPEN_EXISTING,
+                                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                                            nullptr);
                 if (file == INVALID_HANDLE_VALUE)
                 {
                     error = ::GetLastError();
@@ -239,18 +272,37 @@ namespace Yua
                     ::CloseHandle(file);
                     return false;
                 }
-                if (static_cast<unsigned long long>(size.QuadPart) > kMaxReadBytes)
+                if (static_cast<unsigned long long>(size.QuadPart) > kMaxReadBytes
+                    || !PathSafety::FitsSizeT(static_cast<uint64_t>(size.QuadPart)))
                 {
                     error = ERROR_FILE_TOO_LARGE;
                     ::CloseHandle(file);
                     return false;
                 }
 
-                out.assign(static_cast<size_t>(size.QuadPart), 0u);
-                size_t offset = 0u;
-                while (offset < out.size())
+                const size_t expected = static_cast<size_t>(size.QuadPart);
+                try
                 {
-                    const DWORD chunk = static_cast<DWORD>(std::min<size_t>(out.size() - offset, 1u << 20));
+                    out.assign(expected, 0u);
+                }
+                catch (const std::bad_alloc&)
+                {
+                    error = ERROR_NOT_ENOUGH_MEMORY;
+                    ::CloseHandle(file);
+                    return false;
+                }
+                catch (const std::length_error&)
+                {
+                    error = ERROR_FILE_TOO_LARGE;
+                    ::CloseHandle(file);
+                    return false;
+                }
+
+                size_t offset = 0u;
+                while (offset < expected)
+                {
+                    const DWORD chunk = static_cast<DWORD>(
+                        std::min<size_t>(expected - offset, 1u << 20));
                     DWORD read = 0;
                     if (!::ReadFile(file, out.data() + offset, chunk, &read, nullptr))
                     {
@@ -260,11 +312,23 @@ namespace Yua
                     }
                     if (read == 0u)
                     {
-                        break;
+                        // 读短 = 文件在读取过程中被截断，绝不当成功。
+                        error = ERROR_HANDLE_EOF;
+                        ::CloseHandle(file);
+                        return false;
                     }
                     offset += read;
                 }
-                out.resize(offset);
+
+                // 读完再核对一次大小：文件在读取期间变长/变短都不能算"完整读到"。
+                LARGE_INTEGER finalSize{};
+                if (!::GetFileSizeEx(file, &finalSize)
+                    || finalSize.QuadPart != size.QuadPart)
+                {
+                    error = ERROR_FILE_INVALID;
+                    ::CloseHandle(file);
+                    return false;
+                }
                 ::CloseHandle(file);
                 return true;
             }
@@ -944,15 +1008,34 @@ namespace Yua
                           + L"（请先执行步骤2 采集，或把对照 *.lst 放进这个目录）";
                     return false;
                 }
+                std::wstring offending;
+                if (PathSafety::HasReparsePoint(hashDirectory, &offending))
+                {
+                    error = L"映射目录本身是/含有重解析点，拒绝跟随：" + offending;
+                    return false;
+                }
 
                 const std::wstring directoryLog = CombinePath(hashDirectory, kDirectoryHashLogName);
                 const std::wstring fileNameLog = CombinePath(hashDirectory, kFileNameHashLogName);
 
                 std::wstring sourceError;
+                const auto failIfReadFailed = [&](bool hadFile) -> bool
+                {
+                    if (hadFile && !sourceError.empty())
+                    {
+                        error = sourceError;
+                        return true;
+                    }
+                    return false;
+                };
                 if (FileExists(directoryLog))
                 {
                     collected.counts.directoryLog =
                         LoadSignatureLog(directoryLog, collected.directories, collected.files, sourceError);
+                    if (failIfReadFailed(true))
+                    {
+                        return false;
+                    }
                     collected.sourceLines.push_back(kDirectoryHashLogName + std::wstring(L"（")
                                                    + FormatUInt(collected.counts.directoryLog) + L" 条）");
                 }
@@ -962,6 +1045,10 @@ namespace Yua
                     std::vector<Candidate> ignoredDirectories;
                     collected.counts.fileNameLog = LoadSignatureLog(fileNameLog, ignoredDirectories,
                                                                     collected.files, sourceError);
+                    if (failIfReadFailed(true))
+                    {
+                        return false;
+                    }
                     // 文件日志里出现的 16 位哈希不是文件映射，丢弃但如实报数。
                     collected.sourceLines.push_back(kFileNameHashLogName + std::wstring(L"（")
                                                    + FormatUInt(collected.counts.fileNameLog) + L" 条）");
@@ -972,6 +1059,10 @@ namespace Yua
                 {
                     collected.counts.minedNames =
                         LoadRecoveredList(minedPath, collected.directories, collected.files, sourceError);
+                    if (failIfReadFailed(true))
+                    {
+                        return false;
+                    }
                     collected.sourceLines.push_back(kMinedNamesName + std::wstring(L"（")
                                                    + FormatUInt(collected.counts.minedNames) + L" 条）");
                 }
@@ -981,6 +1072,10 @@ namespace Yua
                 {
                     collected.counts.recoveredNames =
                         LoadRecoveredList(recoveredPath, collected.directories, collected.files, sourceError);
+                    if (failIfReadFailed(true))
+                    {
+                        return false;
+                    }
                     collected.sourceLines.push_back(kRecoveredNamesName + std::wstring(L"（")
                                                    + FormatUInt(collected.counts.recoveredNames) + L" 条）");
                 }
@@ -1027,6 +1122,11 @@ namespace Yua
                     const unsigned int loaded =
                         LoadRecoveredList(CombinePath(hashDirectory, name), extraDirectories, extraFiles,
                                           sourceError);
+                    if (!sourceError.empty())
+                    {
+                        error = sourceError;
+                        return false;
+                    }
                     collected.directories.insert(collected.directories.end(), extraDirectories.begin(),
                                                  extraDirectories.end());
                     collected.files.insert(collected.files.end(), extraFiles.begin(), extraFiles.end());
@@ -1191,48 +1291,82 @@ namespace Yua
                 std::wstring relativePath;
             };
 
-            void CollectScannedFiles(const std::wstring& root, const std::wstring& current,
-                                     std::vector<ScannedFile>& files, unsigned int& skippedLogs)
+            // 递归枚举（只用于 DryRun 的只读扫描）：**不 follow 重解析点**，不把
+            // "列不出来"当成功。返回 false 时 error 点名不可列的子目录。
+            bool CollectScannedFiles(const std::wstring& root, const std::wstring& current,
+                                     std::vector<ScannedFile>& files, unsigned int& skippedLogs,
+                                     unsigned int& skippedReparsePoints, std::wstring& error)
             {
                 WIN32_FIND_DATAW data{};
                 HANDLE find = ::FindFirstFileW(CombinePath(current, L"*").c_str(), &data);
                 if (find == INVALID_HANDLE_VALUE)
                 {
-                    return;
+                    const DWORD findError = ::GetLastError();
+                    if (findError == ERROR_FILE_NOT_FOUND)
+                    {
+                        return true;   // 空目录
+                    }
+                    error = L"无法列出目录：" + current + L"（Win32 错误码 "
+                          + FormatUInt(findError) + L"）";
+                    return false;
                 }
-                do
+                bool ok = true;
+                for (;;)
                 {
                     const std::wstring name = data.cFileName;
-                    if (name == L"." || name == L"..")
-                    {
-                        continue;
-                    }
-                    if (IsSkippedLogComponent(name))
+                    bool skip = (name == L"." || name == L"..");
+                    if (!skip && IsSkippedLogComponent(name))
                     {
                         // 工具自己的日志目录不是游戏资源，与还原口径一致地跳过。
                         ++skippedLogs;
-                        continue;
+                        skip = true;
+                    }
+                    if (!skip)
+                    {
+                        const std::wstring full = CombinePath(current, name);
+                        if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                        {
+                            // junction / symlink：不跟进去，也不当成普通文件读。
+                            ++skippedReparsePoints;
+                        }
+                        else if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                        {
+                            if (!CollectScannedFiles(root, full, files, skippedLogs,
+                                                     skippedReparsePoints, error))
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            ScannedFile file;
+                            file.fullPath = full;
+                            file.relativePath = full.substr(root.length());
+                            while (!file.relativePath.empty()
+                                   && (file.relativePath.front() == L'\\'
+                                       || file.relativePath.front() == L'/'))
+                            {
+                                file.relativePath.erase(file.relativePath.begin());
+                            }
+                            files.push_back(file);
+                        }
                     }
 
-                    const std::wstring full = CombinePath(current, name);
-                    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                    if (!::FindNextFileW(find, &data))
                     {
-                        CollectScannedFiles(root, full, files, skippedLogs);
-                    }
-                    else
-                    {
-                        ScannedFile file;
-                        file.fullPath = full;
-                        file.relativePath = full.substr(root.length());
-                        while (!file.relativePath.empty()
-                               && (file.relativePath.front() == L'\\' || file.relativePath.front() == L'/'))
+                        const DWORD nextError = ::GetLastError();
+                        if (nextError != ERROR_NO_MORE_FILES && nextError != 0u)
                         {
-                            file.relativePath.erase(file.relativePath.begin());
+                            error = L"枚举目录时出错：" + current + L"（Win32 错误码 "
+                                  + FormatUInt(nextError) + L"）";
+                            ok = false;
                         }
-                        files.push_back(file);
+                        break;
                     }
-                } while (::FindNextFileW(find, &data));
+                }
                 ::FindClose(find);
+                return ok;
             }
 
             // =====================================================================
@@ -1376,6 +1510,22 @@ namespace Yua
                 out.erase(out.begin());
             }
             return out;
+        }
+
+        std::wstring LibrarySlotKey(const std::wstring& publisher, const std::wstring& title)
+        {
+            // 全工程唯一的"物理槽位"口径（2026-11 安全轮）：
+            //   MakeSafePathComponent（实际落盘组件）+ casefold（Windows 大小写不敏感）+ '\\'。
+            // Install 的 upsert、EnumerateLibrary 的目录去重、Online::Classify 的 sameSlot
+            // 必须全部用这一份，否则"Game:A" 与 "GameA" 这种 sanitize 后相同的名字会被
+            // 判成 New，然后无确认地覆盖同一物理目录。
+            const std::wstring safePublisher = MakeSafePathComponent(publisher);
+            const std::wstring safeTitle = MakeSafePathComponent(title);
+            if (safePublisher.empty() || safeTitle.empty())
+            {
+                return std::wstring();
+            }
+            return ToLowerString(safePublisher) + L"\\" + ToLowerString(safeTitle);
         }
 
         bool ValidateMeta(const Meta& meta, std::wstring& error)
@@ -1736,7 +1886,8 @@ namespace Yua
         std::vector<unsigned char> EncodeArchive(const Archive& archive, std::wstring& error)
         {
             error.clear();
-
+            try
+            {
             std::vector<unsigned char> payload;
             std::vector<ChunkEntry> table;
 
@@ -1801,6 +1952,14 @@ namespace Yua
                 AppendChunk(payload, table, kChunkRules, archive.rules);
             }
 
+            if (payload.size() > kMaxArchivePayloadBytes)
+            {
+                error = L"扩展集内容超过上限（" + FormatUInt(payload.size())
+                      + L" 字节，上限 " + FormatUInt(kMaxArchivePayloadBytes)
+                      + L" 字节），拒绝生成。";
+                return std::vector<unsigned char>();
+            }
+
             std::vector<unsigned char> stored = payload;
             uint32_t flags = 0u;
             if (!payload.empty())
@@ -1842,16 +2001,35 @@ namespace Yua
 
             out.insert(out.end(), stored.begin(), stored.end());
             return out;
+            }
+            catch (const std::bad_alloc&)
+            {
+                error = L"内存不足：扩展集内容太大，无法编码。";
+                return std::vector<unsigned char>();
+            }
+            catch (const std::length_error&)
+            {
+                error = L"扩展集内容超过可处理长度，拒绝编码。";
+                return std::vector<unsigned char>();
+            }
         }
 
         bool DecodeArchive(const std::vector<unsigned char>& blob, Archive& out, std::wstring& error)
         {
             error.clear();
             out = Archive();
+            try
+            {
 
             if (blob.size() < kHeaderSize)
             {
                 error = L"档案被截断：只有 " + FormatUInt(blob.size()) + L" 字节，连 20 字节头部都不够。";
+                return false;
+            }
+            if (blob.size() > kMaxArchiveInputBytes)
+            {
+                error = L"档案超过上限：文件有 " + FormatUInt(blob.size()) + L" 字节，本工具只接受 "
+                      + FormatUInt(kMaxArchiveInputBytes) + L" 字节以内的扩展集档案。";
                 return false;
             }
 
@@ -1883,6 +2061,20 @@ namespace Yua
             const uint32_t crc = ReadU32(blob.data() + 12u);
             const uint32_t chunkCount = ReadU32(blob.data() + 16u);
 
+            if ((flags & ~kFlagZlib) != 0u)
+            {
+                error = L"头部 flags 不合法：0x" + ToUpperString(FormatUInt(flags))
+                      + L"，本格式只认 bit0（zlib）。";
+                return false;
+            }
+            if (chunkCount > kMaxChunkCount)
+            {
+                error = L"chunk 表项过多：chunkCount=" + FormatUInt(chunkCount)
+                      + L"，上限 " + FormatUInt(kMaxChunkCount)
+                      + L"（正常档案只有个位数 chunk）。";
+                return false;
+            }
+
             if (headerSize < kHeaderSize || static_cast<size_t>(headerSize) > blob.size())
             {
                 error = L"头部长度不合法：headerSize=" + FormatUInt(headerSize)
@@ -1906,39 +2098,128 @@ namespace Yua
             std::vector<unsigned char> payload;
             if ((flags & kFlagZlib) != 0u)
             {
-                // 解压前先按"未压缩 payload 不可能超过某个上限"设界，避免畸形档案撑爆内存。
-                unsigned long long guess = static_cast<unsigned long long>(storedSize) * 1024ull + 65536ull;
-                const unsigned long long cap = 1ull << 31;   // 2 GB
-                if (guess > cap)
+                // **有界流式 inflate**（2026-11 安全轮）：
+                // 旧实现按 storedSize * 1024 先 resize 一个可能高达 2 GB 的缓冲区，
+                // 一个几十字节的畸形输入就能让 UI 线程崩掉。现在固定 64 KiB 输出块渐进追加，
+                // 每次追加前检查 64 MiB 上限；必须真正走到 Z_STREAM_END，且不允许尾随字节。
+                z_stream stream{};
+                const int initStatus = ::inflateInit(&stream);
+                if (initStatus != Z_OK)
                 {
-                    guess = cap;
-                }
-
-                payload.resize(static_cast<size_t>(guess));
-                uLongf produced = static_cast<uLongf>(guess);
-                int status = ::uncompress(payload.data(), &produced, stored,
-                                          static_cast<uLong>(storedSize));
-                if (status == Z_BUF_ERROR)
-                {
-                    // 猜小了：按 zlib 报的"还需要多少"再来一次。
-                    payload.resize(payload.size() * 4u + 65536u);
-                    produced = static_cast<uLongf>(payload.size());
-                    status = ::uncompress(payload.data(), &produced, stored,
-                                          static_cast<uLong>(storedSize));
-                }
-                if (status != Z_OK)
-                {
-                    error = L"档案结构损坏：payload 解压失败（" + ZlibStatusText(status) + L"）。";
+                    error = L"档案结构损坏：初始化 zlib 解压失败（"
+                          + ZlibStatusText(initStatus) + L"）。";
                     return false;
                 }
-                payload.resize(static_cast<size_t>(produced));
+
+                // inflateEnd 必须无条件执行：chunk 分配 / payload.insert 等任何异常
+                // 都要经过这里，否则 zlib 内部状态会泄漏。
+                struct InflateGuard
+                {
+                    z_stream* state = nullptr;
+                    bool active = false;
+                    ~InflateGuard()
+                    {
+                        End();
+                    }
+                    void End()
+                    {
+                        if (active && state != nullptr)
+                        {
+                            ::inflateEnd(state);
+                            active = false;
+                        }
+                    }
+                };
+                InflateGuard inflateGuard{&stream, true};
+
+                stream.next_in = const_cast<Bytef*>(stored);
+                stream.avail_in = static_cast<uInt>(storedSize);
+
+                std::vector<unsigned char> chunk(kInflateChunkBytes);
+                bool finished = false;
+                int status = Z_OK;
+                while (!finished)
+                {
+                    const uLong inputBefore = stream.total_in;
+                    stream.next_out = chunk.data();
+                    stream.avail_out = static_cast<uInt>(chunk.size());
+                    status = ::inflate(&stream, Z_NO_FLUSH);
+                    const size_t produced = chunk.size() - stream.avail_out;
+
+                    if (produced > 0u)
+                    {
+                        if (payload.size() > kMaxArchivePayloadBytes - produced)
+                        {
+                            inflateGuard.End();
+                            error = L"档案解压后超过上限：payload 会超过 "
+                                  + FormatUInt(kMaxArchivePayloadBytes)
+                                  + L" 字节，拒绝继续解压（疑似压缩炸弹或损坏档案）。";
+                            return false;
+                        }
+                        payload.insert(payload.end(), chunk.begin(),
+                                       chunk.begin() + static_cast<std::ptrdiff_t>(produced));
+                    }
+
+                    if (status == Z_STREAM_END)
+                    {
+                        if (stream.avail_in != 0u)
+                        {
+                            inflateGuard.End();
+                            error = L"档案结构损坏：zlib 流结束后还有 "
+                                  + FormatUInt(stream.avail_in) + L" 字节尾随数据。";
+                            return false;
+                        }
+                        finished = true;
+                        break;
+                    }
+                    if (status == Z_NEED_DICT)
+                    {
+                        inflateGuard.End();
+                        error = L"档案结构损坏：payload 需要 zlib 预置字典，本格式不支持。";
+                        return false;
+                    }
+                    if (status != Z_OK && status != Z_BUF_ERROR)
+                    {
+                        inflateGuard.End();
+                        error = L"档案结构损坏：payload 解压失败（"
+                              + ZlibStatusText(status) + L"）。";
+                        return false;
+                    }
+                    if (produced == 0u && stream.avail_in == 0u)
+                    {
+                        inflateGuard.End();
+                        error = L"档案结构损坏：payload 解压中途结束（截断）。";
+                        return false;
+                    }
+                    if (status == Z_BUF_ERROR && produced == 0u)
+                    {
+                        inflateGuard.End();
+                        error = L"档案结构损坏：payload 解压没有进展（截断或数据非法）。";
+                        return false;
+                    }
+                    if (status == Z_OK && produced == 0u && stream.total_in == inputBefore)
+                    {
+                        inflateGuard.End();
+                        error = L"档案结构损坏：payload 解压没有进展（异常数据）。";
+                        return false;
+                    }
+                }
+                inflateGuard.End();
             }
             else
             {
+                if (storedSize > kMaxArchivePayloadBytes)
+                {
+                    error = L"档案 payload 超过上限：未压缩 payload " + FormatUInt(storedSize)
+                          + L" 字节，上限 " + FormatUInt(kMaxArchivePayloadBytes) + L" 字节。";
+                    return false;
+                }
                 payload.assign(stored, stored + storedSize);
             }
 
-            if (!payload.empty() && Crc32(payload.data(), payload.size()) != crc)
+            // CRC32 **始终**校验，包含空 payload（空 payload 的 CRC32 是 0）。
+            // 旧实现只在 non-empty 时比，等于放过了 crc 被改成任意值的空档案。
+            if (Crc32(payload.empty() ? nullptr : payload.data(), payload.size()) != crc)
             {
                 error = L"CRC32 校验失败：档案内容与头部记录不一致（已损坏或被改动）。";
                 return false;
@@ -1946,6 +2227,61 @@ namespace Yua
 
             bool hasIdentity = false;
             bool hasMeta = false;
+
+            // 先整体验证 chunk 表：越界 / 重叠 / 已知 chunk 重复 / 非零 flags 都拒绝，
+            // 再进入解析。绝不能一边解析一边发现"这个 chunk 和上一个叠在一起"。
+            std::vector<std::pair<uint32_t, uint32_t>> ranges; // [begin, end)
+            std::set<uint16_t> seenKnown;
+            for (uint32_t index = 0u; index < chunkCount; ++index)
+            {
+                const unsigned char* entry = blob.data() + headerSize + static_cast<size_t>(index) * 12u;
+                const uint16_t id = ReadU16(entry);
+                const uint16_t entryFlags = ReadU16(entry + 2u);
+                const uint32_t offset = ReadU32(entry + 4u);
+                const uint32_t size = ReadU32(entry + 8u);
+
+                if (entryFlags != 0u)
+                {
+                    error = L"chunk 表不合法：id=0x" + ToUpperString(FormatUInt(id))
+                          + L" 的 flags=" + FormatUInt(entryFlags) + L"，本格式要求为 0。";
+                    return false;
+                }
+                if (static_cast<size_t>(offset) > payload.size()
+                    || static_cast<size_t>(size) > payload.size() - static_cast<size_t>(offset))
+                {
+                    error = L"chunk 越界：id=0x" + ToUpperString(FormatUInt(id))
+                          + L" offset=" + FormatUInt(offset) + L" size=" + FormatUInt(size)
+                          + L"，payload 只有 " + FormatUInt(payload.size()) + L" 字节。";
+                    return false;
+                }
+                const bool known = id == kChunkMeta || id == kChunkIdentity || id == kChunkDirs
+                    || id == kChunkFiles || id == kChunkExceptions || id == kChunkRules
+                    || id == kChunkStats;
+                if (known)
+                {
+                    if (!seenKnown.insert(id).second)
+                    {
+                        error = L"chunk 表不合法：已知 chunk 0x" + ToUpperString(FormatUInt(id))
+                              + L" 出现了不止一次。";
+                        return false;
+                    }
+                }
+                if (size > 0u)
+                {
+                    ranges.push_back(std::make_pair(offset, offset + size));
+                }
+            }
+            std::sort(ranges.begin(), ranges.end());
+            for (size_t i = 1u; i < ranges.size(); ++i)
+            {
+                if (ranges[i].first < ranges[i - 1u].second)
+                {
+                    error = L"chunk 表不合法：chunk 内容范围重叠（offset "
+                          + FormatUInt(ranges[i].first) + L" < 前一个结束 "
+                          + FormatUInt(ranges[i - 1u].second) + L"）。";
+                    return false;
+                }
+            }
 
             for (uint32_t index = 0u; index < chunkCount; ++index)
             {
@@ -2095,6 +2431,19 @@ namespace Yua
                 return false;
             }
             return true;
+            }
+            catch (const std::bad_alloc&)
+            {
+                out = Archive();
+                error = L"内存不足：档案内容太大或结构异常，解码被中止。";
+                return false;
+            }
+            catch (const std::length_error&)
+            {
+                out = Archive();
+                error = L"档案内容超过可处理长度，解码被中止。";
+                return false;
+            }
         }
 
         bool RebuildLookup(Archive& archive, std::wstring& error)
@@ -2144,9 +2493,12 @@ namespace Yua
             }
 
             DWORD writeError = 0;
-            if (!WriteAllBytes(path, blob.data(), blob.size(), writeError))
+            (void)writeError;
+            std::wstring atomicError;
+            if (!Common::AtomicFile::WriteFileAtomic(path, blob, atomicError))
             {
-                error = L"写档案失败：" + path + L"（Win32 错误码 " + FormatUInt(writeError) + L"）";
+                error = L"写档案失败：" + path + (atomicError.empty() ? std::wstring()
+                                                                      : (L"\r\n" + atomicError));
                 return false;
             }
             return true;
@@ -2268,13 +2620,13 @@ namespace Yua
         {
             GenerateResult result;
             const DWORD started = ::GetTickCount();
-
             auto finish = [&]() -> GenerateResult
             {
                 result.elapsedMillis = static_cast<unsigned long long>(::GetTickCount() - started);
                 return result;
             };
-
+            try
+            {
             // 1) 定盐：Universal.log -> 静态派生 -> 明确报错中止（绝不静默）
             result.salt = ResolveSalt(options.logDirectory, options.staticKeyDirectory);
             if (!result.salt.available)
@@ -2476,6 +2828,19 @@ namespace Yua
             result.archive = archive;
             result.ok = true;
             return finish();
+            }
+            catch (const std::bad_alloc&)
+            {
+                result.ok = false;
+                result.error = L"内存不足：生成扩展集被中止。";
+                return finish();
+            }
+            catch (const std::length_error&)
+            {
+                result.ok = false;
+                result.error = L"采集内容超过可处理长度，生成被中止。";
+                return finish();
+            }
         }
 
         namespace
@@ -2533,6 +2898,8 @@ namespace Yua
                 result.error = L"没有给出档案落盘路径。";
                 return result;
             }
+            try
+            {
 
             std::wstring error;
             const std::vector<unsigned char> blob = EncodeArchive(result.archive, error);
@@ -2543,12 +2910,22 @@ namespace Yua
                 return result;
             }
 
-            DWORD writeError = 0;
-            if (!WriteAllBytes(archivePath, blob.data(), blob.size(), writeError))
+            const std::wstring outputDirectory = ParentDirectory(archivePath);
+            DWORD directoryError = 0u;
+            if (!outputDirectory.empty()
+                && !EnsureDirectoryTree(outputDirectory, directoryError))
             {
                 result.ok = false;
-                result.error = L"写档案失败：" + archivePath + L"（Win32 错误码 "
-                             + FormatUInt(writeError) + L"）";
+                result.error = L"建不出档案输出目录：" + outputDirectory + L"（Win32 错误码 "
+                             + FormatUInt(directoryError) + L"）";
+                return result;
+            }
+            std::wstring atomicError;
+            if (!Common::AtomicFile::WriteFileAtomic(archivePath, blob, atomicError))
+            {
+                result.ok = false;
+                result.error = L"写档案失败：" + archivePath
+                             + (atomicError.empty() ? std::wstring() : (L"\r\n" + atomicError));
                 return result;
             }
 
@@ -2557,7 +2934,7 @@ namespace Yua
             result.archiveSha256 = Sha256HexBytes(blob.data(), blob.size());
 
             // §4 步骤5：同目录另写 info.txt（meta 的只读副本，仅供人看）。
-            const std::wstring infoPath = CombinePath(ParentDirectory(archivePath), kInfoFileName);
+            const std::wstring infoPath = CombinePath(outputDirectory, kInfoFileName);
             const std::string infoUtf8 = WideToUtf8(BuildInfoText(result.archive, archivePath));
             std::vector<unsigned char> infoBytes;
             infoBytes.reserve(infoUtf8.size() + 3u);
@@ -2565,16 +2942,30 @@ namespace Yua
             infoBytes.push_back(0xBBu);
             infoBytes.push_back(0xBFu);
             infoBytes.insert(infoBytes.end(), infoUtf8.begin(), infoUtf8.end());
-            if (WriteAllBytes(infoPath, infoBytes.data(), infoBytes.size(), writeError))
+            if (Common::AtomicFile::WriteFileAtomic(infoPath, infoBytes, atomicError))
             {
                 result.infoPath = infoPath;
             }
             else
             {
                 result.warnings.push_back(L"档案已写出，但 info.txt 没写成：" + infoPath
-                                          + L"（Win32 错误码 " + FormatUInt(writeError) + L"）");
+                                          + (atomicError.empty() ? std::wstring()
+                                                                 : (L"\r\n" + atomicError)));
             }
             return result;
+            }
+            catch (const std::bad_alloc&)
+            {
+                result.ok = false;
+                result.error = L"内存不足：写出扩展集档案被中止。";
+                return result;
+            }
+            catch (const std::length_error&)
+            {
+                result.ok = false;
+                result.error = L"扩展集内容超过可处理长度，写出被中止。";
+                return result;
+            }
         }
 
         // =====================================================================
@@ -2596,6 +2987,8 @@ namespace Yua
         {
             LoadResult result;
             result.archivePath = archivePath;
+            try
+            {
 
             std::vector<unsigned char> blob;
             DWORD readError = 0;
@@ -2694,6 +3087,23 @@ namespace Yua
                            L"而且没有可用的当前游戏盐（先跑一次步骤2 或静态 Key 提取即可拿到）。"
                            L"确需强制加载请显式打开 allowUnverified。";
             return result;
+            }
+            catch (const std::bad_alloc&)
+            {
+                result.ok = false;
+                result.match = IdentityMatch::Rejected;
+                result.failure = LoadFailure::Structure;
+                result.error = L"内存不足：读取/解码扩展集档案被中止。";
+                return result;
+            }
+            catch (const std::length_error&)
+            {
+                result.ok = false;
+                result.match = IdentityMatch::Rejected;
+                result.failure = LoadFailure::Structure;
+                result.error = L"扩展集档案超过可处理长度，加载被中止。";
+                return result;
+            }
         }
 
         LoadResult LoadArchiveFromLibrary(const std::wstring& libraryRoot, const std::wstring& publisher,
@@ -2721,6 +3131,8 @@ namespace Yua
         StaticHashResult WriteStaticHashMap(const Archive& archive, const std::wstring& outputDirectory)
         {
             StaticHashResult result;
+            try
+            {
             if (outputDirectory.empty())
             {
                 result.error = L"没有给出 StaticHash_Output 目录。";
@@ -2823,6 +3235,19 @@ namespace Yua
             result.fileEntries = static_cast<unsigned int>(source->fileNames.size());
             result.bytes = static_cast<unsigned long long>(utf8.size());
             return result;
+            }
+            catch (const std::bad_alloc&)
+            {
+                result.ok = false;
+                result.error = L"内存不足：生成静态 Hash 表被中止。";
+                return result;
+            }
+            catch (const std::length_error&)
+            {
+                result.ok = false;
+                result.error = L"静态 Hash 表内容超过可处理长度，生成被中止。";
+                return result;
+            }
         }
 
         // =====================================================================
@@ -2832,10 +3257,18 @@ namespace Yua
         DryRunResult DryRun(const Archive& archive, const DryRunOptions& options)
         {
             DryRunResult result;
+            try
+            {
 
             if (options.sourceDirectory.empty() || !DirectoryExists(options.sourceDirectory))
             {
                 result.error = L"测试来源目录不存在：" + options.sourceDirectory;
+                return result;
+            }
+            std::wstring offending;
+            if (PathSafety::HasReparsePoint(options.sourceDirectory, &offending))
+            {
+                result.error = L"测试来源目录本身是/含有重解析点，拒绝跟随：" + offending;
                 return result;
             }
 
@@ -2855,7 +3288,16 @@ namespace Yua
 
             std::vector<ScannedFile> files;
             unsigned int skippedLogs = 0u;
-            CollectScannedFiles(options.sourceDirectory, options.sourceDirectory, files, skippedLogs);
+            unsigned int skippedReparse = 0u;
+            std::wstring scanError;
+            if (!CollectScannedFiles(options.sourceDirectory, options.sourceDirectory, files,
+                                     skippedLogs, skippedReparse, scanError))
+            {
+                // 不可列的子目录**不能**被当成"全部扫完了"：直接失败并把目录名带出去。
+                result.error = scanError;
+                return result;
+            }
+            result.skippedReparsePoints = skippedReparse;
             result.totalFiles = static_cast<unsigned int>(files.size());
 
             std::set<std::wstring> hitDirectories;
@@ -2974,6 +3416,19 @@ namespace Yua
                 : 0u;
             result.ok = true;
             return result;
+            }
+            catch (const std::bad_alloc&)
+            {
+                result.ok = false;
+                result.error = L"内存不足：读取测试目录时被中止。";
+                return result;
+            }
+            catch (const std::length_error&)
+            {
+                result.ok = false;
+                result.error = L"测试目录内容超过可处理长度，扫描被中止。";
+                return result;
+            }
         }
 
         // =====================================================================
@@ -3173,10 +3628,8 @@ namespace Yua
                 return ManifestLineStatus::Ok;
             }
 
-            bool WriteManifest(const std::wstring& path, const std::vector<ManifestRow>& rows,
-                               std::wstring& error)
+            std::string BuildManifestBytes(const std::vector<ManifestRow>& rows)
             {
-                error.clear();
                 std::wstring text;
                 text += L"# 会社\t作品\t目标exe摘要\t兄弟exe摘要\t盐摘要\t档案摘要\t条数\t生成时间\t安装时间\t来源\r\n";
                 for (const ManifestRow& row : rows)
@@ -3184,12 +3637,18 @@ namespace Yua
                     text += ManifestLine(row);
                     text += L"\r\n";
                 }
-                const std::string utf8 = WideToUtf8(text);
-                DWORD writeError = 0;
-                if (!WriteAllBytes(path, utf8.data(), utf8.size(), writeError))
+                return WideToUtf8(text);
+            }
+
+            bool WriteManifest(const std::wstring& path, const std::vector<ManifestRow>& rows,
+                               std::wstring& error)
+            {
+                error.clear();
+                const std::string utf8 = BuildManifestBytes(rows);
+                if (!Common::AtomicFile::WriteFileAtomic(
+                        path, std::vector<unsigned char>(utf8.begin(), utf8.end()), error))
                 {
-                    error = L"写扩展集库清单失败：" + path + L"（Win32 错误码 "
-                          + FormatUInt(writeError) + L"）";
+                    error = L"写扩展集库清单失败：" + path + L"\r\n" + error;
                     return false;
                 }
                 return true;
@@ -3234,16 +3693,46 @@ namespace Yua
             {
                 out.clear();
                 error.clear();
-                if (!FileExists(path))
+
+                // 不能只靠 FileExists：access denied / 同名目录都会返回 false，把它当
+                // "清单不存在"会静默重建空清单、丢光旧条目。只把真正的 FILE_NOT_FOUND /
+                // PATH_NOT_FOUND 当"还没有清单"，其余一律失败。
+                const DWORD attributes = ::GetFileAttributesW(path.c_str());
+                if (attributes == INVALID_FILE_ATTRIBUTES)
                 {
-                    return true;   // 清单还不存在就当空的（与参数仓库的 Manifest::load 一致）
+                    const DWORD attributeError = ::GetLastError();
+                    if (attributeError == ERROR_FILE_NOT_FOUND
+                        || attributeError == ERROR_PATH_NOT_FOUND)
+                    {
+                        return true;   // 清单还不存在就当空的（与参数仓库 Manifest::load 一致）
+                    }
+                    error = L"读不到扩展集库清单：" + path + L"（Win32 错误码 "
+                          + FormatUInt(attributeError) + L"）—— 不能当成空清单处理。";
+                    return false;
+                }
+                if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                {
+                    error = L"扩展集库清单位置是一个目录：" + path;
+                    return false;
+                }
+                if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                {
+                    error = L"扩展集库清单是重解析点/链接文件，拒绝读取：" + path;
+                    return false;
+                }
+                std::wstring offending;
+                if (PathSafety::HasReparsePoint(path, &offending))
+                {
+                    error = L"扩展集库清单路径上有重解析点，拒绝读取：" + offending;
+                    return false;
                 }
 
                 std::wstring content;
                 DWORD readError = 0;
                 if (!ReadTextFileAuto(path, content, readError))
                 {
-                    error = L"读不到扩展集库清单：" + path;
+                    error = L"读不到扩展集库清单：" + path + L"（Win32 错误码 "
+                          + FormatUInt(readError) + L"）";
                     return false;
                 }
 
@@ -3397,11 +3886,18 @@ namespace Yua
                                    + L"」的那一条做不出库目录名，已跳过。\r\n";
                     continue;
                 }
+                const std::wstring slotKey = LibrarySlotKey(parsed.publisher, parsed.title);
+                if (slotKey.empty())
+                {
+                    catalog.error += L"会社 / 作品名为「" + parsed.publisher + L" / " + parsed.title
+                                   + L"」的那一条做不出库目录名，已跳过。\r\n";
+                    continue;
+                }
                 entry.archivePath = InstalledPath(libraryRoot, safePublisher, safeTitle);
                 catalog.entries.push_back(entry);
-                // 去重键也用 sanitize 后的形态：目录扫描给的键就是磁盘上的真目录名，
-                // 两边不同口径会让同一个目录被列两次（清单一次、扫描一次）。
-                known.insert(safePublisher + L"\\" + safeTitle);
+                // 去重键必须与 Install upsert / Online::Classify 同一口径（sanitize + casefold），
+                // 否则 sanitize 后同名的两份会被列成两条。
+                known.insert(slotKey);
             }
 
             // 清单里没有、但目录里真有 rules.int 的，也列出来（否则 UI 会把它们藏起来）。
@@ -3415,9 +3911,10 @@ namespace Yua
                     {
                         const std::wstring publisher = publisherData.cFileName;
                         if (publisher == L"." || publisher == L".."
-                            || (publisherData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+                            || (publisherData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+                            || (publisherData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
                         {
-                            continue;
+                            continue;   // 目录扫描不 follow 重解析点
                         }
                         const std::wstring publisherPath = CombinePath(libraryRoot, publisher);
                         WIN32_FIND_DATAW titleData{};
@@ -3431,17 +3928,19 @@ namespace Yua
                         {
                             const std::wstring title = titleData.cFileName;
                             if (title == L"." || title == L".."
-                                || (titleData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+                                || (titleData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+                                || (titleData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
                             {
                                 continue;
                             }
-                            if (known.find(publisher + L"\\" + title) != known.end())
+                            const std::wstring slotKey = LibrarySlotKey(publisher, title);
+                            if (slotKey.empty() || known.find(slotKey) != known.end())
                             {
                                 continue;
                             }
                             const std::wstring path =
                                 InstalledPath(libraryRoot, publisher, title);
-                            if (!FileExists(path))
+                            if (!FileExists(path) || PathSafety::HasReparsePoint(path))
                             {
                                 continue;
                             }
@@ -3451,7 +3950,7 @@ namespace Yua
                             entry.archivePath = path;
                             entry.source = L"（清单里没有，按目录补列）";
                             catalog.entries.push_back(entry);
-                            known.insert(publisher + L"\\" + title);
+                            known.insert(slotKey);
                         } while (::FindNextFileW(titleFind, &titleData));
                         ::FindClose(titleFind);
                     } while (::FindNextFileW(publisherFind, &publisherData));
@@ -3479,17 +3978,122 @@ namespace Yua
             return catalog;
         }
 
+        namespace
+        {
+            // 库级写事务的命名互斥体：同名（同一规范化库根）跨进程串行。
+            // 超时有界，不把 UI 线程无限卡住；WAIT_ABANDONED 表示上一个持有者异常退出，
+            // 我们接管所有权，并按普通成功处理（事务本身已由 STAGED/ROLLBACK 兜底）。
+            class LibraryWriteLock
+            {
+            public:
+                LibraryWriteLock() = default;
+                LibraryWriteLock(const LibraryWriteLock&) = delete;
+                LibraryWriteLock& operator=(const LibraryWriteLock&) = delete;
+
+                ~LibraryWriteLock()
+                {
+                    if (handle_ != nullptr)
+                    {
+                        if (locked_)
+                        {
+                            ::ReleaseMutex(handle_);
+                        }
+                        ::CloseHandle(handle_);
+                    }
+                }
+
+                bool Acquire(const std::wstring& normalizedRoot, std::wstring& error)
+                {
+                    error.clear();
+                    // 互斥体名用**本地 digest**，不把用户路径直接写进内核对象名（路径里可能有
+                    // 反斜杠、非 ASCII 或超长）。Local\ 前缀 = 本机会话内可见。
+                    const std::wstring digest = Sha256HexText(ToLowerString(normalizedRoot));
+                    const std::wstring name =
+                        L"Local\\YuaExtract.ExtensionLibrary." + digest.substr(0u, 40u);
+                    handle_ = ::CreateMutexW(nullptr, FALSE, name.c_str());
+                    if (handle_ == nullptr)
+                    {
+                        error = L"创建库写锁失败（Win32 错误码 "
+                              + FormatUInt(::GetLastError()) + L"）。";
+                        return false;
+                    }
+                    const DWORD wait = ::WaitForSingleObject(handle_, 30000u);
+                    if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED)
+                    {
+                        locked_ = true;
+                        return true;
+                    }
+                    error = (wait == WAIT_TIMEOUT)
+                        ? L"另一个安装操作正在写同一个扩展集库，等待 30 秒仍未完成，已放弃。"
+                        : L"等待库写锁失败（Win32 错误码 " + FormatUInt(::GetLastError()) + L"）。";
+                    return false;
+                }
+
+            private:
+                HANDLE handle_ = nullptr;
+                bool locked_ = false;
+            };
+
+            // 只收回**本次调用自己新建**的目录（浅 -> 深记录，深 -> 浅删除）。
+            // 只删空目录：里面若有用户数据/别的进程写入，RemoveDirectoryW 会失败，这里就停手，
+            // 绝不做递归删除。
+            std::wstring RemoveCreatedDirectories(const std::vector<std::wstring>& created)
+            {
+                std::wstring blocked;
+                for (auto it = created.rbegin(); it != created.rend(); ++it)
+                {
+                    if (it->empty() || it->size() <= 3u)
+                    {
+                        continue;
+                    }
+                    if (!::RemoveDirectoryW(it->c_str()))
+                    {
+                        blocked = *it;
+                        break;
+                    }
+                }
+                return blocked;
+            }
+
+            bool ValidateInstallSlot(const std::wstring& normalizedRoot,
+                                     const std::wstring& safePublisher,
+                                     const std::wstring& safeTitle,
+                                     std::wstring& targetDirectory, std::wstring& error)
+            {
+                std::wstring why;
+                const std::wstring relative = safePublisher + L"\\" + safeTitle;
+                if (!PathSafety::ValidateRelativeName(relative, PathSafety::Kind::Directory, &why))
+                {
+                    error = L"会社 / 作品名不安全，拒绝落库：" + why;
+                    return false;
+                }
+                if (!PathSafety::TryResolveUnderRoot(normalizedRoot, relative,
+                                                    PathSafety::Kind::Directory,
+                                                    targetDirectory, &why))
+                {
+                    error = L"会社 / 作品名越出扩展集库根或路径不安全：" + why;
+                    return false;
+                }
+                return true;
+            }
+        }
+
         bool InstallToLibrary(const std::wstring& libraryRoot, const std::wstring& archivePath,
                               std::wstring& error, const std::wstring& sourceLabel)
         {
             error.clear();
-
             if (libraryRoot.empty())
             {
                 error = L"没有给出扩展集库根目录。";
                 return false;
             }
+            if (archivePath.empty())
+            {
+                error = L"没有给出要安装的档案路径。";
+                return false;
+            }
 
+            // 路径接口：**只读一次**完整字节，之后全走字节接口。
             std::vector<unsigned char> blob;
             DWORD readError = 0;
             if (!ReadAllBytes(archivePath, blob, readError))
@@ -3498,136 +4102,200 @@ namespace Yua
                       + FormatUInt(readError) + L"）";
                 return false;
             }
+            return InstallBytesToLibrary(libraryRoot, blob, error,
+                                         sourceLabel.empty() ? archivePath : sourceLabel);
+        }
 
+        bool InstallBytesToLibrary(const std::wstring& libraryRoot,
+                                   const std::vector<unsigned char>& blob,
+                                   std::wstring& error,
+                                   const std::wstring& sourceLabel)
+        {
+            error.clear();
+            error.reserve(4096u);
+            // 事务所需状态全部放在 try 外：catch 也要能在锁仍持有、createdDirectories 仍在
+            // 的情况下尽力回滚。lock 在函数末尾析构（catch 之后），不会提前放锁。
+            std::vector<Common::AtomicFile::StagedFile> pending;
+            std::vector<std::wstring> createdDirectories;
+            LibraryWriteLock lock;
+            // 三个目标文件全部 Commit 成功后置 true：此后任何清理异常都**绝不能**回滚
+            // （某些 backup 可能已经被 Finalize 删掉，再 Rollback 会误伤/误报）。
+            bool transactionCommitted = false;
+
+            const auto discardAll = [&]()
+            {
+                for (Common::AtomicFile::StagedFile& item : pending)
+                {
+                    Common::AtomicFile::Discard(item);
+                }
+            };
+            // count = 要回滚的 pending 前缀长度（包含"失败的那一项"）。
+            // **每一项独立 try**：某项 Rollback 构造错误串时再 bad_alloc，也只标记失败，
+            // 继续恢复下一项；绝不因恢复前/恢复中分配失败而跳过剩余已更新项。
+            const auto rollbackPrefix = [&](size_t count, std::wstring& report) -> bool
+            {
+                bool allOk = true;
+                for (size_t i = count; i > 0u; --i)
+                {
+                    bool itemOk = false;
+                    try
+                    {
+                        std::wstring rollbackError;
+                        itemOk = Common::AtomicFile::Rollback(pending[i - 1u], rollbackError);
+                        if (!itemOk)
+                        {
+                            try
+                            {
+                                report += L"  · " + rollbackError + L"\r\n";
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                    }
+                    catch (...)
+                    {
+                        itemOk = false;
+                        try
+                        {
+                            report += L"  · 回滚某一项时再次发生异常；该项 backup/temp 已保留。\r\n";
+                        }
+                        catch (...)
+                        {
+                        }
+                    }
+                    if (!itemOk)
+                    {
+                        allOk = false;
+                    }
+                }
+                return allOk;
+            };
+            const auto recoverAfterException = [&](std::wstring& report) -> bool
+            {
+                // bad_alloc 可能正发生在 Commit 之后（backup 已产生 / 目标已更新）。
+                // 这里尽力回滚全部 pending（含失败项）；每项独立处理，异常不外抛。
+                try
+                {
+                    return rollbackPrefix(pending.size(), report);
+                }
+                catch (...)
+                {
+                    try
+                    {
+                        report += L"  · 回滚过程中再次发生异常，状态不明。\r\n";
+                    }
+                    catch (...)
+                    {
+                    }
+                    return false;
+                }
+            };
+            try
+            {
+            if (libraryRoot.empty())
+            {
+                error = L"没有给出扩展集库根目录。";
+                return false;
+            }
+
+            const std::wstring normalizedRoot = PathSafety::NormalizeFullPath(libraryRoot);
+            if (normalizedRoot.empty())
+            {
+                error = L"扩展集库根路径无效：" + libraryRoot;
+                return false;
+            }
+            if (FileExists(normalizedRoot))
+            {
+                error = L"扩展集库根是一个文件，不是目录：" + normalizedRoot;
+                return false;
+            }
+
+            if (!lock.Acquire(normalizedRoot, error))
+            {
+                return false;
+            }
+
+            // ---------- 1) 所有"读 + 解码 + 编码 + 路径检查"都在任何目标覆盖之前完成 ----------
             Archive archive;
             if (!DecodeArchive(blob, archive, error))
             {
                 return false;
             }
-
             if (!ValidateMeta(archive.meta, error))
             {
                 return false;
             }
+
             const std::wstring publisher = MakeSafePathComponent(archive.meta.publisher);
             const std::wstring title = MakeSafePathComponent(archive.meta.title);
-
-            DWORD createError = 0;
-            const std::wstring targetDirectory =
-                CombinePath(CombinePath(libraryRoot, publisher), title);
-            const std::wstring installedArchive = CombinePath(targetDirectory, kArchiveFileName);
-
-            // 这次调用**自己新建出来**的库目录（浅 -> 深），失败时要按相反顺序收回去。
-            // 界面在失败时会对用户说"本地库未被改动"，那句话必须是真的 —— 空目录也算改动
-            // （独立验证 N-P1：会社叫 CON 时留下空目录 CON\ 的上一级；库根写不了时留下 AB\ 与 AB\T\）。
-            std::vector<std::wstring> createdDirectories;
-            // 档案本体有没有真的写进去过。写进去之后再失败，就不能再说"没写进库"了。
-            bool archiveWritten = false;
-
-            // 失败收尾：收回本次新建的空目录，并把**本地库到底动没动**如实说全。
-            // **只删空目录、只删自己建的** —— 别人先放进去的东西一律不碰（rules.int 也可能是
-            // 覆盖写掉了旧版本，那种情况下更不许删）。
-            //
-            // 每一条失败路径的 error 里**永远**能读到一句关于本地库状态的结论，而且只有
-            // "没收回 / 已经写进去" 那两种才会说"不一致"（2026-10-16，界面不再自己下断言，
-            // 结论由内核给全）。
-            const auto failInstall = [&](const std::wstring& message) -> bool
+            const std::wstring slotKey = LibrarySlotKey(archive.meta.publisher, archive.meta.title);
+            if (publisher.empty() || title.empty() || slotKey.empty())
             {
-                error = message;
-
-                std::wstring blocked;
-                for (auto it = createdDirectories.rbegin(); it != createdDirectories.rend(); ++it)
-                {
-                    if (it->empty())
-                    {
-                        continue;
-                    }
-                    if (it->size() <= 3u)
-                    {
-                        // 决不删盘根（理论到不了：盘根总是"操作前就有"，不会被记进来）。
-                        // 万一真进来了，就当"没收干净"报出去，绝不假装干净。
-                        blocked = *it;
-                        break;
-                    }
-                    if (!::RemoveDirectoryW(it->c_str()))
-                    {
-                        // 删不掉 = 这一层里已经有东西（多半就是刚写进去的 rules.int）。
-                        // 再往上删只会同样失败，停在这里把实话说出来。
-                        blocked = *it;
-                        break;
-                    }
-                }
-                if (!blocked.empty())
-                {
-                    error += L"\r\n注意：本次已经新建了库目录，但没能全部收回：" + blocked
-                           + L" 删不掉（里面已经有东西了）—— 本地库**不是**与操作前完全一致"
-                             L"（上面这个目录是本次新出现的）。";
-                }
-                if (archiveWritten)
-                {
-                    error += L"\r\n注意：这份 rules.int 已经写进库了（" + installedArchive
-                           + L"），只是清单没更新 —— 本地库与操作前**不一致**。";
-                }
-                if (blocked.empty() && !archiveWritten)
-                {
-                    // 建出来的空目录已经全部收回（或者根本什么都没建）：库与操作前逐项一致
-                    //（含空目录）。界面那句"本地库未被改动"这时候才是真的。
-                    error += L"\r\n\r\n本次没有改动本地库。";
-                }
+                error = L"会社 / 作品名做不出安全的库目录名，拒绝安装。";
                 return false;
-            };
-
-            if (!EnsureDirectoryTree(targetDirectory, createError, &createdDirectories))
-            {
-                std::wstring message = L"建不出库目录：" + targetDirectory + L"（Win32 错误码 "
-                      + FormatUInt(createError) + L"）";
-                // 183 = ERROR_ALREADY_EXISTS：会社 / 作品叫 CON / NUL / COM1 这类 Windows 保留
-                // 设备名时就是它（名字被设备占着，目录其实没建出来）；267 = ERROR_DIRECTORY。
-                // 不点破的话，用户只会看到一句"建不出目录 + 一个查不到意思的数字"。
-                if (createError == ERROR_ALREADY_EXISTS || createError == ERROR_DIRECTORY)
-                {
-                    message += L"\r\n这个名字不能当目录用：它可能占用了 Windows 的保留设备名"
-                               L"（CON / PRN / AUX / NUL / COM1-9 / LPT1-9），或者位置上一份"
-                               L"同名文件挡着。把会社 / 作品改个名字再试。";
-                }
-                return failInstall(message);
             }
 
-            // 档案本体是唯一真身：整份重写。
-            if (!WriteAllBytes(installedArchive, blob.data(), blob.size(), createError))
-            {
-                return failInstall(L"写库里的档案失败：" + installedArchive + L"（Win32 错误码 "
-                                   + FormatUInt(createError) + L"）");
-            }
-            archiveWritten = true;
+            const std::wstring manifestPath = CombinePath(normalizedRoot, kManifestFileName);
 
-            // info.txt 的只读副本（§6：只给人看，工具一律不读）。
+            // 根路径与清单路径都不能是重解析点；库根不存在时检查已存在的祖先。
+            std::wstring offending;
+            if (PathSafety::HasReparsePoint(normalizedRoot, &offending))
             {
-                const std::string infoUtf8 = WideToUtf8(BuildInfoText(archive, installedArchive));
-                std::vector<unsigned char> infoBytes;
-                infoBytes.reserve(infoUtf8.size() + 3u);
-                infoBytes.push_back(0xEFu);
-                infoBytes.push_back(0xBBu);
-                infoBytes.push_back(0xBFu);
-                infoBytes.insert(infoBytes.end(), infoUtf8.begin(), infoUtf8.end());
-                DWORD infoError = 0;
-                WriteAllBytes(CombinePath(targetDirectory, kInfoFileName), infoBytes.data(),
-                              infoBytes.size(), infoError);
+                error = L"拒绝安装：扩展集库路径上有重解析点：" + offending;
+                return false;
+            }
+            if (FileExists(manifestPath) && PathSafety::HasReparsePoint(manifestPath, &offending))
+            {
+                error = L"拒绝安装：库清单是重解析点/链接文件：" + offending;
+                return false;
             }
 
-            // 清单 upsert：同一 exe 摘要（或同一 会社/作品）的旧条目被替换，不产生重复条目。
-            // 读清单也走唯一的解析实现（ParseManifestText），别人写的行原样保住。
+            // **清单读失败绝不能当成"不存在/空清单"**：那会静默丢掉所有旧条目。
+            // 同理，清单里**有跳过的坏行**（ReadManifestFile 返回 true 但带报告）时也拒绝安装：
+            // 安装会整份重写清单，那些"跳过的原始行"会被永久写丢。宁可拒绝并点名行号，
+            // 也不静默破坏用户已有数据。
             std::vector<LibraryEntry> existingEntries;
-            if (!ReadManifestFile(CombinePath(libraryRoot, kManifestFileName), existingEntries, error))
             {
-                const std::wstring reason = error;
-                return failInstall(reason);   // 档案已经写进去了，failInstall 会把这一点如实说出来
+                std::wstring manifestReport;
+                if (!ReadManifestFile(manifestPath, existingEntries, manifestReport))
+                {
+                    error = manifestReport;
+                    return false;
+                }
+                if (!manifestReport.empty())
+                {
+                    error = L"扩展集库清单里有不合规的行，安装会整份重写并丢失这些原始行，"
+                            L"已拒绝安装（本地一个字节都没改）。请先修好清单再装：\r\n"
+                          + manifestReport;
+                    return false;
+                }
             }
-            std::vector<ManifestRow> rows;
-            rows.reserve(existingEntries.size() + 1u);
-            for (const LibraryEntry& existing : existingEntries)
+
+            std::wstring why;
+            std::wstring targetDirectory;
+            if (!ValidateInstallSlot(normalizedRoot, publisher, title, targetDirectory, why))
             {
-                rows.push_back(RowFromEntry(existing));
+                error = why;
+                return false;
+            }
+
+            const std::wstring installedArchive = CombinePath(targetDirectory, kArchiveFileName);
+            const std::wstring installedInfo = CombinePath(targetDirectory, kInfoFileName);
+            if (!PathSafety::IsUnderRoot(normalizedRoot, targetDirectory, true)
+                || !PathSafety::IsUnderRoot(normalizedRoot, installedArchive, true)
+                || !PathSafety::IsUnderRoot(normalizedRoot, installedInfo, true)
+                || !PathSafety::IsUnderRoot(normalizedRoot, manifestPath, true))
+            {
+                error = L"安装目标越出扩展集库根，拒绝。";
+                return false;
+            }
+            if (PathSafety::HasReparsePoint(installedArchive, &offending)
+                || PathSafety::HasReparsePoint(installedInfo, &offending)
+                || PathSafety::HasReparsePoint(targetDirectory, &offending))
+            {
+                error = L"拒绝安装：库内目标路径上有重解析点：" + offending;
+                return false;
             }
 
             const std::wstring archiveDigest = Sha256HexBytes(blob.data(), blob.size());
@@ -3639,27 +4307,22 @@ namespace Yua
             ::swprintf_s(installedAt, L"%04u-%02u-%02u %02u:%02u:%02u", now.wYear, now.wMonth,
                          now.wDay, now.wHour, now.wMinute, now.wSecond);
 
-            for (size_t index = 0u; index < rows.size();)
+            // upsert：**统一用 LibrarySlotKey**（sanitize + casefold）判同一物理槽位，
+            // 同一 exe 摘要的旧条目也替换；显示名仍保留清单里的原始名。
+            std::vector<ManifestRow> rows;
+            rows.reserve(existingEntries.size() + 1u);
+            for (const LibraryEntry& existing : existingEntries)
             {
-                const ManifestRow& row = rows[index];
-                bool sameExe = !row.exeDigest.empty()
-                            && !archive.identity.targetExe.sha256.empty()
-                            && SameHash(row.exeDigest, archive.identity.targetExe.sha256);
-                // 比的是**库目录名**，不是清单里的原始名：清单存原始名（展示保真），目录却是
-                // MakeSafePathComponent 建的 —— 拿原始名跟 sanitize 后的名字比，形态不同就永远不相等，
-                // 于是旧行不被替换、清单里留下两行指向同一个目录（2026-10-15 修）。
-                const std::wstring rowPublisher = MakeSafePathComponent(row.publisher);
-                const std::wstring rowTitle = MakeSafePathComponent(row.title);
-                bool sameSlot = _wcsicmp(rowPublisher.c_str(), publisher.c_str()) == 0
-                             && _wcsicmp(rowTitle.c_str(), title.c_str()) == 0;
+                const bool sameExe = !existing.exeDigest.empty()
+                    && !archive.identity.targetExe.sha256.empty()
+                    && SameHash(existing.exeDigest, archive.identity.targetExe.sha256);
+                const bool sameSlot =
+                    LibrarySlotKey(existing.publisher, existing.title) == slotKey;
                 if (sameExe || sameSlot)
                 {
-                    rows.erase(rows.begin() + static_cast<ptrdiff_t>(index));
+                    continue;   // 被本次安装取代
                 }
-                else
-                {
-                    ++index;
-                }
+                rows.push_back(RowFromEntry(existing));
             }
 
             ManifestRow row;
@@ -3673,17 +4336,328 @@ namespace Yua
                                         + archive.stats.files);
             row.generatedAt = archive.meta.generatedAt;
             row.installedAt = installedAt;
-            row.source = sourceLabel.empty() ? archivePath : sourceLabel;
+            row.source = sourceLabel;
             rows.push_back(row);
 
-            if (!WriteManifest(CombinePath(libraryRoot, kManifestFileName), rows, error))
+            const std::string manifestUtf8 = BuildManifestBytes(rows);
+            const std::string infoUtf8 = WideToUtf8(BuildInfoText(archive, installedArchive));
+            std::vector<unsigned char> infoBytes;
+            infoBytes.reserve(infoUtf8.size() + 3u);
+            infoBytes.push_back(0xEFu);
+            infoBytes.push_back(0xBBu);
+            infoBytes.push_back(0xBFu);
+            infoBytes.insert(infoBytes.end(), infoUtf8.begin(), infoUtf8.end());
+            const std::vector<unsigned char> manifestBytes(manifestUtf8.begin(), manifestUtf8.end());
+
+            // ---------- 2) 建目录（只记本次新建的，失败时只收空目录） ----------
+            DWORD createError = 0u;
+            if (!EnsureDirectoryTree(normalizedRoot, createError, &createdDirectories))
             {
-                const std::wstring reason = error;
-                return failInstall(reason);   // 同上：档案在库里，清单没更新，这句必须说清
+                const std::wstring blocked = RemoveCreatedDirectories(createdDirectories);
+                error = L"建不出扩展集库根：" + normalizedRoot + L"（Win32 错误码 "
+                      + FormatUInt(createError) + L"）";
+                if (!blocked.empty())
+                {
+                    error += L"\r\n注意：本次新建的目录没能全部收回：" + blocked;
+                }
+                else
+                {
+                    error += L"\r\n\r\n本次没有改动本地库。";
+                }
+                return false;
+            }
+            if (!EnsureDirectoryTree(targetDirectory, createError, &createdDirectories))
+            {
+                const std::wstring blocked = RemoveCreatedDirectories(createdDirectories);
+                error = L"建不出库目录：" + targetDirectory + L"（Win32 错误码 "
+                      + FormatUInt(createError) + L"）";
+                if (createError == ERROR_ALREADY_EXISTS || createError == ERROR_DIRECTORY)
+                {
+                    error += L"\r\n这个名字不能当目录用：可能占用了 Windows 保留设备名"
+                             L"（CON / PRN / AUX / NUL / COM1-9 / LPT1-9），或位置上有同名文件挡着。";
+                }
+                if (!blocked.empty())
+                {
+                    error += L"\r\n注意：本次新建的目录没能全部收回：" + blocked;
+                }
+                else
+                {
+                    error += L"\r\n\r\n本次没有改动本地库。";
+                }
+                return false;
+            }
+
+            // 建目录后再查一次重解析点（防止检查与创建之间被换成 junction）。
+            if (PathSafety::HasReparsePoint(targetDirectory, &offending))
+            {
+                const std::wstring blocked = RemoveCreatedDirectories(createdDirectories);
+                error = L"拒绝安装：目标目录在创建后变成/含有重解析点：" + offending;
+                if (!blocked.empty())
+                {
+                    error += L"\r\n注意：本次新建的目录没能全部收回：" + blocked;
+                }
+                else
+                {
+                    error += L"\r\n\r\n本次没有改动本地库。";
+                }
+                return false;
+            }
+
+            // ---------- 3) 同卷唯一暂存（rules / info / manifest） ----------
+            pending.resize(3u);
+
+            if (!Common::AtomicFile::StageBytes(installedArchive, blob,
+                                                pending[0], error))
+            {
+                discardAll();
+                const std::wstring blocked = RemoveCreatedDirectories(createdDirectories);
+                error = L"暂存 rules.int 失败：" + error;
+                error += blocked.empty() ? L"\r\n\r\n本次没有改动本地库。"
+                                         : (L"\r\n注意：本次新建的目录没能全部收回：" + blocked);
+                return false;
+            }
+            if (!Common::AtomicFile::StageBytes(installedInfo, infoBytes,
+                                                pending[1], error))
+            {
+                discardAll();
+                const std::wstring blocked = RemoveCreatedDirectories(createdDirectories);
+                error = L"暂存 info.txt 失败：" + error;
+                error += blocked.empty() ? L"\r\n\r\n本次没有改动本地库。"
+                                         : (L"\r\n注意：本次新建的目录没能全部收回：" + blocked);
+                return false;
+            }
+            if (!Common::AtomicFile::StageBytes(manifestPath, manifestBytes,
+                                                pending[2], error))
+            {
+                discardAll();
+                const std::wstring blocked = RemoveCreatedDirectories(createdDirectories);
+                error = L"暂存库清单失败：" + error;
+                error += blocked.empty() ? L"\r\n\r\n本次没有改动本地库。"
+                                         : (L"\r\n注意：本次新建的目录没能全部收回：" + blocked);
+                return false;
+            }
+
+            // ---------- 4) 依次提交；任一步失败按相反顺序回滚（**含失败的那一项**） ----------
+            for (size_t i = 0u; i < pending.size(); ++i)
+            {
+                std::wstring commitError;
+                commitError.reserve(1024u);
+                if (!Common::AtomicFile::Commit(pending[i], commitError))
+                {
+                    std::wstring rollbackReport;
+                    rollbackReport.reserve(2048u);
+                    const bool rollbackOk = rollbackPrefix(i + 1u, rollbackReport);
+                    discardAll();
+                    const std::wstring blocked = RemoveCreatedDirectories(createdDirectories);
+                    error = L"提交库文件失败（" + std::wstring(i == 0u ? L"rules.int"
+                                  : (i == 1u ? L"info.txt" : L"manifest.txt"))
+                          + L"）：" + commitError;
+                    if (rollbackOk && rollbackReport.empty())
+                    {
+                        error += L"\r\n已回滚本次已提交的文件（含失败项的可能半状态）。";
+                        error += blocked.empty()
+                            ? L"\r\n\r\n本次没有改动本地库。"
+                            : (L"\r\n注意：本次新建的目录没能全部收回：" + blocked);
+                    }
+                    else
+                    {
+                        error += L"\r\n回滚没有全部成功，旧数据仍在备份里（**请勿删除**）：\r\n"
+                               + rollbackReport;
+                        if (!blocked.empty())
+                        {
+                            error += L"注意：本次新建的目录没能全部收回：" + blocked + L"\r\n";
+                        }
+                    }
+                    return false;
+                }
+            }
+
+            // ---------- 5) 成功收尾：只删本次自己的 backup / 残留 temp ----------
+            // 到这里三个目标文件都已 Commit 成功。之后**任何**清理异常都只做 best-effort，
+            // 绝不回滚（backup 可能已被删，再回滚会误伤/误报）。
+            transactionCommitted = true;
+            try
+            {
+                std::wstring cleanupNotes;
+                bool cleanupException = false;
+                for (Common::AtomicFile::StagedFile& item : pending)
+                {
+                    try
+                    {
+                        std::wstring finalizeError;
+                        if (!Common::AtomicFile::Finalize(item, finalizeError))
+                        {
+                            try
+                            {
+                                cleanupNotes += finalizeError;
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                    }
+                    catch (...)
+                    {
+                        // 保留该 item 的 backup/temp 路径；数据已成功提交。
+                        cleanupException = true;
+                    }
+                }
+                try
+                {
+                    if (cleanupException)
+                    {
+                        error = L"扩展集已安装成功，但收尾清理时发生异常；"
+                                L"如目录中出现 .yua-bak / .yua-tmp，可手动删除。\r\n";
+                    }
+                    if (!cleanupNotes.empty())
+                    {
+                        error += cleanupNotes;
+                    }
+                }
+                catch (...)
+                {
+                }
+            }
+            catch (...)
+            {
+                try
+                {
+                    error = L"扩展集已安装成功，但清理 backup/temp 时发生异常；"
+                            L"如目录中出现 .yua-bak / .yua-tmp，可手动删除。";
+                }
+                catch (...)
+                {
+                }
             }
             return true;
+            }
+            catch (const std::bad_alloc&)
+            {
+                if (transactionCommitted)
+                {
+                    try
+                    {
+                        error = L"扩展集已安装成功；内存不足发生在收尾清理阶段，"
+                                L"如目录中出现 .yua-bak / .yua-tmp，可手动删除。";
+                    }
+                    catch (...)
+                    {
+                    }
+                    return true;
+                }
+                std::wstring rollbackReport;
+                const bool rollbackOk = recoverAfterException(rollbackReport);
+                try
+                {
+                    discardAll();
+                }
+                catch (...)
+                {
+                }
+                std::wstring blocked;
+                try
+                {
+                    blocked = RemoveCreatedDirectories(createdDirectories);
+                }
+                catch (...)
+                {
+                    blocked = L"（收目录时再次异常）";
+                }
+                try
+                {
+                    error = L"内存不足：安装扩展集被中止。";
+                    if (rollbackOk && rollbackReport.empty() && blocked.empty())
+                    {
+                        error += L"\r\n已回滚本次事务，本次没有改动本地库。";
+                    }
+                    else
+                    {
+                        error += L"\r\n安装事务未能完整回滚，本地库状态可能不一致；"
+                                 L"旧数据（如有）仍在 .yua-bak 备份里，**请勿删除**：\r\n"
+                               + rollbackReport;
+                        if (!blocked.empty())
+                        {
+                            error += L"本次新建目录未能全部收回：" + blocked + L"\r\n";
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    try
+                    {
+                        error = L"内存不足：安装被中止；回滚报告构造失败，"
+                                L"请保留 .yua-bak / .yua-tmp 并检查本地库。";
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+                return false;
+            }
+            catch (const std::length_error&)
+            {
+                if (transactionCommitted)
+                {
+                    try
+                    {
+                        error = L"扩展集已安装成功；长度异常发生在收尾清理阶段，"
+                                L"如目录中出现 .yua-bak / .yua-tmp，可手动删除。";
+                    }
+                    catch (...)
+                    {
+                    }
+                    return true;
+                }
+                std::wstring rollbackReport;
+                const bool rollbackOk = recoverAfterException(rollbackReport);
+                try
+                {
+                    discardAll();
+                }
+                catch (...)
+                {
+                }
+                std::wstring blocked;
+                try
+                {
+                    blocked = RemoveCreatedDirectories(createdDirectories);
+                }
+                catch (...)
+                {
+                    blocked = L"（收目录时再次异常）";
+                }
+                try
+                {
+                    error = L"扩展集内容超过可处理长度，安装被中止。";
+                    if (rollbackOk && rollbackReport.empty() && blocked.empty())
+                    {
+                        error += L"\r\n已回滚本次事务，本次没有改动本地库。";
+                    }
+                    else
+                    {
+                        error += L"\r\n安装事务未能完整回滚，本地库状态可能不一致；"
+                                 L"旧数据（如有）仍在 .yua-bak 备份里，**请勿删除**：\r\n"
+                               + rollbackReport;
+                        if (!blocked.empty())
+                        {
+                            error += L"本次新建目录未能全部收回：" + blocked + L"\r\n";
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    try
+                    {
+                        error = L"长度异常：安装被中止；回滚报告构造失败，"
+                                L"请保留 .yua-bak / .yua-tmp 并检查本地库。";
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+                return false;
+            }
         }
-
         // =====================================================================
         // 默认路径
         // =====================================================================
@@ -3814,6 +4788,11 @@ namespace Yua
                   + L" / 整路径可还原 " + FormatUInt(result.fullyResolvedFiles) + L"\r\n";
             text += L"缺目录 Hash " + FormatUInt(result.missingDirectory)
                   + L" / 缺文件 Hash " + FormatUInt(result.missingFileName) + L"\r\n";
+            if (result.skippedReparsePoints > 0u)
+            {
+                text += L"扫描时跳过重解析点（junction / symlink，不跟随）"
+                      + FormatUInt(result.skippedReparsePoints) + L" 个\r\n";
+            }
             text += L"成功率 " + FormatUInt(result.successRate) + L"%（"
                   + FormatUInt(result.fullyResolvedFiles) + L" / "
                   + FormatUInt(result.hashNamedFiles) + L"）";

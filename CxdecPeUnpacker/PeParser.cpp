@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "PeParser.h"
 
+#include <cstddef>
+
 // ---- PE 读取 ----
 
 PeReader::PeReader(const std::wstring& filePath)
@@ -10,36 +12,67 @@ PeReader::~PeReader() { Close(); }
 
 bool PeReader::Load()
 {
+    Close();
     HANDLE hFile = CreateFileW(m_filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
-    DWORD fileSize = GetFileSize(hFile, nullptr);
-    if (fileSize == INVALID_FILE_SIZE || fileSize < sizeof(IMAGE_DOS_HEADER)) {
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart < static_cast<LONGLONG>(sizeof(IMAGE_DOS_HEADER)) ||
+        static_cast<unsigned long long>(fileSize.QuadPart) > static_cast<unsigned long long>(SIZE_MAX)) {
         CloseHandle(hFile); return false;
     }
 
-    m_fileData.resize(fileSize);
+    m_fileData.resize(static_cast<size_t>(fileSize.QuadPart));
     DWORD bytesRead = 0;
-    if (!ReadFile(hFile, m_fileData.data(), fileSize, &bytesRead, nullptr) || bytesRead != fileSize) {
+    const DWORD toRead = static_cast<DWORD>(m_fileData.size());
+    if (!ReadFile(hFile, m_fileData.data(), toRead, &bytesRead, nullptr) || bytesRead != toRead) {
         CloseHandle(hFile); m_fileData.clear(); return false;
     }
     CloseHandle(hFile);
 
+    const size_t size = m_fileData.size();
     m_dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(m_fileData.data());
     if (m_dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    if (m_dosHeader->e_lfanew <= 0 || static_cast<size_t>(m_dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS32) > m_fileData.size())
-        return false;
 
-    m_ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS32*>(m_fileData.data() + m_dosHeader->e_lfanew);
+    const size_t e_lfanew = static_cast<size_t>(m_dosHeader->e_lfanew);
+    if (e_lfanew < sizeof(IMAGE_DOS_HEADER) || e_lfanew > size) return false;
+    if (size - e_lfanew < 4u + sizeof(IMAGE_FILE_HEADER)) return false;
+
+    m_ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS32*>(m_fileData.data() + e_lfanew);
     if (m_ntHeaders->Signature != IMAGE_NT_SIGNATURE) return false;
     if (m_ntHeaders->FileHeader.Machine != IMAGE_FILE_MACHINE_I386) return false;
 
+    const size_t optionalOffset = e_lfanew + 4u + sizeof(IMAGE_FILE_HEADER);
+    const size_t optionalSize = m_ntHeaders->FileHeader.SizeOfOptionalHeader;
+    constexpr size_t kMinimumOptional = offsetof(IMAGE_OPTIONAL_HEADER32, DataDirectory);
+    if (optionalSize < kMinimumOptional || optionalSize > size - optionalOffset) return false;
+    if (m_ntHeaders->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) return false;
+
+    uint32_t rvaCount = m_ntHeaders->OptionalHeader.NumberOfRvaAndSizes;
+    if (rvaCount > IMAGE_NUMBEROF_DIRECTORY_ENTRIES) rvaCount = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    if (kMinimumOptional + static_cast<size_t>(rvaCount) * sizeof(IMAGE_DATA_DIRECTORY) > optionalSize) {
+        return false;
+    }
+    m_rvaCount = rvaCount;
+
+    const size_t sectionOffset = optionalOffset + optionalSize;
+    const size_t sectionCount = m_ntHeaders->FileHeader.NumberOfSections;
+    if (sectionCount > (size - sectionOffset) / sizeof(IMAGE_SECTION_HEADER)) return false;
+
+    // 每个节的原始数据范围必须在文件里；否则后续 RVA→偏移会算出越界位置。
+    const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(m_fileData.data() + sectionOffset);
+    for (size_t i = 0; i < sectionCount; ++i) {
+        const size_t rawStart = sections[i].PointerToRawData;
+        const size_t rawSize = sections[i].SizeOfRawData;
+        if (rawSize == 0) continue;
+        if (rawStart > size || rawSize > size - rawStart) return false;
+    }
     return true;
 }
 
 void PeReader::Close() {
-    m_fileData.clear(); m_dosHeader = nullptr; m_ntHeaders = nullptr;
+    m_fileData.clear(); m_dosHeader = nullptr; m_ntHeaders = nullptr; m_rvaCount = 0;
 }
 
 const IMAGE_DOS_HEADER* PeReader::DosHeader() const { return m_dosHeader; }
@@ -66,17 +99,23 @@ size_t PeReader::SectionCount() const {
     return m_ntHeaders ? m_ntHeaders->FileHeader.NumberOfSections : 0;
 }
 
-uint32_t PeReader::RvaToOffset(uint32_t rva) const
+uint32_t PeReader::RvaToOffset(uint32_t rva, size_t length) const
 {
-    if (!m_ntHeaders) return 0;
+    if (!m_ntHeaders || m_fileData.empty()) return 0;
     auto* sections = IMAGE_FIRST_SECTION(m_ntHeaders);
     for (WORD i = 0; i < m_ntHeaders->FileHeader.NumberOfSections; ++i) {
         uint32_t vsize = sections[i].Misc.VirtualSize;
         if (vsize == 0) vsize = sections[i].SizeOfRawData;
-        if (rva >= sections[i].VirtualAddress &&
-            rva < sections[i].VirtualAddress + vsize) {
-            return rva - sections[i].VirtualAddress + sections[i].PointerToRawData;
-        }
+        if (rva < sections[i].VirtualAddress) continue;
+        const uint32_t delta = rva - sections[i].VirtualAddress;
+        if (delta >= vsize) continue;
+
+        // 只有落在节的**原始数据**里才有文件字节；虚拟填充区没有对应内容。
+        if (delta >= sections[i].SizeOfRawData) return 0;
+        const uint64_t offset = static_cast<uint64_t>(sections[i].PointerToRawData) + delta;
+        if (offset >= m_fileData.size()) return 0;
+        if (static_cast<uint64_t>(length) > m_fileData.size() - offset) return 0;
+        return static_cast<uint32_t>(offset);
     }
     return 0;
 }
@@ -99,7 +138,10 @@ size_t PeReader::DataSize() const { return m_fileData.size(); }
 
 IMAGE_DATA_DIRECTORY PeReader::GetDataDirectory(int index) const
 {
-    if (!m_ntHeaders || index < 0 || index >= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) return {};
+    if (!m_ntHeaders || index < 0 || index >= IMAGE_NUMBEROF_DIRECTORY_ENTRIES ||
+        static_cast<uint32_t>(index) >= m_rvaCount) {
+        return {};
+    }
     return m_ntHeaders->OptionalHeader.DataDirectory[index];
 }
 
@@ -108,9 +150,14 @@ IMAGE_DATA_DIRECTORY PeReader::GetDataDirectory(int index) const
 PeRebuilder::PeRebuilder(const PeReader& source)
     : m_source(source), m_dosHeader(nullptr), m_ntHeaders(nullptr), m_zeroDosStub(false)
 {
-    m_outputData.assign(source.Data(), source.Data() + source.DataSize());
+    if (source.Data() != nullptr && source.DataSize() != 0) {
+        m_outputData.assign(source.Data(), source.Data() + source.DataSize());
+    }
+    if (m_outputData.size() < sizeof(IMAGE_DOS_HEADER)) return;
     m_dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(m_outputData.data());
-    m_ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS32*>(m_outputData.data() + m_dosHeader->e_lfanew);
+    const size_t e_lfanew = static_cast<size_t>(m_dosHeader->e_lfanew);
+    if (e_lfanew > m_outputData.size() || m_outputData.size() - e_lfanew < sizeof(IMAGE_NT_HEADERS32)) return;
+    m_ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS32*>(m_outputData.data() + e_lfanew);
 }
 
 void PeRebuilder::SetEntryPoint(uint32_t oep) {

@@ -143,9 +143,11 @@ bool Repacker::Load(std::wstring& error)
     bool ok = true;
     ok = Bind(module, "SniffInputDir", Sniff, error) && ok;
     ok = Bind(module, "Repack", Repack, error) && ok;
+    ok = Bind(module, "RepackEx", RepackEx, error) && ok;
     ok = Bind(module, "NextPatchRevision", NextRevision, error) && ok;
     ok = Bind(module, "ImportKeyFile", ImportKey, error) && ok;
     ok = Bind(module, "DeriveKeys", DeriveKeys, error) && ok;
+    ok = Bind(module, "DeriveKeysEx", DeriveKeysEx, error) && ok;
     if (!ok)
     {
         error = L"从 " + path + L" 取导出失败：" + error;
@@ -175,7 +177,10 @@ bool KeyStatic::Load(std::wstring& error)
         return false;
     }
 
-    if (!Bind(module, "ExtractKey", ExtractKey, error))
+    bool ok = true;
+    ok = Bind(module, "ExtractKey", ExtractKey, error) && ok;
+    ok = Bind(module, "ExtractKeyEx", ExtractKeyEx, error) && ok;
+    if (!ok)
     {
         error = L"从 " + path + L" 取导出失败：" + error;
         ::FreeLibrary(module);

@@ -51,18 +51,24 @@ namespace
         fwprintf(stdout, L"        --keys <目录>        参数仓库根目录（默认 <工具目录>\\keys）\n");
         fwprintf(stdout, L"        --media-name <盐>    覆盖盐，只在派生的那套不对时才用\n");
         fwprintf(stdout, L"        --mode <1|2|3>       覆盖嗅探结果\n");
-        fwprintf(stdout, L"        --rescramble         把干净文本搅回加扰形态\n\n");
+        fwprintf(stdout, L"        --rescramble         把干净文本搅回加扰形态\n");
+        fwprintf(stdout, L"        --allow-native-code  允许现场派生时执行游戏内嵌 DLL（仅可信游戏，不是 sandbox）\n\n");
         fwprintf(stdout, L"  keys <游戏.exe> [选项]\n");
-        fwprintf(stdout, L"      只派生/收编参数，不打包。选项同上（--keys）。\n\n");
+        fwprintf(stdout, L"      只派生/收编参数，不打包。选项同上（--keys、--allow-native-code）。\n\n");
         fwprintf(stdout, L"  importkey <参数文件.hxv4p> [选项]\n");
         fwprintf(stdout, L"      把一个 .hxv4p 参数文件收进仓库。选项：--exe、--keys。\n\n");
         fwprintf(stdout, L"  nextrev <游戏目录>\n");
         fwprintf(stdout, L"      扫描已有的 patch@r<N>.xp3，给出下一个可用修订号。\n\n");
-        fwprintf(stdout, L"  keystatic <游戏.exe> [--out <目录>]\n");
+        fwprintf(stdout, L"  keystatic <游戏.exe> [--out <目录>] [--allow-native-code]\n");
         fwprintf(stdout, L"      调 CxdecKeyStatic 做静态 Key 提取。\n");
-        fwprintf(stdout, L"      默认输出到 <游戏目录>\\ExtractKey_Output\\Static。\n\n");
+        fwprintf(stdout, L"      默认输出到 <游戏目录>\\ExtractKey_Output\\Static。\n");
+        fwprintf(stdout, L"      不带 --allow-native-code 时不会执行游戏内嵌 DLL，会明确失败且不创建输出。\n\n");
         fwprintf(stdout, L"  cmp <文件A> <文件B>\n");
         fwprintf(stdout, L"      逐字节比对两份文件（复刻验证用）：只报首个差异偏移，不打印全文。\n\n");
+        fwprintf(stdout, L"原生执行授权（--allow-native-code）：\n");
+        fwprintf(stdout, L"  它会让工具把游戏自带的 BOOTSTRAP DLL 映射进本进程并调用其中的函数。\n");
+        fwprintf(stdout, L"  仅在确认目标游戏可信时使用；这不是 sandbox，代码与本工具同权限。\n");
+        fwprintf(stdout, L"  默认不执行；其它命令不接受这个选项。\n\n");
         fwprintf(stdout, L"  help\n");
     }
 
@@ -115,14 +121,18 @@ namespace
         std::wstring outputDirectory;  // 只有 keystatic 用
         int modeOverride = -1;
         bool rescramble = false;
+        // 仅 repack / keys / keystatic 接受。显式确认目标游戏可信后，才允许
+        // 把游戏内嵌 DLL 映射进本进程并调用；默认 false。
+        bool allowNativeCode = false;
     };
 
     // 每个命令认哪些选项
     enum class OptionSet
     {
-        Repack,      // --exe --keys --media-name --mode --rescramble
-        ExeAndKeys,  // --exe --keys
-        KeyStaticOut // --out
+        Repack,      // --exe --keys --media-name --mode --rescramble --allow-native-code
+        Keys,        // --exe --keys --allow-native-code
+        ImportKey,   // --exe --keys
+        KeyStaticOut // --out --allow-native-code
     };
 
     bool Accepts(OptionSet set, const wchar_t* name)
@@ -132,18 +142,25 @@ namespace
             case OptionSet::Repack:
                 return _wcsicmp(name, L"--exe") == 0 || _wcsicmp(name, L"--keys") == 0 ||
                        _wcsicmp(name, L"--media-name") == 0 || _wcsicmp(name, L"--mode") == 0 ||
-                       _wcsicmp(name, L"--rescramble") == 0;
-            case OptionSet::ExeAndKeys:
+                       _wcsicmp(name, L"--rescramble") == 0 ||
+                       _wcsicmp(name, L"--allow-native-code") == 0;
+            case OptionSet::Keys:
+                return _wcsicmp(name, L"--exe") == 0 || _wcsicmp(name, L"--keys") == 0 ||
+                       _wcsicmp(name, L"--allow-native-code") == 0;
+            case OptionSet::ImportKey:
                 return _wcsicmp(name, L"--exe") == 0 || _wcsicmp(name, L"--keys") == 0;
             case OptionSet::KeyStaticOut:
-                return _wcsicmp(name, L"--out") == 0;
+                return _wcsicmp(name, L"--out") == 0 ||
+                       _wcsicmp(name, L"--allow-native-code") == 0;
         }
         return false;
     }
 
     bool NeedsValue(const wchar_t* name)
     {
-        return _wcsicmp(name, L"--rescramble") != 0;
+        // 这两个是无值开关，不是"后面跟一个值"
+        return _wcsicmp(name, L"--rescramble") != 0 &&
+               _wcsicmp(name, L"--allow-native-code") != 0;
     }
 
     // 解析命令之后的选项。
@@ -211,7 +228,14 @@ namespace
                 continue;
             }
 
-            options.rescramble = true;
+            if (_wcsicmp(token.c_str(), L"--allow-native-code") == 0)
+            {
+                options.allowNativeCode = true;
+            }
+            else
+            {
+                options.rescramble = true;
+            }
             ++index;
         }
         return true;
@@ -262,7 +286,7 @@ namespace
         if (args.size() < 3)
         {
             fwprintf(stderr, L"用法：CxdecCli repack <目录> <输出.xp3> [--exe X] [--keys X] "
-                             L"[--media-name X] [--mode N] [--rescramble]\n");
+                             L"[--media-name X] [--mode N] [--rescramble] [--allow-native-code]\n");
             return kExitUsage;
         }
 
@@ -300,16 +324,21 @@ namespace
         {
             fwprintf(stdout, L"重新加扰：是\n");
         }
+        if (options.allowNativeCode)
+        {
+            fwprintf(stdout, L"原生执行：已显式授权（会执行游戏内嵌 DLL，不是 sandbox）\n");
+        }
 
         char detail[4096] = {};
         char failure[4096] = {};
         const wchar_t* exeArg = options.exePath.empty() ? nullptr : options.exePath.c_str();
         const wchar_t* keysArg = options.keysRoot.empty() ? nullptr : options.keysRoot.c_str();
         const wchar_t* mediaArg = options.mediaName.empty() ? nullptr : options.mediaName.c_str();
+        const DWORD flags = options.allowNativeCode ? 1u : 0u;
 
-        const BOOL ok = api.Repack(inputDirectory.c_str(), outputXp3.c_str(), exeArg, keysArg,
-                                   mediaArg, options.modeOverride, options.rescramble ? 1 : 0,
-                                   detail, sizeof(detail), failure, sizeof(failure));
+        const BOOL ok = api.RepackEx(inputDirectory.c_str(), outputXp3.c_str(), exeArg, keysArg,
+                                     mediaArg, options.modeOverride, options.rescramble ? 1 : 0,
+                                     flags, detail, sizeof(detail), failure, sizeof(failure));
         if (!ok)
         {
             fwprintf(stderr, L"封包失败：%s\n", ModuleApi::FromAnsi(failure).c_str());
@@ -325,7 +354,7 @@ namespace
     {
         if (args.size() < 2)
         {
-            fwprintf(stderr, L"用法：CxdecCli keys <游戏.exe> [--keys <目录>]\n");
+            fwprintf(stderr, L"用法：CxdecCli keys <游戏.exe> [--keys <目录>] [--allow-native-code]\n");
             return kExitUsage;
         }
 
@@ -333,7 +362,7 @@ namespace
 
         Options options;
         std::wstring reason;
-        if (!ParseOptions(args, 2, OptionSet::ExeAndKeys, options, reason))
+        if (!ParseOptions(args, 2, OptionSet::Keys, options, reason))
         {
             fwprintf(stderr, L"%s\n", reason.c_str());
             return kExitUsage;
@@ -349,11 +378,16 @@ namespace
 
         fwprintf(stdout, L"游戏 EXE：%s\n", exePath.c_str());
         fwprintf(stdout, L"参数仓库：%s\n", options.keysRoot.c_str());
+        if (options.allowNativeCode)
+        {
+            fwprintf(stdout, L"原生执行：已显式授权（会执行游戏内嵌 DLL，不是 sandbox）\n");
+        }
 
         char note[4096] = {};
         char failure[4096] = {};
-        if (!api.DeriveKeys(exePath.c_str(), options.keysRoot.c_str(), note, sizeof(note), failure,
-                            sizeof(failure)))
+        const DWORD flags = options.allowNativeCode ? 1u : 0u;
+        if (!api.DeriveKeysEx(exePath.c_str(), options.keysRoot.c_str(), flags, note, sizeof(note),
+                              failure, sizeof(failure)))
         {
             fwprintf(stderr, L"取参数失败：%s\n", ModuleApi::FromAnsi(failure).c_str());
             return kExitFail;
@@ -375,7 +409,7 @@ namespace
 
         Options options;
         std::wstring reason;
-        if (!ParseOptions(args, 2, OptionSet::ExeAndKeys, options, reason))
+        if (!ParseOptions(args, 2, OptionSet::ImportKey, options, reason))
         {
             fwprintf(stderr, L"%s\n", reason.c_str());
             return kExitUsage;
@@ -427,7 +461,7 @@ namespace
     {
         if (args.size() < 2)
         {
-            fwprintf(stderr, L"用法：CxdecCli keystatic <游戏.exe> [--out <目录>]\n");
+            fwprintf(stderr, L"用法：CxdecCli keystatic <游戏.exe> [--out <目录>] [--allow-native-code]\n");
             return kExitUsage;
         }
 
@@ -461,9 +495,15 @@ namespace
 
         fwprintf(stdout, L"游戏 EXE：%s\n", exePath.c_str());
         fwprintf(stdout, L"输出目录：%s\n", outputDirectory.c_str());
+        if (options.allowNativeCode)
+        {
+            fwprintf(stdout, L"原生执行：已显式授权（会执行游戏内嵌 DLL，不是 sandbox）\n");
+        }
 
         char failure[2048] = {};
-        if (!api.ExtractKey(exePath.c_str(), outputDirectory.c_str(), failure, sizeof(failure)))
+        const DWORD flags = options.allowNativeCode ? 1u : 0u;
+        if (!api.ExtractKeyEx(exePath.c_str(), outputDirectory.c_str(), flags, failure,
+                              sizeof(failure)))
         {
             fwprintf(stderr, L"静态提取失败：%s\n", ModuleApi::FromAnsi(failure).c_str());
             return kExitFail;

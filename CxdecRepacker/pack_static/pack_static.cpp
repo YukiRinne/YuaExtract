@@ -80,15 +80,26 @@ PackReport pack_static(const std::string& utf8_dir, const std::string& utf8_out,
     ResolvedProfile pr = store.resolve(opts.exe_path);
     if (pr.origin == ProfileOrigin::Builtin && opts.auto_derive && !opts.exe_path.empty()) {
         std::string note, why;
-        if (DeriveProfile(opts.exe_path, opts.profile_root, &note, &why)) {
+        // DeriveProfile 内部先在游戏目录旁收编已生成好的 .hxv4p（纯文件，不需要授权），
+        // 真到现场派生时才检查 allow_native_execution。这里传真实授权位，不回落到内置。
+        if (DeriveProfile(opts.exe_path, opts.profile_root, &note, &why,
+                          opts.allow_native_execution)) {
             const ResolvedProfile again = store.resolve(opts.exe_path);
             if (again.origin == ProfileOrigin::Loaded) {
                 pr = again;
                 r.derived = true;
                 r.derive_note = note;
+            } else {
+                // 派生报告成功但仓库里仍取不到：宁可失败，也不要拿内置参数封一个错包。
+                r.error = "派生过程报告成功，但参数仓库里仍找不到这个 EXE 的参数";
+                return r;
             }
         } else {
-            r.derive_note = "现场派生失败：" + why + "；改用内置参数";
+            // 以前这里会 "改用内置参数" 继续打包 —— 结果是一个看着成功、实际只有
+            // 目标游戏恰好是内置那套参数时才对的包。现在给了 EXE 却没拿到它的参数，
+            // 就必须停下来说清楚（尤其是没授权执行内嵌原生代码时）。
+            r.error = "取不到这个 EXE 的参数，已停止，不会用内置参数生成可能错误的包：" + why;
+            return r;
         }
     }
     if (!pr.ok()) {

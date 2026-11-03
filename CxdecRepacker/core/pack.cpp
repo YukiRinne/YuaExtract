@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 
 namespace hxv4 {
 namespace {
@@ -66,13 +67,30 @@ bool load_plaintext(const PackEntry& entry, std::vector<uint8_t>& out, std::stri
         return false;
     }
     f.seekg(0, std::ios::end);
-    const std::streamoff n = f.tellg();
-    f.seekg(0, std::ios::beg);
-    out.assign(static_cast<size_t>(n > 0 ? n : 0), 0);
-    if (!out.empty()) f.read(reinterpret_cast<char*>(out.data()), n);
-    if (!f && !f.eof()) {
+    if (!f) {
         err = "读不到 " + entry.source_path;
         return false;
+    }
+    const std::streamoff n = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (!f || n < 0) {
+        err = "读不到 " + entry.source_path;
+        return false;
+    }
+    if (static_cast<uint64_t>(n) > static_cast<uint64_t>(SIZE_MAX) ||
+        static_cast<uint64_t>(n) > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        err = "文件过大 " + entry.source_path;
+        return false;
+    }
+    out.assign(static_cast<size_t>(n), 0);
+    if (!out.empty()) {
+        f.read(reinterpret_cast<char*>(out.data()), n);
+        // 短读（文件在读取期间被截断/共享受限）必须整条失败；
+        // 以前只判 !f && !eof，会把"读到的部分 + 零填充的尾巴"当完整内容打包。
+        if (!f || f.gcount() != static_cast<std::streamsize>(n)) {
+            err = "读不到 " + entry.source_path;
+            return false;
+        }
     }
     return true;
 }
@@ -144,7 +162,7 @@ public:
         return true;
     }
     bool Patch(uint64_t offset, const uint8_t* data, size_t len) override {
-        if (offset + len > bytes_.size()) return false;
+        if (offset > bytes_.size() || len > bytes_.size() - static_cast<size_t>(offset)) return false;
         std::memcpy(bytes_.data() + offset, data, len);
         return true;
     }
@@ -439,23 +457,42 @@ bool rebuild_archive(const uint8_t* data, size_t len, const Hxv4Keys& keys, cons
         if (i == 0) {
             // 占位图：数据紧跟在 40 字节头之后，**不过过滤器、不压缩**。
             // 它那条 segm 是原包的陈旧值（指向 PNG 中段），要原样写回去。
+            if (len < 40u) return false;
+            if (e.original_size > len - 40u) return false;
             const size_t size = static_cast<size_t>(e.original_size);
-            if (40 + size > len) return false;
             in.plaintext.assign(data + 40, data + 40 + size);
             in.raw = true;
             in.compress = false;
             in.segments_override = e.segments;
         } else {
+            constexpr uint64_t kMaxSegmentOriginal = 512ull * 1024 * 1024;
+            constexpr uint64_t kMaxEntryOriginal = 1024ull * 1024 * 1024;
+            if (e.original_size > kMaxEntryOriginal) return false;
+
             // 逐段取出：解压 → 反过滤器 → 明文
             uint8_t seed_state[48];
             if (!drip.build_filter_state(rec.key, arch.hxv4.open_flag(), seed_state)) {
                 return false;
             }
             const FilterState filter(seed_state);
+            // 过滤器按**累计逻辑偏移**应用：多段条目第二段必须接着第一段的明文位置，
+            // 每段都从 0 开始会让多段包与等价单段包的明文不一致。
+            uint64_t logicalOffset = 0;
             for (const Xp3Segment& seg : e.segments) {
-                if (seg.offset + seg.archived_size > len) return false;
+                if (seg.offset > len || seg.archived_size > len - seg.offset) return false;
+                const uint64_t chunkSize = seg.is_compressed() ? seg.original_size : seg.archived_size;
+                // 先按"本条目累计"卡 cap，再分配：畸形段表不能先申请一大块内存再被拒。
+                if (chunkSize > kMaxEntryOriginal ||
+                    logicalOffset > kMaxEntryOriginal - chunkSize) {
+                    return false;
+                }
                 std::vector<uint8_t> chunk;
                 if (seg.is_compressed()) {
+                    if (seg.original_size > kMaxSegmentOriginal ||
+                        seg.original_size > static_cast<uint64_t>(static_cast<uLongf>(-1)) ||
+                        seg.archived_size > static_cast<uint64_t>(static_cast<uLong>(-1))) {
+                        return false;
+                    }
                     chunk.assign(static_cast<size_t>(seg.original_size), 0);
                     uLongf got = static_cast<uLongf>(seg.original_size);
                     if (uncompress(chunk.data(), &got, data + seg.offset,
@@ -464,9 +501,14 @@ bool rebuild_archive(const uint8_t* data, size_t len, const Hxv4Keys& keys, cons
                         return false;
                     }
                 } else {
-                    chunk.assign(data + seg.offset, data + seg.offset + seg.archived_size);
+                    if (seg.original_size != seg.archived_size ||
+                        seg.archived_size > static_cast<uint64_t>(SIZE_MAX)) {
+                        return false;
+                    }
+                    chunk.assign(data + seg.offset, data + seg.offset + static_cast<size_t>(seg.archived_size));
                 }
-                filter.apply(chunk.data(), chunk.size(), 0);
+                filter.apply(chunk.data(), chunk.size(), logicalOffset);
+                logicalOffset += chunk.size();
                 in.plaintext.insert(in.plaintext.end(), chunk.begin(), chunk.end());
             }
             in.compress = !e.segments.empty() && e.segments[0].is_compressed();

@@ -2,6 +2,8 @@
 
 #include "HashNameMiner.h"
 #include "YuaExtractWorkspace.h"
+#include "AtomicFile.h"
+#include "PathSafety.h"
 #include "logdir.h"
 
 #ifndef NOMINMAX
@@ -358,16 +360,43 @@ namespace
 
     // ---------- 映射表 ----------
 
+    void RejectMapEntry(HashMapTables& tables, const std::wstring& hash, const std::wstring& name,
+                        const std::wstring& why)
+    {
+        ++tables.rejectedEntries;
+        if (tables.rejectedSamples.size() < 20u)
+        {
+            tables.rejectedSamples.push_back(hash + L" -> " + name + L"（" + why + L"）");
+        }
+    }
+
+    // 映射名来自外部日志/lst，不能只做字符串归一化就当可信。目录与文件名分别按
+    // PathSafety 的口径校验：绝对路径 / 盘符 / ADS / 设备名 / .. / 尾点尾空白一律拒绝。
+    // 文件映射允许自带包内目录（"bgimage/cg01.png"），目录映射允许正常多层与空根域。
     void MergeHashMapLine(HashMapTables& tables, const std::wstring& name, const std::wstring& hash)
     {
         const std::wstring upper = ToUpperString(hash);
         if (IsHexLength(upper, 16u))
         {
-            tables.directories.emplace(upper, NormalizeDirectoryName(name));
+            const std::wstring normalized = NormalizeDirectoryName(name);
+            std::wstring why;
+            if (!PathSafety::ValidateRelativeName(normalized, PathSafety::Kind::Directory, &why))
+            {
+                RejectMapEntry(tables, upper, name, why);
+                return;
+            }
+            tables.directories.emplace(upper, normalized);
         }
         else if (IsHexLength(upper, 64u))
         {
-            tables.files.emplace(upper, NormalizeFileName(name));
+            const std::wstring normalized = NormalizeFileName(name);
+            std::wstring why;
+            if (!PathSafety::ValidateRelativeName(normalized, PathSafety::Kind::RelativePath, &why))
+            {
+                RejectMapEntry(tables, upper, name, why);
+                return;
+            }
+            tables.files.emplace(upper, normalized);
         }
     }
 
@@ -492,6 +521,8 @@ namespace
     // WriteTextFileUtf8Bom 定义在下面的"输出"一节；MinedNames.lst 要用它，
     // 所以这里先声明一下（匿名命名空间内的前置声明，不对外暴露）。
     bool WriteTextFileUtf8Bom(const std::wstring& path, const std::wstring& text, DWORD& error);
+    // 同内容的原子替换：唯一临时文件 → 写满+flush → MoveFileEx 替换。失败时旧文件字节不变。
+    bool WriteTextFileUtf8BomAtomic(const std::wstring& path, const std::wstring& text, DWORD& error);
 
     bool SameDirectory(const std::wstring& left, const std::wstring& right)
     {
@@ -583,6 +614,16 @@ namespace
             {
                 continue;
             }
+            // 挖出来的名字也来自游戏资源文本，同样按路径边界校验。拒绝的条目计入
+            // 映射表的 rejected 统计（来源仍然是外部数据，不能因为"过了哈希"就免检）。
+            {
+                std::wstring why;
+                if (!PathSafety::ValidateRelativeName(name, PathSafety::Kind::RelativePath, &why))
+                {
+                    RejectMapEntry(tables, hash, name, why);
+                    continue;
+                }
+            }
             // 映射表里的名字按口径只取"最后一段"（见 ResolveHashName：映射名带层级时
             // 层级是重复信息，封包与目录层由源路径和目录映射负责）。名字**不做**任何
             // 修改或推断 —— 内核给什么就是什么。
@@ -600,40 +641,160 @@ namespace
         return added;
     }
 
+    // 同一份 MinedNames.lst 的多进程/多线程写必须串行：无锁的
+    // "读旧 -> 并集 -> 原子替换" 会让后写者用旧快照覆盖先写者的新条目。
+    // 用 Local\ 命名互斥体（不跨用户会话），路径做 FNV-1a 哈希避免名字过长。
+    class MinedListWriteLock
+    {
+    public:
+        explicit MinedListWriteLock(const std::wstring& path)
+        {
+            uint64_t hash = 1469598103934665603ull;
+            for (wchar_t ch : path)
+            {
+                hash ^= static_cast<uint64_t>(ch);
+                hash *= 1099511628211ull;
+            }
+            wchar_t name[96]{};
+            ::swprintf_s(name, L"Local\\YuaExtract.MinedNames.%016llX",
+                         static_cast<unsigned long long>(hash));
+            handle_ = ::CreateMutexW(nullptr, FALSE, name);
+            if (handle_ != nullptr)
+            {
+                const DWORD wait = ::WaitForSingleObject(handle_, 30000u);
+                acquired_ = (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED);
+            }
+        }
+
+        ~MinedListWriteLock()
+        {
+            if (acquired_)
+            {
+                ::ReleaseMutex(handle_);
+            }
+            if (handle_ != nullptr)
+            {
+                ::CloseHandle(handle_);
+            }
+        }
+
+        bool acquired() const { return acquired_; }
+
+    private:
+        HANDLE handle_ = nullptr;
+        bool acquired_ = false;
+    };
+
+    // 读已有 MinedNames.lst（哈希:名字）。只收 64 位哈希与通过路径校验的名字。
+    // 失败必须区分"文件本来就不存在"和"存在但读不了/内容坏"：后者绝不能继续写，
+    // 否则一份暂时读不了（但可写）的旧文件会被并集结果覆盖掉。
+    bool ReadMinedNamesList(const std::wstring& path, std::map<std::wstring, std::wstring>& out,
+                            DWORD& error, bool& missing, std::wstring& detail)
+    {
+        error = 0;
+        missing = false;
+        detail.clear();
+
+        std::wstring content;
+        DWORD readError = 0;
+        if (!ReadTextFileAuto(path, content, readError))
+        {
+            if (readError == ERROR_FILE_NOT_FOUND || readError == ERROR_PATH_NOT_FOUND)
+            {
+                missing = true;
+                return true;
+            }
+            error = readError == 0 ? ERROR_READ_FAULT : readError;
+            detail = L"读不了已有 MinedNames.lst（保留原文件）：" + path;
+            return false;
+        }
+
+        std::wstring invalidLine;
+        ForEachLine(content,
+                    [&](const std::wstring& line)
+                    {
+                        if (line.empty() || line[0] == L'#')
+                        {
+                            return;
+                        }
+                        const size_t split = line.find(L':');
+                        if (split == std::wstring::npos || split == 0u)
+                        {
+                            if (invalidLine.empty()) invalidLine = line;
+                            return;
+                        }
+                        const std::wstring hash = ToUpperString(line.substr(0u, split));
+                        const std::wstring name = NormalizeFileName(line.substr(split + 1u));
+                        if (!IsHexLength(hash, 64u) || name.empty())
+                        {
+                            if (invalidLine.empty()) invalidLine = line;
+                            return;
+                        }
+                        std::wstring why;
+                        if (!PathSafety::ValidateRelativeName(name, PathSafety::Kind::RelativePath, &why))
+                        {
+                            if (invalidLine.empty()) invalidLine = line;
+                            return;
+                        }
+                        out.emplace(hash, name);
+                    });
+        if (!invalidLine.empty())
+        {
+            // 旧文件里有无法解释的行：不静默丢掉它，也不覆写；交给用户/上一阶段修。
+            error = ERROR_INVALID_DATA;
+            detail = L"MinedNames.lst 含无法解析的行，保留原文件：\"";
+            if (invalidLine.size() > 120u)
+            {
+                detail += invalidLine.substr(0u, 120u) + L"...";
+            }
+            else
+            {
+                detail += invalidLine;
+            }
+            detail += L"\"";
+            return false;
+        }
+        return true;
+    }
+
     // 把挖掘结果落盘（哈希:名字，UTF-8 with BOM）。
     //
-    // 这里是**整份重写**而不是"追加去重"：MinedNames.lst 的字段只有 哈希:名字，
-    // 而 std::map 已经天然按哈希去重（同一个哈希只会有一条），所以重写出来的文件
-    // 本身就是去重且稳定的（连跑两次逐字节一致，不会膨胀）。同目录下用户自己攒的
-    // 其它 *.lst 一个都不动 —— 那些是别人的成果，本工具只维护自己这一份。
-    //
-    // mined 为空时**不写**：空结果通常意味着挖掘没真正跑（被中止/盐不可用），
-    // 把上次挖到的几千条好数据重写成只剩注释头是纯破坏。要表达"清空"得用别的入口。
+    // 这是**历史 + 本次**的并集，旧条目优先、不覆盖：
+    //   - MinedNames.lst 是跨次运行的成果，本次只挖到一部分时不能把旧数据整份抹掉；
+    //   - 被中止/部分结果也只做并集，旧字节不会因为"这次没挖到"而丢；
+    //   - 写入走 AtomicFile（唯一临时文件 + flush + 备份替换），任何普通失败都保留旧文件；
+    //   - 旧文件读不了或含无法解析的行时直接失败、不写（message 说明原因）。
     bool WriteMinedNamesList(const std::wstring& path, const std::map<std::wstring, std::wstring>& mined,
-                             unsigned int& writtenEntries, DWORD& error)
+                             unsigned int& writtenEntries, DWORD& error,
+                             std::wstring* message = nullptr)
     {
         error = 0;
         writtenEntries = 0u;
-
-        if (mined.empty())
+        if (message != nullptr)
         {
-            // 文件已存在就如实报"本次 0 条、保留原文件"；不存在则不凭空创建。
-            if (::GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
-            {
-                writtenEntries = 0u;
-                return true;
-            }
-            // 不存在时也返回 true（没东西可写不算失败），但不留一个只有注释头的空壳。
-            return true;
+            message->clear();
         }
 
-        std::wstring text;
-        text.reserve(mined.size() * 96u + 256u);
-        text += L"# YuaExtract 推理补充还原：从游戏资源里挖出并用哈希验证过的资源名\r\n";
-        text += L"# 格式：<大写 64 位 Hash>:<名字>；本文件由工具维护，与同目录其它 *.lst 一并被步骤3 读取\r\n";
-        text += L"# 生成时间：" + TimestampNow() + L"\r\n";
+        // 先取锁再读旧文件，保证"读旧 → 并集 → 原子替换"整段互斥。
+        MinedListWriteLock writeLock(path);
+        if (!writeLock.acquired())
+        {
+            error = ERROR_LOCK_FAILED;
+            if (message) *message = L"取 MinedNames.lst 写锁超时，保留原文件";
+            return false;
+        }
 
-        unsigned int count = 0u;
+        std::map<std::wstring, std::wstring> merged;
+        DWORD readError = 0;
+        bool missing = false;
+        std::wstring readDetail;
+        if (!ReadMinedNamesList(path, merged, readError, missing, readDetail))
+        {
+            error = readError;
+            if (message) *message = readDetail;
+            return false;
+        }
+
         for (const auto& entry : mined)
         {
             const std::wstring hash = ToUpperString(entry.first);
@@ -642,17 +803,40 @@ namespace
             {
                 continue;
             }
-            text += MakeMinedListLine(hash, name) + L"\r\n";
-            ++count;
+            std::wstring why;
+            if (!PathSafety::ValidateRelativeName(name, PathSafety::Kind::RelativePath, &why))
+            {
+                continue;
+            }
+            merged.emplace(hash, name);  // 旧条目已在 map 里时保留旧值
         }
-        writtenEntries = count;
+
+        writtenEntries = static_cast<unsigned int>(merged.size());
+        if (merged.empty())
+        {
+            // 没有历史也没有新结果：不凭空创建只有注释头的空壳，也不覆写已有空文件。
+            return true;
+        }
+
+        std::wstring text;
+        text.reserve(merged.size() * 96u + 256u);
+        text += L"# YuaExtract 推理补充还原：从游戏资源里挖出并用哈希验证过的资源名\r\n";
+        text += L"# 格式：<大写 64 位 Hash>:<名字>；本文件由工具维护，与同目录其它 *.lst 一并被步骤3 读取\r\n";
+        text += L"# 生成时间：" + TimestampNow() + L"\r\n";
+
+        for (const auto& entry : merged)
+        {
+            text += MakeMinedListLine(entry.first, entry.second) + L"\r\n";
+        }
 
         DWORD writeError = 0;
-        if (!WriteTextFileUtf8Bom(path, text, writeError))
+        if (!WriteTextFileUtf8BomAtomic(path, text, writeError))
         {
-            error = writeError;
+            error = writeError == 0 ? ERROR_WRITE_FAULT : writeError;
+            if (message) *message = L"MinedNames.lst 原子替换失败，保留原文件：" + path;
             return false;
         }
+        (void)missing;
         return true;
     }
 
@@ -675,93 +859,204 @@ namespace
                lower.rfind(L"yuaextractrestore.log", 0) == 0;
     }
 
-    void CollectSourceFiles(const std::wstring& root, const std::wstring& current,
-                            std::vector<SourceFile>& files, unsigned int& skippedLogFiles)
+    // 源目录扫描的深度上限。正常解包结果层级很浅；超过说明是链接环或坏数据。
+    constexpr unsigned int kMaxRestoreScanDepth = 64u;
+
+    bool IsReparsePoint(DWORD attributes)
     {
+        return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    }
+
+    // 返回 false = 列目录/FindNext 失败、超深或被取消。调用方必须把它当失败/取消，
+    // 不能拿半份文件列表继续当"完整结果"。
+    bool CollectSourceFiles(const std::wstring& root, const std::wstring& current, unsigned int depth,
+                            std::vector<SourceFile>& files, unsigned int& skippedLogFiles,
+                            const std::function<bool()>& cancelRequested, std::wstring& error)
+    {
+        const DWORD currentAttributes = ::GetFileAttributesW(current.c_str());
+        if (currentAttributes == INVALID_FILE_ATTRIBUTES)
+        {
+            error = L"源目录不可访问（code=" + std::to_wstring(::GetLastError()) + L"）：" + current;
+            return false;
+        }
+        if (IsReparsePoint(currentAttributes))
+        {
+            // current 本身是 junction/symlink 时，FindFirst 会直接枚举链接目标；
+            // 只在"子目录是 reparse"时跳过是不够的。
+            error = L"源目录是重解析点（junction / symlink），拒绝扫描：" + current;
+            return false;
+        }
+        if (depth > kMaxRestoreScanDepth)
+        {
+            error = L"源目录递归超过深度上限：" + current;
+            return false;
+        }
+        if (cancelRequested && cancelRequested())
+        {
+            error = L"用户中止扫描";
+            return false;
+        }
+
         WIN32_FIND_DATAW data{};
         HANDLE find = ::FindFirstFileW(CombinePath(current, L"*").c_str(), &data);
         if (find == INVALID_HANDLE_VALUE)
         {
-            return;
-        }
-        do
-        {
-            const std::wstring name = data.cFileName;
-            if (name == L"." || name == L"..")
+            const DWORD code = ::GetLastError();
+            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
             {
-                continue;
+                return true;
             }
-            if (IsSkippedLogComponent(name))
+            error = L"列目录失败（code=" + std::to_wstring(code) + L"）：" + current;
+            return false;
+        }
+
+        bool ok = true;
+        for (;;)
+        {
+            if (cancelRequested && cancelRequested())
             {
-                // 日志目录是工具自己的产物，不是游戏资源，别跟着一起还原/计数。
-                continue;
+                error = L"用户中止扫描";
+                ok = false;
+                break;
             }
 
-            const std::wstring full = CombinePath(current, name);
-            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            const std::wstring name = data.cFileName;
+            if (name != L"." && name != L"..")
             {
-                CollectSourceFiles(root, full, files, skippedLogFiles);
+                if (IsSkippedLogComponent(name))
+                {
+                    // 日志目录是工具自己的产物，不是游戏资源，别跟着一起还原/计数。
+                }
+                else
+                {
+                    const std::wstring full = CombinePath(current, name);
+                    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                    {
+                        // 重解析点目录不跟进去：junction 可能指向源目录外，也可能成环。
+                        if (!IsReparsePoint(data.dwFileAttributes))
+                        {
+                            if (!CollectSourceFiles(root, full, depth + 1u, files, skippedLogFiles,
+                                                    cancelRequested, error))
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (IsReparsePoint(data.dwFileAttributes))
+                        {
+                            // 文件 symlink：复制会跟随到源目录外/别的文件，直接判扫描失败。
+                            error = L"源目录里发现文件重解析点，拒绝扫描：" + full;
+                            ok = false;
+                            break;
+                        }
+                        SourceFile file;
+                        file.fullPath = full;
+                        file.relativePath = full.substr(root.length());
+                        while (!file.relativePath.empty() &&
+                               (file.relativePath.front() == L'\\' || file.relativePath.front() == L'/'))
+                        {
+                            file.relativePath.erase(file.relativePath.begin());
+                        }
+                        LARGE_INTEGER size{};
+                        size.LowPart = data.nFileSizeLow;
+                        size.HighPart = static_cast<LONG>(data.nFileSizeHigh);
+                        file.size = static_cast<unsigned long long>(size.QuadPart);
+                        files.push_back(file);
+                    }
+                }
             }
-            else
+
+            if (!::FindNextFileW(find, &data))
+            {
+                const DWORD code = ::GetLastError();
+                if (code != ERROR_NO_MORE_FILES)
+                {
+                    error = L"枚举目录失败（code=" + std::to_wstring(code) + L"）：" + current;
+                    ok = false;
+                }
+                break;
+            }
+        }
+        ::FindClose(find);
+        return ok;
+    }
+
+    // 只扫本层文件，不递归。给"根目录"那个任务用 —— 根下的散文件不是封包内容，
+    // 硬套递归会把整个解包结果再走一遍（等于每个封包都扫两遍）。
+    bool CollectTopLevelFiles(const std::wstring& root, std::vector<SourceFile>& files,
+                              std::wstring& error)
+    {
+        const DWORD rootAttributes = ::GetFileAttributesW(root.c_str());
+        if (rootAttributes == INVALID_FILE_ATTRIBUTES)
+        {
+            const DWORD code = ::GetLastError();
+            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
+            {
+                return true;
+            }
+            error = L"源根目录不可访问（code=" + std::to_wstring(code) + L"）：" + root;
+            return false;
+        }
+        if (IsReparsePoint(rootAttributes))
+        {
+            error = L"源根目录是重解析点（junction / symlink），拒绝扫描：" + root;
+            return false;
+        }
+
+        WIN32_FIND_DATAW data{};
+        HANDLE find = ::FindFirstFileW(CombinePath(root, L"*").c_str(), &data);
+        if (find == INVALID_HANDLE_VALUE)
+        {
+            const DWORD code = ::GetLastError();
+            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
+            {
+                return true;
+            }
+            error = L"列目录失败（code=" + std::to_wstring(code) + L"）：" + root;
+            return false;
+        }
+
+        bool ok = true;
+        for (;;)
+        {
+            const std::wstring name = data.cFileName;
+            if (name != L"." && name != L".." && (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+                !IsSkippedLogComponent(name) && !IsToolArtifactName(name))
             {
                 SourceFile file;
-                file.fullPath = full;
-                file.relativePath = full.substr(root.length());
-                while (!file.relativePath.empty() &&
-                       (file.relativePath.front() == L'\\' || file.relativePath.front() == L'/'))
-                {
-                    file.relativePath.erase(file.relativePath.begin());
-                }
+                file.fullPath = CombinePath(root, name);
+                file.relativePath = name;
                 LARGE_INTEGER size{};
                 size.LowPart = data.nFileSizeLow;
                 size.HighPart = static_cast<LONG>(data.nFileSizeHigh);
                 file.size = static_cast<unsigned long long>(size.QuadPart);
                 files.push_back(file);
             }
-        } while (::FindNextFileW(find, &data));
-        ::FindClose(find);
-    }
 
-    // 只扫本层文件，不递归。给"根目录"那个任务用 —— 根下的散文件不是封包内容，
-    // 硬套递归会把整个解包结果再走一遍（等于每个封包都扫两遍）。
-    void CollectTopLevelFiles(const std::wstring& root, std::vector<SourceFile>& files)
-    {
-        WIN32_FIND_DATAW data{};
-        HANDLE find = ::FindFirstFileW(CombinePath(root, L"*").c_str(), &data);
-        if (find == INVALID_HANDLE_VALUE)
-        {
-            return;
+            if (!::FindNextFileW(find, &data))
+            {
+                const DWORD code = ::GetLastError();
+                if (code != ERROR_NO_MORE_FILES)
+                {
+                    error = L"枚举目录失败（code=" + std::to_wstring(code) + L"）：" + root;
+                    ok = false;
+                }
+                break;
+            }
         }
-        do
-        {
-            const std::wstring name = data.cFileName;
-            if (name == L"." || name == L"..")
-            {
-                continue;
-            }
-            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            {
-                continue;
-            }
-            if (IsSkippedLogComponent(name) || IsToolArtifactName(name))
-            {
-                continue;
-            }
-
-            SourceFile file;
-            file.fullPath = CombinePath(root, name);
-            file.relativePath = name;
-            LARGE_INTEGER size{};
-            size.LowPart = data.nFileSizeLow;
-            size.HighPart = static_cast<LONG>(data.nFileSizeHigh);
-            file.size = static_cast<unsigned long long>(size.QuadPart);
-            files.push_back(file);
-        } while (::FindNextFileW(find, &data));
         ::FindClose(find);
+        return ok;
     }
 
-    unsigned int CountSkippedLogFiles(const std::wstring& root)
+    unsigned int CountSkippedLogFilesInner(const std::wstring& root, unsigned int depth)
     {
+        if (depth > kMaxRestoreScanDepth)
+        {
+            return 0u;
+        }
         unsigned int count = 0u;
         WIN32_FIND_DATAW data{};
         HANDLE find = ::FindFirstFileW(CombinePath(root, L"*").c_str(), &data);
@@ -769,41 +1064,53 @@ namespace
         {
             return 0u;
         }
-        do
+        for (;;)
         {
             const std::wstring name = data.cFileName;
-            if (name == L"." || name == L"..")
+            if (name != L"." && name != L"..")
             {
-                continue;
-            }
-            const std::wstring full = CombinePath(root, name);
-            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            {
-                if (IsSkippedLogComponent(name))
+                const std::wstring full = CombinePath(root, name);
+                if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !IsReparsePoint(data.dwFileAttributes))
                 {
-                    WIN32_FIND_DATAW inner{};
-                    HANDLE innerFind = ::FindFirstFileW(CombinePath(full, L"*").c_str(), &inner);
-                    if (innerFind != INVALID_HANDLE_VALUE)
+                    if (IsSkippedLogComponent(name))
                     {
-                        do
+                        WIN32_FIND_DATAW inner{};
+                        HANDLE innerFind = ::FindFirstFileW(CombinePath(full, L"*").c_str(), &inner);
+                        if (innerFind != INVALID_HANDLE_VALUE)
                         {
-                            if ((inner.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
-                                wcscmp(inner.cFileName, L".") != 0 && wcscmp(inner.cFileName, L"..") != 0)
+                            for (;;)
                             {
-                                ++count;
+                                if ((inner.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+                                    wcscmp(inner.cFileName, L".") != 0 && wcscmp(inner.cFileName, L"..") != 0)
+                                {
+                                    ++count;
+                                }
+                                if (!::FindNextFileW(innerFind, &inner))
+                                {
+                                    break;
+                                }
                             }
-                        } while (::FindNextFileW(innerFind, &inner));
-                        ::FindClose(innerFind);
+                            ::FindClose(innerFind);
+                        }
+                    }
+                    else
+                    {
+                        count += CountSkippedLogFilesInner(full, depth + 1u);
                     }
                 }
-                else
-                {
-                    count += CountSkippedLogFiles(full);
-                }
             }
-        } while (::FindNextFileW(find, &data));
+            if (!::FindNextFileW(find, &data))
+            {
+                break;
+            }
+        }
         ::FindClose(find);
         return count;
+    }
+
+    unsigned int CountSkippedLogFiles(const std::wstring& root)
+    {
+        return CountSkippedLogFilesInner(root, 0u);
     }
 
     // 只数"解包目录根下直接躺着的日志目录/日志文件"里的文件，不往封包里递归。
@@ -904,6 +1211,167 @@ namespace
         }
     }
 
+    // 两个路径指向的文件内容是否逐字节一致（大小不同直接 false）。
+    bool FilesEqualByPath(const std::wstring& leftPath, const std::wstring& rightPath)
+    {
+        HANDLE left = ::CreateFileW(leftPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (left == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        HANDLE right = ::CreateFileW(rightPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (right == INVALID_HANDLE_VALUE)
+        {
+            ::CloseHandle(left);
+            return false;
+        }
+
+        LARGE_INTEGER leftSize{};
+        LARGE_INTEGER rightSize{};
+        const bool sizesOk = ::GetFileSizeEx(left, &leftSize) && ::GetFileSizeEx(right, &rightSize) &&
+                             leftSize.QuadPart == rightSize.QuadPart;
+        const bool equal = sizesOk && FilesContentEqual(left, right);
+        ::CloseHandle(right);
+        ::CloseHandle(left);
+        return equal;
+    }
+
+    // 源相对路径（相对 RestoreOptions::sourceDirectory，含封包段）。
+    // 两遍式交付记录/残留清理都以它为主键。
+    std::wstring DeliverySourceKey(const RestorePackageTask& task, const std::wstring& relative)
+    {
+        if (task.rootLevel)
+        {
+            return relative;
+        }
+        return task.packageName.empty() ? relative : CombinePath(task.packageName, relative);
+    }
+
+    // 从标准化根下算相对路径（输出侧记录用）。
+    std::wstring RelativeToNormalizedRoot(const std::wstring& normalizedRoot, const std::wstring& fullPath)
+    {
+        if (normalizedRoot.empty() || fullPath.size() <= normalizedRoot.size())
+        {
+            return std::wstring();
+        }
+        if (_wcsnicmp(fullPath.c_str(), normalizedRoot.c_str(), normalizedRoot.size()) != 0)
+        {
+            return std::wstring();
+        }
+        size_t start = normalizedRoot.size();
+        while (start < fullPath.size() && (fullPath[start] == L'\\' || fullPath[start] == L'/'))
+        {
+            ++start;
+        }
+        return fullPath.substr(start);
+    }
+
+    bool LookupPreviousDelivery(const std::map<std::wstring, std::wstring>& previous,
+                                const std::wstring& key, std::wstring& target)
+    {
+        const auto exact = previous.find(key);
+        if (exact != previous.end())
+        {
+            target = exact->second;
+            return true;
+        }
+        // 文件系统不区分大小写，记录侧可能大小写不同；映射通常很小，逐个比较可以接受。
+        for (const auto& entry : previous)
+        {
+            if (_wcsicmp(entry.first.c_str(), key.c_str()) == 0)
+            {
+                target = entry.second;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool PathExistsAsFile(const std::wstring& path, DWORD* attributesOut = nullptr)
+    {
+        const DWORD attributes = ::GetFileAttributesW(path.c_str());
+        if (attributesOut)
+        {
+            *attributesOut = attributes;
+        }
+        return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
+
+    // 两个输出路径是否是"同一个逻辑目标"：完全相等，或者只是 __dupN 冲突副本。
+    // 用于两遍式跳过判断：第一遍因冲突落到 x__dup1，第二遍不能因为"base 被占"
+    // 再落 x__dup2；但第一遍的 <hash>.png 与第二遍真名不同，不能算同一目标。
+    bool SameLogicalTargetPath(const std::wstring& left, const std::wstring& right)
+    {
+        const std::wstring a = PathSafety::NormalizeFullPath(left);
+        const std::wstring b = PathSafety::NormalizeFullPath(right);
+        if (a.empty() || b.empty())
+        {
+            return false;
+        }
+        if (_wcsicmp(a.c_str(), b.c_str()) == 0)
+        {
+            return true;
+        }
+
+        const PathSafety::SplitPath sa = PathSafety::SplitFullPath(a);
+        const PathSafety::SplitPath sb = PathSafety::SplitFullPath(b);
+        if (!sa.valid || !sb.valid || sa.parts.empty() || sb.parts.empty() ||
+            _wcsicmp(sa.prefix.c_str(), sb.prefix.c_str()) != 0 ||
+            sa.parts.size() != sb.parts.size())
+        {
+            return false;
+        }
+        for (size_t i = 0; i + 1u < sa.parts.size(); ++i)
+        {
+            if (_wcsicmp(sa.parts[i].c_str(), sb.parts[i].c_str()) != 0)
+            {
+                return false;
+            }
+        }
+
+        auto splitLeaf = [](const std::wstring& leaf, std::wstring& stem, std::wstring& extension)
+        {
+            const size_t dot = leaf.find_last_of(L'.');
+            if (dot == std::wstring::npos || dot == 0u)
+            {
+                stem = leaf;
+                extension.clear();
+            }
+            else
+            {
+                stem = leaf.substr(0u, dot);
+                extension = leaf.substr(dot);
+            }
+        };
+        auto stripConflictSuffix = [](std::wstring stem)
+        {
+            const size_t marker = stem.rfind(L"__dup");
+            if (marker == std::wstring::npos || marker == 0u || marker + 5u >= stem.size())
+            {
+                return stem;
+            }
+            for (size_t index = marker + 5u; index < stem.size(); ++index)
+            {
+                if (stem[index] < L'0' || stem[index] > L'9')
+                {
+                    return stem;
+                }
+            }
+            return stem.substr(0u, marker);
+        };
+
+        std::wstring stemA;
+        std::wstring extA;
+        std::wstring stemB;
+        std::wstring extB;
+        splitLeaf(sa.parts.back(), stemA, extA);
+        splitLeaf(sb.parts.back(), stemB, extB);
+        return _wcsicmp(stripConflictSuffix(stemA).c_str(), stripConflictSuffix(stemB).c_str()) == 0 &&
+               _wcsicmp(extA.c_str(), extB.c_str()) == 0;
+    }
+
     // 目标重名时落到 名字__dupN.后缀，绝不覆盖已有还原结果。
     std::wstring MakeUniqueTargetPath(const std::wstring& target)
     {
@@ -932,7 +1400,9 @@ namespace
                 return candidate;
             }
         }
-        return target;
+        // 候选耗尽：**绝不**把已被占用的 target 交回去（那等于覆盖已有还原结果）。
+        // 调用方看到空串必须记失败。
+        return std::wstring();
     }
 
     bool WriteTextFileUtf8Bom(const std::wstring& path, const std::wstring& text, DWORD& error)
@@ -973,6 +1443,64 @@ namespace
         }
         ::CloseHandle(file);
         return ok;
+    }
+
+    // 唯一临时文件 → 写满 + FlushFileBuffers → ReplaceFileW/MoveFileEx（带 backup）。
+    // 复用 Common/AtomicFile.h：普通失败旧字节保留；回滚失败时 backup 保留，不做 Discard。
+    bool WriteTextFileUtf8BomAtomic(const std::wstring& path, const std::wstring& text, DWORD& error)
+    {
+        error = 0;
+        const int need = ::WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                                               nullptr, 0, nullptr, nullptr);
+        if (need < 0)
+        {
+            error = ERROR_NO_UNICODE_TRANSLATION;
+            return false;
+        }
+
+        std::vector<unsigned char> bytes;
+        bytes.reserve(static_cast<size_t>(need) + 3u);
+        bytes.push_back(0xEF);
+        bytes.push_back(0xBB);
+        bytes.push_back(0xBF);
+        if (need > 0)
+        {
+            const size_t start = bytes.size();
+            bytes.resize(start + static_cast<size_t>(need));
+            ::WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                                  reinterpret_cast<char*>(bytes.data() + start), need, nullptr, nullptr);
+        }
+
+        Common::AtomicFile::StagedFile staged;
+        std::wstring stageError;
+        if (!Common::AtomicFile::StageBytes(path, bytes, staged, stageError))
+        {
+            error = ERROR_WRITE_FAULT;
+            AppendProcessLog(std::wstring(), L"暂存 MinedNames.lst 失败：" + stageError);
+            return false;
+        }
+        if (!Common::AtomicFile::Commit(staged, stageError))
+        {
+            std::wstring rollbackError;
+            if (!staged.committed)
+            {
+                Common::AtomicFile::Rollback(staged, rollbackError);
+            }
+            error = ERROR_WRITE_FAULT;
+            AppendProcessLog(std::wstring(), L"提交 MinedNames.lst 失败：" + stageError +
+                                                  (rollbackError.empty() ? L""
+                                                                         : L" | 回滚：" + rollbackError));
+            return false;
+        }
+
+        std::wstring finalizeError;
+        if (!Common::AtomicFile::Finalize(staged, finalizeError))
+        {
+            error = ERROR_WRITE_FAULT;
+            AppendProcessLog(std::wstring(), L"MinedNames.lst 已提交但收尾失败：" + finalizeError);
+            return false;
+        }
+        return true;
     }
 
     // 最后一段剥掉后缀（没有后缀就原样返回）。
@@ -1107,7 +1635,8 @@ namespace
         std::wstring dirHash;   // 源路径里的目录 Hash（大写）
         std::wstring fileHash;  // 源路径里的文件 Hash（大写，已剥掉后缀）
         std::wstring dirName;   // 目录 Hash 对应的明文目录（空串 = 根域，未知目录 = 空且 dirResolved=false）
-        std::wstring fileName;  // 文件 Hash 对应的明文名
+        std::wstring fileDirectory; // 文件映射自带的包内目录（"bgimage/cg01.png" 的前半段）
+        std::wstring fileName;  // 文件 Hash 对应的明文名（只取最后一段）
         bool dirResolved = false;
         bool fileResolved = false;
         bool hashNamed = false; // 是不是 <目录Hash>\<文件Hash>[.后缀] 形态
@@ -1197,11 +1726,18 @@ namespace
         const size_t separator = mapped.find_last_of(L"\\/");
         if (separator != std::wstring::npos)
         {
-            // 形态 2：映射名自带层级。目录 Hash 这一边就不要了（重复信息），
-            // 文件名只取最后一段 —— 封包层由调用方负责。
-            out.fileName = mapped.substr(separator + 1);
-            out.dirName.clear();
-            out.dirResolved = true; // 层级已经由映射名自己带全了
+            // 形态 2：映射名自带层级。目录 Hash 这一边是重复信息，不要再叠一层；
+            // 但**层级本身必须保留** —— 只取 leaf 会把 "bgimage/cg01.png" 摊平成
+            // "cg01.png"，D->bgimage 时还会被误拼成 "bgimage\cg01.png"（运气好）
+            // 或丢目录（D 未知时）。这里把层级存进 fileDirectory，由目标路径拼装处决定。
+            const std::wstring mappedDirectory = mapped.substr(0u, separator);
+            const std::wstring mappedLeaf = mapped.substr(separator + 1u);
+            if (!mappedDirectory.empty())
+            {
+                out.fileDirectory = mappedDirectory;
+                out.dirResolved = true; // 层级已经由映射名自己带全了
+            }
+            out.fileName = mappedLeaf;
         }
 
         if (extension.empty() || out.fileName.empty())
@@ -1262,6 +1798,18 @@ HashMapTables LoadHashMapTables(const std::wstring& hashDirectory)
         ::swprintf_s(line, L"%s（%u 条）", path.c_str(), loaded);
         tables.sources.push_back(line);
     }
+    if (tables.rejectedEntries > 0u)
+    {
+        wchar_t line[512]{};
+        ::swprintf_s(line, L"已拒绝 %u 条越界/非法映射（绝对路径/盘符/ADS/设备名/../尾点尾空白）",
+                     tables.rejectedEntries);
+        tables.sources.push_back(line);
+        for (const std::wstring& sample : tables.rejectedSamples)
+        {
+            tables.sources.push_back(L"拒绝样例：" + sample);
+            AppendProcessLog(std::wstring(), L"拒绝映射条目：" + sample);
+        }
+    }
     return tables;
 }
 
@@ -1286,6 +1834,30 @@ std::vector<RestorePackageTask> EnumerateRestorePackages(const std::wstring& sou
     std::vector<RestorePackageTask> tasks;
     if (!DirectoryExists(sourceDirectory))
     {
+        return tasks;
+    }
+
+    const DWORD sourceAttributes = ::GetFileAttributesW(sourceDirectory.c_str());
+    if (sourceAttributes == INVALID_FILE_ATTRIBUTES)
+    {
+        RestorePackageTask failedRoot;
+        failedRoot.packageName = kRootPackageName;
+        failedRoot.packageDirectory = sourceDirectory;
+        failedRoot.rootLevel = true;
+        failedRoot.enumerationError = L"源根目录不可访问（code=" +
+            std::to_wstring(::GetLastError()) + L"）";
+        tasks.push_back(failedRoot);
+        return tasks;
+    }
+    if (IsReparsePoint(sourceAttributes))
+    {
+        // 源根本身是 junction：绝不能进入它的目标枚举"封包"。
+        RestorePackageTask failedRoot;
+        failedRoot.packageName = kRootPackageName;
+        failedRoot.packageDirectory = sourceDirectory;
+        failedRoot.rootLevel = true;
+        failedRoot.enumerationError = L"源根目录是重解析点（junction / symlink），拒绝枚举";
+        tasks.push_back(failedRoot);
         return tasks;
     }
 
@@ -1316,6 +1888,12 @@ std::vector<RestorePackageTask> EnumerateRestorePackages(const std::wstring& sou
         RestorePackageTask task;
         task.packageName = name;
         task.packageDirectory = CombinePath(sourceDirectory, name);
+        if (IsReparsePoint(data.dwFileAttributes))
+        {
+            // 顶层封包目录是 junction/symlink：不进入（RestoreSinglePackage 也会拒绝），
+            // 但任务照常列出并带明确错误，避免被当成"空封包成功"。
+            task.enumerationError = L"封包目录是重解析点，已跳过：" + task.packageDirectory;
+        }
         tasks.push_back(task);
     } while (::FindNextFileW(find, &data));
     ::FindClose(find);
@@ -1331,7 +1909,12 @@ std::vector<RestorePackageTask> EnumerateRestorePackages(const std::wstring& sou
     {
         unsigned int skipped = 0u;
         std::vector<SourceFile> files;
-        CollectSourceFiles(task.packageDirectory, task.packageDirectory, files, skipped);
+        std::wstring scanError;
+        if (!CollectSourceFiles(task.packageDirectory, task.packageDirectory, 0u, files, skipped,
+                                nullptr, scanError))
+        {
+            task.enumerationError = scanError.empty() ? L"扫描封包失败" : scanError;
+        }
         for (const SourceFile& file : files)
         {
             task.bytes += file.size;
@@ -1343,7 +1926,8 @@ std::vector<RestorePackageTask> EnumerateRestorePackages(const std::wstring& sou
     // 只在真的有散文件时才建这个任务，免得多出一个空行。
     {
         std::vector<SourceFile> rootFiles;
-        CollectTopLevelFiles(sourceDirectory, rootFiles);
+        std::wstring rootScanError;
+        const bool rootScanOk = CollectTopLevelFiles(sourceDirectory, rootFiles, rootScanError);
         unsigned int countable = 0u;
         unsigned long long rootBytes = 0u;
         for (const SourceFile& file : rootFiles)
@@ -1367,6 +1951,10 @@ std::vector<RestorePackageTask> EnumerateRestorePackages(const std::wstring& sou
             rootTask.rootLevel = true;
             rootTask.fileCount = countable;
             rootTask.bytes = rootBytes;
+            if (!rootScanOk)
+            {
+                rootTask.enumerationError = rootScanError.empty() ? L"扫描根目录失败" : rootScanError;
+            }
             tasks.push_back(rootTask);
         }
     }
@@ -1389,7 +1977,52 @@ RestorePackageResult RestoreSinglePackage(const RestorePackageTask& task, const 
         return result;
     }
 
+    // 源根/封包目录本身是重解析点时，任何列目录都会枚举链接目标；必须在建输出目录前拒绝。
+    {
+        const DWORD packageAttributes = ::GetFileAttributesW(task.packageDirectory.c_str());
+        if (packageAttributes == INVALID_FILE_ATTRIBUTES || IsReparsePoint(packageAttributes))
+        {
+            result.succeeded = false;
+            result.completed = true;
+            result.info = L"封包目录不可读或是重解析点（junction / symlink），拒绝还原";
+            return result;
+        }
+        if (!options.sourceDirectory.empty())
+        {
+            const DWORD sourceAttributes = ::GetFileAttributesW(options.sourceDirectory.c_str());
+            if (sourceAttributes == INVALID_FILE_ATTRIBUTES || IsReparsePoint(sourceAttributes))
+            {
+                result.succeeded = false;
+                result.completed = true;
+                result.info = L"源根目录不可读或是重解析点（junction / symlink），拒绝还原";
+                return result;
+            }
+        }
+    }
+
     DWORD error = 0;
+
+    // 核心二次防线：界面已经拦过一次，但内核不能只依赖界面（自检程序/别的调用方
+    // 也直接调这里）。必须在**建输出目录之前**完成：
+    //   1) 词法 + Win32 尾点/尾空白别名；
+    //   2) 已存在路径的真实身份（句柄 + GetLongPathName，展开 8.3）；
+    //   3) 输出路径上不得有重解析点。
+    // 否则非法 nested 输出会先在源目录下建出子目录，违反"源目录只读"。
+    if (!options.sourceDirectory.empty())
+    {
+        std::wstring rootsWhy;
+        if (!PathSafety::ValidateWriteRoots(options.sourceDirectory, options.outputDirectory, &rootsWhy))
+        {
+            result.succeeded = false;
+            result.completed = true;
+            result.info = L"拒绝还原：" + (rootsWhy.empty() ? std::wstring(L"输出根与源根冲突")
+                                                             : rootsWhy);
+            AppendProcessLog(options.logDirectory, result.info + L" | 源=" + options.sourceDirectory +
+                                                      L" | 输出=" + options.outputDirectory);
+            return result;
+        }
+    }
+
     if (!EnsureDirectory(options.outputDirectory, error))
     {
         result.succeeded = false;
@@ -1399,24 +2032,43 @@ RestorePackageResult RestoreSinglePackage(const RestorePackageTask& task, const 
     }
 
     std::vector<SourceFile> files;
+    std::wstring scanError;
+    bool scanOk = true;
     if (task.rootLevel)
     {
         // 根任务只扫本层：根下的散文件不属于任何封包，也就没有"包内相对路径"。
-        CollectTopLevelFiles(task.packageDirectory, files);
+        scanOk = CollectTopLevelFiles(task.packageDirectory, files, scanError);
         // 根下的日志目录故意不在这里计数：它们不属于任何封包，而且根任务只在
         // "根下真有散文件"时才存在，记在这里会随"这次有没有散文件"时有时无。
         // 报告统一数一次（见 WriteRestoreReport 里的 CountTopLevelSkippedLogFiles）。
     }
     else
     {
-        CollectSourceFiles(task.packageDirectory, task.packageDirectory, files, result.skippedLogFiles);
-        result.skippedLogFiles += CountSkippedLogFiles(task.packageDirectory);
+        scanOk = CollectSourceFiles(task.packageDirectory, task.packageDirectory, 0u, files,
+                                    result.skippedLogFiles, options.cancelRequested, scanError);
+        if (scanOk)
+        {
+            result.skippedLogFiles += CountSkippedLogFiles(task.packageDirectory);
+        }
+    }
+    if (!scanOk)
+    {
+        const bool cancelledNow = options.cancelRequested && options.cancelRequested();
+        result.cancelled = cancelledNow;
+        result.succeeded = false;
+        result.completed = true;
+        result.info = cancelledNow ? L"扫描源目录时被中止"
+                                   : (scanError.empty() ? L"扫描源目录失败" : scanError);
+        AppendProcessLog(options.logDirectory,
+                         L"封包 " + task.packageName + L" 扫描失败：" + result.info);
+        return result;
     }
     result.totalFiles = static_cast<unsigned int>(files.size());
 
     // 还原结果落在哪一层：正常封包要保留 <封包> 这一层（多个封包里的同名资源否则会
     // 在输出目录里撞成一份）；根任务是"输出目录根下的散文件"，就没有这一层。
     const std::wstring outputPrefix = task.rootLevel ? std::wstring() : task.packageName;
+    const std::wstring normalizedOutputRoot = PathSafety::NormalizeFullPath(options.outputDirectory);
 
     // 报告明细：只记与哈希名有关的部分（非哈希名文件动辄上千条，写进去只会淹掉重点）。
     std::wstring details;
@@ -1441,6 +2093,9 @@ RestorePackageResult RestoreSinglePackage(const RestorePackageTask& task, const 
         const NameResolution resolution = ResolveHashName(tables, parts);
         const unsigned long long fileSize = file.size;
         const std::wstring sourcePath = file.fullPath;
+        const std::wstring sourceKey = DeliverySourceKey(task, file.relativePath);
+        std::wstring previousTarget;
+        const bool hasPrevious = LookupPreviousDelivery(options.previousDeliveries, sourceKey, previousTarget);
 
         if (resolution.hashNamed)
         {
@@ -1483,8 +2138,11 @@ RestorePackageResult RestoreSinglePackage(const RestorePackageTask& task, const 
         std::wstring targetRelative = outputPrefix;
         if (resolution.hashNamed)
         {
-            const std::wstring targetDirectoryName =
-                resolution.dirResolved ? resolution.dirName : resolution.dirHash;
+            // 目录段的优先级：文件映射自带的层级 > 目录 Hash 的明文名 > 目录 Hash 本身。
+            // 文件映射自带层级时它是完整的包内路径，再叠目录名就会变成 bgimage\bgimage\...。
+            const std::wstring targetDirectoryName = !resolution.fileDirectory.empty()
+                ? resolution.fileDirectory
+                : (resolution.dirResolved ? resolution.dirName : resolution.dirHash);
             if (!targetDirectoryName.empty())
             {
                 targetRelative = targetRelative.empty() ? targetDirectoryName
@@ -1526,32 +2184,48 @@ RestorePackageResult RestoreSinglePackage(const RestorePackageTask& task, const 
                                  targetRelative.back() != L'/';
 
         bool delivered = false;
-        if (unresolved && !options.keepUnrestored)
-        {
-            // 默认语义：名字里还有没解析掉的 Hash 段就不进输出目录
-            //（文件名仍是 64 位 Hash、或路径里仍有未解析 Hash 目录）。
-            // 默认模式下输出目录里只留"名字全是真名"的文件。
-            ++result.droppedUnrestoredFiles;
-        }
-        else if (!validTarget)
-        {
-            ++result.failedFiles;
-        }
-        else
-        {
-            const std::wstring baseTarget = CombinePath(options.outputDirectory, targetRelative);
+        std::wstring baseTarget;
+        std::wstring boundaryWhy;
+        const bool safeTarget =
+            validTarget &&
+            PathSafety::TryResolveUnderRoot(options.outputDirectory, targetRelative,
+                                            PathSafety::Kind::RelativePath, baseTarget, &boundaryWhy);
 
-            // 两遍式还原：这一遍（补充还原遍）遇到第一遍已交付过的目标就跳过。
-            // 挖掘只补第一遍没还原掉的文件，第一遍已交付的不该再被碰 ——
-            // 跳过既不重复复制，也不会把第一遍的成果计成本遍的。
-            if (options.alreadyDelivered.find(targetRelative) != options.alreadyDelivered.end())
+        // 两遍式：同一个源、同一个目标、内容仍一致 —— 第一遍已经交付过，直接跳过。
+        // 只有"目标也相同"才跳；目标因补全映射而变化（<hash>.png → 真名）时必须继续
+        // 走下面的交付逻辑，否则真名永远补不出来。
+        if (hasPrevious && safeTarget && !previousTarget.empty())
+        {
+            std::wstring previousFull;
+            std::wstring previousWhy;
+            if (PathSafety::TryResolveUnderRoot(options.outputDirectory, previousTarget,
+                                                PathSafety::Kind::RelativePath, previousFull,
+                                                &previousWhy) &&
+                SameLogicalTargetPath(previousFull, baseTarget) &&
+                PathExistsAsFile(previousFull) && FilesEqualByPath(sourcePath, previousFull))
             {
                 ++result.skippedAlreadyDelivered;
                 if (!resolution.hashNamed)
                 {
-                    // 非哈希名文件照样计进"原样"，保持"输出文件数 == 已还原 + 原样"对账成立。
                     ++result.passthroughFiles;
                 }
+                result.deliveries.push_back(RestoreDelivery{sourceKey, previousTarget});
+
+                details += file.relativePath;
+                details += L'\t';
+                details += resolution.dirHash;
+                details += L'\t';
+                details += resolution.fileHash;
+                details += L'\t';
+                details += resolution.dirName;
+                details += L'\t';
+                details += resolution.fileName;
+                details += L'\t';
+                details += targetRelative;
+                details += L'\t';
+                details += OutcomeText(resolved, true);
+                details += L"\r\n";
+
                 if (options.progress && total > 0u)
                 {
                     const unsigned int percent =
@@ -1564,6 +2238,27 @@ RestorePackageResult RestoreSinglePackage(const RestorePackageTask& task, const 
                 }
                 continue;
             }
+        }
+
+        if (unresolved && !options.keepUnrestored)
+        {
+            // 默认语义：名字里还有没解析掉的 Hash 段就不进输出目录
+            //（文件名仍是 64 位 Hash、或路径里仍有未解析 Hash 目录）。
+            // 默认模式下输出目录里只留"名字全是真名"的文件。
+            ++result.droppedUnrestoredFiles;
+        }
+        else if (!validTarget || !safeTarget)
+        {
+            ++result.failedFiles;
+            if (!boundaryWhy.empty())
+            {
+                AppendProcessLog(options.logDirectory,
+                                 L"拒绝落盘 " + file.relativePath + L" -> " + targetRelative +
+                                     L"：" + boundaryWhy);
+            }
+        }
+        else
+        {
 
             // 重跑同一输出目录时的语义：目标已存在时，**内容相同就跳过**，
             // 只有内容不同才落 __dupN 副本。
@@ -1606,108 +2301,107 @@ RestorePackageResult RestoreSinglePackage(const RestorePackageTask& task, const 
 
             if (identicalExisting)
             {
-                // 内容相同：什么都不做。这不算"失败"也不算"重名改名"，
-                // 但要计入 totalFiles 已有的统计口径里（ delivered=false 且不进任何失败计数，
-                // 报告的"已还原"数与磁盘文件数保持一致）。
+                // 内容相同：目标已经在位，不再复制。仍然要**记一条交付**，
+                // 否则两遍式的下一遍/finalize 会以为这个源没交付过。
+                // 已还原的按实际交付计一次（"输出文件数 == 已还原 + 原样"对账要成立）。
                 result.copiedBytes += 0u;
-                // 与上次 run 相同的文件不再复制，语义上等同"已经在输出目录里"，
-                // 不改变 restoredFiles（它统计的是本次实际交付的还原结果）。
+                delivered = true;
+                result.deliveries.push_back(RestoreDelivery{sourceKey, targetRelative});
+                if (resolved)
+                {
+                    ++result.restoredFiles;
+                }
             }
             else
             {
-                const std::wstring targetPath = MakeUniqueTargetPath(baseTarget);
-                if (_wcsicmp(targetPath.c_str(), baseTarget.c_str()) != 0)
-                {
-                    ++result.renamedForConflict;
-                }
-
-                const size_t separator = targetPath.find_last_of(L"\\/");
-                const std::wstring targetDirectory =
-                    separator == std::wstring::npos ? options.outputDirectory : targetPath.substr(0, separator);
-
-                DWORD createError = 0;
+                // 目标重名时落到 __dupN；CopyFile 的第三参数必须是 TRUE：
+                // 就算探测与复制之间被别的进程抢占了同名文件，也只能失败，绝不覆盖。
+                // MakeUniqueTargetPath 候选耗尽时返回空串，这里如实记失败。
+                std::wstring targetPath;
                 bool copied = false;
-                if (EnsureDirectory(targetDirectory, createError))
+                for (int attempt = 0; attempt < 8 && !copied; ++attempt)
                 {
-                    copied = ::CopyFileW(sourcePath.c_str(), targetPath.c_str(), FALSE) != FALSE;
+                    targetPath = MakeUniqueTargetPath(baseTarget);
+                    if (targetPath.empty())
+                    {
+                        boundaryWhy = L"重名候选耗尽";
+                        break;
+                    }
+
+                    const size_t separator = targetPath.find_last_of(L"\\/");
+                    const std::wstring targetDirectory =
+                        separator == std::wstring::npos ? options.outputDirectory : targetPath.substr(0, separator);
+
+                    DWORD createError = 0;
+                    if (!EnsureDirectory(targetDirectory, createError))
+                    {
+                        break;
+                    }
+                    std::wstring offending;
+                    if (PathSafety::HasReparsePoint(targetDirectory, &offending))
+                    {
+                        boundaryWhy = L"目标目录上有重解析点：" + offending;
+                        break;
+                    }
+                    if (::CopyFileW(sourcePath.c_str(), targetPath.c_str(), TRUE) != FALSE)
+                    {
+                        copied = true;
+                        break;
+                    }
+                    const DWORD copyError = ::GetLastError();
+                    if (copyError != ERROR_FILE_EXISTS && copyError != ERROR_ALREADY_EXISTS)
+                    {
+                        break;
+                    }
                 }
+
                 if (!copied)
                 {
                     ++result.failedFiles;
+                    if (!boundaryWhy.empty())
+                    {
+                        AppendProcessLog(options.logDirectory,
+                                         L"落盘失败 " + targetRelative + L"：" + boundaryWhy);
+                    }
                 }
                 else
                 {
+                    if (!targetPath.empty() && _wcsicmp(targetPath.c_str(), baseTarget.c_str()) != 0)
+                    {
+                        ++result.renamedForConflict;
+                    }
                     delivered = true;
                     result.copiedBytes += fileSize;
-                    // 记录交付目标（改名前的基名），供两遍式的下一遍做"已交付"跳过。
+                    // 旧字段继续维护（现有 UI 过渡用），新字段按"源 → 实际目标"记录。
                     result.deliveredRelative.push_back(targetRelative);
-
-                    // 两遍式 + 保留未还原：第一遍把这个文件以「<hash><补的后缀>」交付过了
-                    //（当时没解析出真名）。本遍挖出了真名、落的是真名路径 —— 两份都留在
-                    // 输出目录就是重复。真名已交付，把第一遍的哈希名残留删掉。
-                    //
-                    // **残留的位置要按源目录哈希找，不能按解析出的目录名找**：这批文件
-                    // 常常连目录 Hash 都不在映射里（"缺目录 Hash"），第一遍交付时目录段
-                    // 就是哈希本身；本遍真名解析出来后落在 <同一路径前缀>\真名.png。
-                    // 两者的目录段可能一个是哈希、一个是明文（目录解析出来了），所以
-                    // "明文目录"和"哈希目录"两个位置都要找一遍。源目录永远不动。
-                    if (resolution.hashNamed && !options.alreadyDelivered.empty()
-                        && resolution.fileResolved)
                     {
-                        // 第一遍交付时的目录段：目录解析出来了用明文，没解析出来用哈希。
-                        // 但第一遍可能两种情况都发生过（映射在两次 run 之间变化），所以
-                        // 两个候选目录都清一遍。文件名段固定是 <64位哈希>。
-                        const wchar_t* staleDirectories[2] = {
-                            resolution.dirResolved ? resolution.dirName.c_str() : resolution.dirHash.c_str(),
-                            resolution.dirResolved ? resolution.dirHash.c_str() : resolution.dirName.c_str()
-                        };
+                        const std::wstring actualRelative =
+                            RelativeToNormalizedRoot(normalizedOutputRoot, targetPath);
+                        result.deliveries.push_back(RestoreDelivery{
+                            sourceKey, actualRelative.empty() ? targetRelative : actualRelative});
+                    }
 
-                        for (int dirIndex = 0; dirIndex < 2; ++dirIndex)
+                    // 两遍式：同一个源第一遍交付到了别的落点（典型是 <hash>.png），本遍
+                    // 把真名交付成功后，只清理**这条源自己记录的旧落点**。
+                    // 不做 <hash>.* 通配删除 —— 那会误删用户放在同一目录下的其它文件；
+                    // 而且必须内容相等且仍在输出根下才删。
+                    if (hasPrevious && !previousTarget.empty())
+                    {
+                        std::wstring previousFull;
+                        std::wstring previousWhy;
+                        DWORD previousAttributes = INVALID_FILE_ATTRIBUTES;
+                        if (PathSafety::TryResolveUnderRoot(options.outputDirectory, previousTarget,
+                                                            PathSafety::Kind::RelativePath, previousFull,
+                                                            &previousWhy) &&
+                            _wcsicmp(previousFull.c_str(), targetPath.c_str()) != 0 &&
+                            PathExistsAsFile(previousFull, &previousAttributes) &&
+                            !IsReparsePoint(previousAttributes) &&
+                            FilesEqualByPath(sourcePath, previousFull))
                         {
-                            const std::wstring staleDirectory = outputPrefix.empty()
-                                ? CombinePath(options.outputDirectory, staleDirectories[dirIndex])
-                                : CombinePath(CombinePath(options.outputDirectory, outputPrefix),
-                                              staleDirectories[dirIndex]);
-
-                            WIN32_FIND_DATAW staleData{};
-                            HANDLE staleFind = ::FindFirstFileW(
-                                CombinePath(staleDirectory, parts.back() + L".*").c_str(), &staleData);
-                            if (staleFind == INVALID_HANDLE_VALUE)
+                            if (!::DeleteFileW(previousFull.c_str()))
                             {
-                                continue;
-                            }
-
-                            // 记下每个真删掉的残留的后缀，用于把第一遍的补后缀计数退掉
-                            //（那些计数描述的是"磁盘上带补后缀的文件"，残留删了就该退）。
-                            std::vector<std::wstring> removedExtensions;
-                            do
-                            {
-                                if ((staleData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-                                {
-                                    continue;
-                                }
-                                const std::wstring stalePath = CombinePath(staleDirectory, staleData.cFileName);
-                                if (::DeleteFileW(stalePath.c_str()))
-                                {
-                                    const size_t dot = std::wstring(staleData.cFileName).find_last_of(L'.');
-                                    removedExtensions.push_back(
-                                        dot == std::wstring::npos ? std::wstring()
-                                                                  : std::wstring(staleData.cFileName).substr(dot));
-                                }
-                            } while (::FindNextFileW(staleFind, &staleData));
-                            ::FindClose(staleFind);
-
-                            for (const std::wstring& removed : removedExtensions)
-                            {
-                                if (result.headerSuffixedFiles > 0u)
-                                {
-                                    --result.headerSuffixedFiles;
-                                }
-                                auto countIt = result.headerExtensionCounts.find(removed);
-                                if (countIt != result.headerExtensionCounts.end() && countIt->second > 0u)
-                                {
-                                    --countIt->second;
-                                }
+                                AppendProcessLog(options.logDirectory,
+                                                 L"清理上遍残留失败：" + previousFull);
                             }
                         }
                     }
@@ -2077,9 +2771,18 @@ MappingSummary LoadMappingSummary(const std::wstring& hashDirectory)
     const HashMapTables tables = LoadHashMapTables(hashDirectory);
     summary.directoryEntries = static_cast<unsigned int>(tables.directories.size());
     summary.fileNameEntries = static_cast<unsigned int>(tables.files.size());
+    summary.rejectedEntries = tables.rejectedEntries;
     summary.sources = tables.sources;
     summary.ok = !tables.directories.empty() || !tables.files.empty();
     summary.message = summary.ok ? std::wstring() : L"没有可用的 Hash 映射";
+    if (tables.rejectedEntries > 0u)
+    {
+        if (!summary.message.empty())
+        {
+            summary.message += L"；";
+        }
+        summary.message += L"已拒绝 " + FormatCount(tables.rejectedEntries) + L" 条越界/非法映射";
+    }
     return summary;
 }
 
@@ -2191,7 +2894,9 @@ SupplementOutcome RunSupplementRestore(HashMapTables& tables, const SupplementOp
     // 6) 落盘。写不进去不影响本次还原（表已经补过了），但必须如实说出来。
     bool listOk = false;
     DWORD listError = 0;
-    if (!options.minedListPath.empty())
+    std::wstring listMessage;
+    const bool cancelledAtEnd = options.cancelRequested && options.cancelRequested();
+    if (!options.minedListPath.empty() && !cancelledAtEnd)
     {
         DWORD directoryError = 0;
         const size_t separator = options.minedListPath.find_last_of(L"\\/");
@@ -2199,7 +2904,13 @@ SupplementOutcome RunSupplementRestore(HashMapTables& tables, const SupplementOp
         {
             EnsureDirectory(options.minedListPath.substr(0u, separator), directoryError);
         }
-        listOk = WriteMinedNamesList(options.minedListPath, mined.files, outcome.writtenEntries, listError);
+        listOk = WriteMinedNamesList(options.minedListPath, mined.files, outcome.writtenEntries,
+                                     listError, &listMessage);
+    }
+    else if (!options.minedListPath.empty() && cancelledAtEnd)
+    {
+        // 取消时不写：旧文件原样保留，半份挖掘结果不覆盖历史记录。
+        listMessage = L"已取消：保留历史映射，未写入 MinedNames.lst";
     }
 
     wchar_t summary[512]{};
@@ -2219,7 +2930,11 @@ SupplementOutcome RunSupplementRestore(HashMapTables& tables, const SupplementOp
     }
     if (!options.minedListPath.empty())
     {
-        if (listOk)
+        if (cancelledAtEnd)
+        {
+            outcome.message += L"；" + listMessage;
+        }
+        else if (listOk)
         {
             outcome.message += L"；已写入 " + std::to_wstring(outcome.writtenEntries) + L" 条到 MinedNames.lst";
         }
@@ -2228,6 +2943,10 @@ SupplementOutcome RunSupplementRestore(HashMapTables& tables, const SupplementOp
             wchar_t failed[256]{};
             ::swprintf_s(failed, L"；MinedNames.lst 写出失败（错误 %lu）", listError);
             outcome.message += failed;
+            if (!listMessage.empty())
+            {
+                outcome.message += L"：" + listMessage;
+            }
         }
     }
     if (!mined.message.empty())

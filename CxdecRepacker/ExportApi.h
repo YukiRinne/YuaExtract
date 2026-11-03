@@ -44,6 +44,22 @@ __declspec(dllexport) BOOL __stdcall Repack(
     char* detailOut, int detailOutSize,
     char* errorOut, int errorOutSize);
 
+// 显式授权版 Repack。
+//   flags bit0 = 允许在参数仓库缺这个 EXE 时现场派生（执行游戏内嵌的 BOOTSTRAP DLL）。
+//   其余位非法，立即拒绝。flags = 0 与旧 Repack 行为一致（安全默认）。
+//   注意：仓库里已有参数、或游戏目录旁已有同名 .hxv4p 时，会直接复用，不需要原生执行。
+__declspec(dllexport) BOOL __stdcall RepackEx(
+    const wchar_t* inputDir,
+    const wchar_t* outputXp3,
+    const wchar_t* exePath,
+    const wchar_t* keysRoot,
+    const wchar_t* mediaName,
+    int modeOverride,
+    int rescramble,
+    DWORD flags,
+    char* detailOut, int detailOutSize,
+    char* errorOut, int errorOutSize);
+
 // 扫描游戏目录里已有的 patch@r<N>.xp3，返回下一个可用修订号（至少 1）。
 __declspec(dllexport) unsigned int __stdcall NextPatchRevision(const wchar_t* gameDir);
 
@@ -67,13 +83,25 @@ __declspec(dllexport) BOOL __stdcall DeriveKeys(
     char* noteOut, int noteOutSize,
     char* errorOut, int errorOutSize);
 
+// 显式授权版 DeriveKeys。
+//   flags bit0 = 明确允许执行游戏内嵌的原生代码（仅此位合法）。
+//   旁侧同名 .hxv4p 收编与仓库已有参数复用都不需要这个位。
+__declspec(dllexport) BOOL __stdcall DeriveKeysEx(
+    const wchar_t* exePath,
+    const wchar_t* keysRoot,
+    DWORD flags,
+    char* noteOut, int noteOutSize,
+    char* errorOut, int errorOutSize);
+
 // 让导出表同时包含无装饰名，便于 GetProcAddress 直接按名字查找
 // 后面的 @N 是 __stdcall 的参数字节数，改签名就得跟着改
 #pragma comment(linker, "/EXPORT:SniffInputDir=_SniffInputDir@24")
 #pragma comment(linker, "/EXPORT:Repack=_Repack@44")
+#pragma comment(linker, "/EXPORT:RepackEx=_RepackEx@48")
 #pragma comment(linker, "/EXPORT:NextPatchRevision=_NextPatchRevision@4")
 #pragma comment(linker, "/EXPORT:ImportKeyFile=_ImportKeyFile@28")
 #pragma comment(linker, "/EXPORT:DeriveKeys=_DeriveKeys@24")
+#pragma comment(linker, "/EXPORT:DeriveKeysEx=_DeriveKeysEx@28")
 
 #ifdef __cplusplus
 }

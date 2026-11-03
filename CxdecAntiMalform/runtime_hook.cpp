@@ -106,6 +106,44 @@ static bool KmpMemcpyPatch(uint8_t* haystack, size_t haySize,
     return true;
 }
 
+// 从流里读满 size 字节，再复位到 0。
+// 短读（介质错、流被截断、GetSize 与 Read 不一致）一律返回 false：
+// 绝不能把 malloc 出来但只写了一半的缓冲区当成数据往下走。
+static bool ReadAllAndRewind(TjsStream* stream, uint8_t* buf, uint32_t size) {
+    if (stream == nullptr || stream->vtable == nullptr || buf == nullptr) return false;
+    if (stream->vtable->Read == nullptr || stream->vtable->Seek == nullptr) return false;
+    const uint32_t got = stream->vtable->Read(stream, buf, size);
+    if (got != size) return false;
+    return stream->vtable->Seek(stream, 0, 0) == 0;
+}
+
+// 第二遍读（密文态）：临时把 writeTarget 置空，读完再放回。
+// __finally 保证任何退出/异常展开路径都会恢复原值，不会把流留在半改状态。
+static bool ReadCipherAndRewind(TjsStream* stream, uint8_t* buf, uint32_t size) {
+    if (stream == nullptr) return false;
+    auto* slot = reinterpret_cast<TjsStream**>(reinterpret_cast<uint8_t*>(stream) + 0x10);
+    if (slot == nullptr) return false;
+    TjsStream* saved = *slot;
+    bool ok = false;
+    __try {
+        *slot = nullptr;
+        ok = ReadAllAndRewind(stream, buf, size);
+    } __finally {
+        *slot = saved;
+    }
+    return ok;
+}
+
+// 把补丁后的解密态写回运行时流。这是失败可能被上层当成"成功"的地方，
+// 所以单独成一个可测入口：只有写满 size 才算成功。
+static bool WriteBackToStream(TjsStream* target, const uint8_t* data, uint32_t size) {
+    if (target == nullptr || target->vtable == nullptr || target->vtable->Write == nullptr ||
+        data == nullptr)
+        return false;
+    const uint32_t wrote = target->vtable->Write(target, data, size, 0);
+    return wrote == size;
+}
+
 // 写 _crack.exe。needle 是密文原文，replacement 是密文补丁态。
 // outChanged：这次是否真的改到了东西（都没改到就不写文件）
 // outFailed ：需要补但没补上——此时一律不写文件，由调用方决定怎么收场
@@ -188,6 +226,16 @@ static bool PatchAndWrite(const wchar_t* origPath, const wchar_t* crackPath,
 static void __cdecl PatchAndDump(TjsStream* stream) {
     AmLog(L"[AntiMalform] PatchAndDump: stream=0x%p", stream);
 
+    if (stream == nullptr || stream->vtable == nullptr) {
+        AmLog(L"[AntiMalform] PatchAndDump: null stream/vtable, skip");
+        return;
+    }
+    if (stream->vtable->GetSize == nullptr || stream->vtable->Read == nullptr ||
+        stream->vtable->Seek == nullptr || stream->vtable->Write == nullptr) {
+        AmLog(L"[AntiMalform] PatchAndDump: incomplete vtable, skip");
+        return;
+    }
+
     // 所有堆分配都在开头声明，cleanup 里可以无条件释放
     // free(nullptr) 是安全的，所以不需要判断
     uint8_t* blockDec     = nullptr;
@@ -196,6 +244,8 @@ static void __cdecl PatchAndDump(TjsStream* stream) {
     uint8_t* v5encPatched = nullptr;
     TjsStream* savedWt    = nullptr;
     bool ok               = false;
+    // 解密态真的被 TjsPatcher 改过才允许写回运行时流。
+    bool plainPatched     = false;
     // 默认 true：只有 PatchAndWrite 明确报告「什么都没改到」时才会变 false。
     // 这样「根本没走到写文件那一步」（例如分配失败）不会被误判成「无需补丁」。
     bool changed          = true;
@@ -214,10 +264,11 @@ static void __cdecl PatchAndDump(TjsStream* stream) {
     // 第一遍读：拿解密态，用来定位补丁点
     blockDec = (uint8_t*)malloc(dataSize);
     if (!blockDec) { AmLog(L"D: alloc fail"); return; }
-    stream->vtable->Read(stream, blockDec, (uint32_t)dataSize);
+    if (!ReadAllAndRewind(stream, blockDec, (uint32_t)dataSize)) {
+        AmLog(L"[AntiMalform] E: Read1 short/seek failed (size=%d), abort without writing", dataSize);
+        goto cleanup;
+    }
     AmLog(L"[AntiMalform] E: Read1 OK, size=%d", dataSize);
-    stream->vtable->Seek(stream, 0, 0);
-    AmLog(L"[AntiMalform] F: Seek1 OK");
 
     // 先存一份解密原文，后面要算增量
     blockDecOrig = (uint8_t*)malloc(dataSize);
@@ -227,20 +278,18 @@ static void __cdecl PatchAndDump(TjsStream* stream) {
 
     // 第二遍读：把 writeTarget 置空，拿到密文态
     savedWt = *(TjsStream**)((uint8_t*)stream + 0x10);
-    *(TjsStream**)((uint8_t*)stream + 0x10) = nullptr;
     AmLog(L"[AntiMalform] H: writeTarget=0, alloc v5enc...");
 
     v5enc = (uint8_t*)malloc(dataSize);
     if (!v5enc) {
         AmLog(L"I: v5enc alloc fail");
-        *(TjsStream**)((uint8_t*)stream + 0x10) = savedWt;
         goto cleanup;
     }
-    stream->vtable->Read(stream, v5enc, (uint32_t)dataSize);
+    if (!ReadCipherAndRewind(stream, v5enc, (uint32_t)dataSize)) {
+        AmLog(L"[AntiMalform] J: Read2 short/seek failed (size=%d), abort without writing", dataSize);
+        goto cleanup;  // writeTarget 已由 ReadCipherAndRewind 恢复
+    }
     AmLog(L"[AntiMalform] J: Read2 OK");
-    stream->vtable->Seek(stream, 0, 0);
-    AmLog(L"[AntiMalform] K: Seek2 OK");
-    *(TjsStream**)((uint8_t*)stream + 0x10) = savedWt;
     AmLog(L"[AntiMalform] L: writeTarget restored");
 
     // 解析并修改解密态
@@ -256,6 +305,7 @@ static void __cdecl PatchAndDump(TjsStream* stream) {
                 goto write_runtime;
             }
             std::memcpy(blockDec, patchResult.bytes.data(), dataSize);
+            plainPatched = true;
             AmLog(L"[AntiMalform] TJS patched: %d patches", patchResult.patchesApplied);
         }
     }
@@ -275,13 +325,21 @@ static void __cdecl PatchAndDump(TjsStream* stream) {
     }
 
 write_runtime:
-    // 写回运行时流，让引擎用上补丁
-    if (savedWt) {
-        savedWt->vtable->Write(savedWt, blockDec, (uint32_t)dataSize, 0);
+    // 写回运行时流，让引擎用上补丁。
+    // 只有解密态真的被改过才写：把未修改的整段字节码重新写回去没有意义，
+    // 而且会在流有副作用时制造额外风险。
+    // 短写/失败必须标 failed，不能继续生成 _crack.exe 再 ExitProcess(0) 报成功。
+    if (plainPatched && savedWt != nullptr) {
+        if (!WriteBackToStream(savedWt, blockDec, (uint32_t)dataSize)) {
+            AmLog(L"[AntiMalform] ERROR: write-back short/failed for %d bytes", dataSize);
+            failed = true;
+        }
+    } else if (!plainPatched) {
+        AmLog(L"[AntiMalform] no patch applied, not writing back to stream");
     }
 
-    // 产出 _crack.exe
-    if (v5encPatched) {
+    // 产出 _crack.exe（写回失败时 failed 已置位，绝不生成"成功"产物）
+    if (!failed && v5encPatched) {
         wchar_t exePath[MAX_PATH];
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
         wchar_t crackPath[MAX_PATH];
@@ -330,9 +388,20 @@ cleanup:
 static void* __cdecl HookCallback(int a1, int a2, int a3) {
     void* result = g_originalFn(a1, a2, a3);
 
-    const wchar_t* scriptPath = *(const wchar_t**)(*(DWORD*)a2 + 4);
+    // 外层对象/结果都可能为空（挂错目标、引擎版本不同），先做合理 guard，
+    // 不要把 0 当指针解引用。
+    if (result == nullptr || a2 == 0)
+        return result;
+
+    const DWORD holder = *(DWORD*)a2;
+    if (holder == 0)
+        return result;
+
+    const wchar_t* scriptPath = *(const wchar_t**)(holder + 4);
     if (!scriptPath)
-        scriptPath = (const wchar_t*)(*(DWORD*)a2 + 8);
+        scriptPath = (const wchar_t*)(holder + 8);
+    if (!scriptPath)
+        return result;
 
     if (wcsstr(scriptPath, L"startup.tjs")) {
         PatchAndDump((TjsStream*)result);

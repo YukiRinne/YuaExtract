@@ -22,6 +22,11 @@ struct GameParams {
     uint32_t rva_archive_derive   = 0x157D0;
     uint32_t rva_hashkey_derive   = 0x10410;
     uint32_t rva_archive_seed     = 0x81758;
+
+    // 是否允许把游戏内嵌的 BOOTSTRAP DLL 映射进本进程并调用其中的函数。
+    // **默认 false**：未显式授权时 recover_drip_program 在创建输出目录、读资源、
+    // 写临时 DLL 之前就直接失败。这不是 sandbox —— 授权后代码与本工具同权限。
+    bool allow_native_execution = false;
 };
 
 // 主入口点。

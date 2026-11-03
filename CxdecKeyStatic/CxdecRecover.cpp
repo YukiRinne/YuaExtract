@@ -5,6 +5,7 @@
 #include "BootstrapExtract.h"
 #include "FilterManager.h"
 #include "Hxv4p.h"
+#include "NativeExecution.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
@@ -66,9 +67,12 @@ static std::vector<size_t> find_salt_candidates(const uint8_t* data, size_t size
         if (memcmp(data + i, marker2, sizeof(marker2) - 1) == 0) {
             size_t start = (i + sizeof(marker2) - 1 + 0xF) & ~(size_t)0xF;
             size_t end = (i + 0x100 < size) ? (i + 0x100) : size;
-            if (end > size - salt_size) end = size - salt_size;
+            // 用减法避免 size - salt_size 在 size < salt_size 时回绕
+            const size_t last_start = (size >= salt_size) ? (size - salt_size) : 0;
+            if (size < salt_size) continue;
+            if (end > last_start) end = last_start;
             for (size_t off = start; off <= end; off += 0x10) {
-                if (off + salt_size <= size)
+                if (off <= size && salt_size <= size - off)
                     candidates.push_back(off);
             }
         }
@@ -94,7 +98,7 @@ static std::vector<size_t> find_salt_candidates(const uint8_t* data, size_t size
                         uint32_t salt_rva = salt_va - image_base;
                         uint32_t salt_off = PeResource::rva_to_file_offset(data, size, salt_rva);
                         if (salt_off == UINT32_MAX) continue;
-                        if (salt_off + salt_size <= size)
+                        if (salt_off <= size && salt_size <= size - salt_off)
                             candidates.push_back(salt_off);
                         break;
                     }
@@ -205,17 +209,32 @@ bool recover_drip_program(const std::wstring& exe_path,
                            std::string* error_out) {
 #define FAIL(msg) do { if (error_out) *error_out = (msg); return false; } while(0)
 
-    EnsureOutputDirectory(output_dir);
+    // 安全默认：在任何副作用（建输出目录、读 EXE/资源、写临时 DLL、LoadLibrary）
+    // 之前就 gate。旧接口不传授权时这里直接失败，磁盘上不会留下半成品。
+    if (!params.allow_native_execution) {
+        FAIL(NativeExecution::DeniedMessage());
+    }
 
-    // 1. 将整个EXE读入内存
+    // 注意：输出目录的创建已挪到真正要写文件之前（见下面 EnsureOutputDirectory），
+    // 这样 EXE/资源读取失败时不会先建出一个空目录。
+
+    // 1. 将整个EXE读入内存。读出长度、Seek、实际读到的字节数都要核对：
+    //    短读/介质错误时绝不把半截缓冲区当 EXE 继续解析，也不创建输出。
     std::vector<uint8_t> exe_data;
     {
         std::ifstream f(exe_path, std::ios::binary | std::ios::ate);
         if (!f) FAIL("Cannot open EXE");
-        exe_data.resize((size_t)f.tellg());
-        f.seekg(0);
-        f.read((char*)exe_data.data(), exe_data.size());
-        if (exe_data.empty()) FAIL("EXE is empty");
+        const std::streamoff file_size = f.tellg();
+        if (file_size <= 0) FAIL("EXE is empty or unreadable");
+        if (static_cast<uint64_t>(file_size) > (uint64_t)SIZE_MAX) FAIL("EXE is too large");
+        exe_data.resize(static_cast<size_t>(file_size));
+        f.seekg(0, std::ios::beg);
+        if (!f) FAIL("Cannot seek EXE to start");
+        f.read(reinterpret_cast<char*>(exe_data.data()), file_size);
+        if (f.gcount() != file_size) {
+            exe_data.clear();
+            FAIL("Cannot read the entire EXE");
+        }
     }
 
     // 2. 读取PE资源
@@ -261,7 +280,8 @@ bool recover_drip_program(const std::wstring& exe_path,
     std::vector<uint8_t> startup_plain;
 
     for (size_t cand : candidates) {
-        if (cand + params.salt_size > exe_data.size()) continue;
+        if (cand > exe_data.size()) continue;
+        if (params.salt_size > exe_data.size() - cand) continue;
         const uint8_t* trial_salt = exe_data.data() + cand;
         std::vector<uint8_t> plain;
 
@@ -379,7 +399,12 @@ bool recover_drip_program(const std::wstring& exe_path,
         bscfg.params.data(), bscfg.params.size(),
         bscfg.archive_seed,
         params.rva_manager_ctor, params.rva_bootstrap_derive,
-        params.rva_archive_derive, params.rva_hashkey_derive);
+        params.rva_archive_derive, params.rva_hashkey_derive,
+        params.allow_native_execution);
+
+    // 到这里输入（EXE/资源/盐/STARTUP/BOOTSTRAP）都读完了，才允许创建输出目录；
+    // 后面的部分失败分支会写 _scheme.json，所以这一步必须在它前面。
+    EnsureOutputDirectory(output_dir);
 
     // 如果FilterManager失败，写入部分scheme
     if (!prog.ok) {

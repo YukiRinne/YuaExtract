@@ -310,8 +310,7 @@ extern "C" void __declspec(naked) HxProbeDetour()
         call ProbeEnterDispatcher
         popfd
         popad
-        mov eax, dword ptr [g_HxOriginal]
-        jmp eax
+        jmp dword ptr [g_HxOriginal]
     }
 }
 
@@ -327,8 +326,7 @@ extern "C" void __declspec(naked) CxProbeDetour()
         call ProbeEnterDispatcher
         popfd
         popad
-        mov eax, dword ptr [g_CxOriginal]
-        jmp eax
+        jmp dword ptr [g_CxOriginal]
     }
 }
 
@@ -344,8 +342,7 @@ extern "C" void __declspec(naked) VerifyProbeDetour()
         call ProbeEnterDispatcher
         popfd
         popad
-        mov eax, dword ptr [g_VerifyOriginal]
-        jmp eax
+        jmp dword ptr [g_VerifyOriginal]
     }
 }
 

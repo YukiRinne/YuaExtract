@@ -10,6 +10,17 @@
     <ClCompile Include="Crypto\ChaCha.cpp"><Filter>Crypto</Filter></ClCompile>
     <ClCompile Include="Crypto\Keccak.cpp"><Filter>Crypto</Filter></ClCompile>
     <ClCompile Include="Crypto\ZlibInflate.cpp"><Filter>Crypto</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\adler32.c"><Filter>zlib</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\compress.c"><Filter>zlib</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\crc32.c"><Filter>zlib</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\deflate.c"><Filter>zlib</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\infback.c"><Filter>zlib</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\inffast.c"><Filter>zlib</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\inflate.c"><Filter>zlib</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\inftrees.c"><Filter>zlib</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\trees.c"><Filter>zlib</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\uncompr.c"><Filter>zlib</Filter></ClCompile>
+    <ClCompile Include="..\CxdecRepacker\third_party\zlib\zutil.c"><Filter>zlib</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="BresDecrypt.h"><Filter>Header Files</Filter></ClInclude>
@@ -26,5 +37,6 @@
     <Filter Include="Header Files" />
     <Filter Include="Source Files" />
     <Filter Include="Crypto" />
+    <Filter Include="zlib" />
   </ItemGroup>
 </Project>

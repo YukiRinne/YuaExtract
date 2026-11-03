@@ -162,6 +162,11 @@ namespace Yua
         // 全被去掉时返回空串，调用方必须据此报错，不要拿空目录名去落盘。
         std::wstring MakeSafePathComponent(const std::wstring& raw);
 
+        // **物理槽位键**：MakeSafePathComponent + casefold + '\\'（任何一级为空则返回空串）。
+        // Install upsert / 库目录去重 / Online::Classify 必须统一用它判"同一个槽位"，
+        // 避免 sanitize 后相同的名字被当成 New 而无确认覆盖。显示仍用清单里的原始名。
+        std::wstring LibrarySlotKey(const std::wstring& publisher, const std::wstring& title);
+
         // 库安装前的校验：会社与作品名必须能生成非空目录名。
         bool ValidateMeta(const Meta& meta, std::wstring& error);
 
@@ -365,6 +370,7 @@ namespace Yua
             unsigned int fullyResolvedFiles = 0;  // 整路径可还原
             unsigned int missingDirectory = 0;    // 缺目录 Hash（与"缺文件名"正交，两个都缺时各计一次）
             unsigned int missingFileName = 0;
+            unsigned int skippedReparsePoints = 0; // 扫描时跳过的重解析点（不跟随，如实报数）
             // 0..100，分母 = hashNamedFiles。口径与步骤3 报告的"还原成功率"一致。
             unsigned int successRate = 0;
 
@@ -420,6 +426,27 @@ namespace Yua
         // 不换的话「来源」列永远指向一个不存在的路径（独立验证 P-3）。
         bool InstallToLibrary(const std::wstring& libraryRoot, const std::wstring& archivePath,
                               std::wstring& error, const std::wstring& sourceLabel = std::wstring());
+
+        // 字节版（2026-11 安全轮，**在线更新唯一应使用的安装入口**）：
+        //   · 只解码传入的 blob，SHA-256 也来自同一份 blob；**绝不再打开路径** ——
+        //     否则"校验 A、安装 B"的 TOCTOU 窗口就回来了；
+        //   · 在任何目标覆盖之前完成：解码、META 校验、清单读取、info / 清单编码、
+        //     目标路径与重解析点检查；
+        //   · 独占库写事务：按规范化 libraryRoot 生成命名 mutex（本地 digest），跨实例串行；
+        //     rules.int / info.txt / manifest.txt 先写同卷唯一 CREATE_NEW 暂存，
+        //     write/flush/close 全检查，再 ReplaceFileW（唯一 backup）或新文件 rename；
+        //   · 后续 commit 失败会按相反顺序还原已替换文件 / 删除本次新建文件与空目录；
+        //     rollback 失败时保留 backup 并明确路径，不销毁唯一旧数据；
+        //   · 不删除旧槽位目录里的用户数据；正常重复安装不产生重复清单条目。
+        //   · 这是**普通失败**的事务（I/O 失败可回滚），**不承诺**进程崩溃 / 掉电时三个文件
+        //     跨文件完全原子的 crash-safe 语义；不要对外声称具备该保证。
+        //
+        // 返回 false 时 error 必非空并写明本地库状态；成功时 error 一般为空，
+        // 极端情况下可能带"备份文件删不掉"的非致命提示。
+        bool InstallBytesToLibrary(const std::wstring& libraryRoot,
+                                   const std::vector<unsigned char>& blob,
+                                   std::wstring& error,
+                                   const std::wstring& sourceLabel = std::wstring());
 
         // 解析一份「清单 / 索引」文本：TSV，10 列（表头与 WriteManifest 一致），'#' 开头是注释行。
         // **本地库清单（EnumerateLibrary）与在线索引（Online::FetchIndex）共用这一份实现**，

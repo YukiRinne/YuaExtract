@@ -17,6 +17,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <functional>
 #include <string>
 
 namespace Yua
@@ -42,9 +43,16 @@ namespace Yua
         unsigned int topLevelEntries = 0;
         unsigned int files = 0;
         unsigned long long bytes = 0;
+        // 递归统计遇到列目录失败/深度上限/取消时置位；界面据此提示"数字不完整"，
+        // 而不是把中途失败当成"目录就这么多东西"。
+        std::wstring error;
+        bool cancelled = false;
     };
 
-    DirProbe ProbeDirectory(const std::wstring& directory, bool deep);
+    // cancelRequested 可为空。deep=true 时递归；重解析点（junction/symlink）目录
+    // 只计一个条目、不跟进去，避免循环与越界统计。
+    DirProbe ProbeDirectory(const std::wstring& directory, bool deep,
+                            const std::function<bool()>& cancelRequested = nullptr);
 
     // 文本文件行数（映射表条数就靠它显示），读不动就回 0。
     unsigned int CountTextFileLines(const std::wstring& path);
@@ -53,7 +61,10 @@ namespace Yua
     std::wstring ReadTextFileTail(const std::wstring& path, unsigned int maxLines);
 
     // 递归删除目录（先清只读属性）。目录不存在算成功。
-    bool RemoveDirectoryTree(const std::wstring& directory, std::wstring& error);
+    // 重解析点（junction/symlink）只删链接自身，不枚举、不删除链接目标；
+    // 目录本身是 junction 时同样只删链接。FindNext 的失败不是"正常结束"，会如实返回 false。
+    bool RemoveDirectoryTree(const std::wstring& directory, std::wstring& error,
+                             const std::function<bool()>& cancelRequested = nullptr);
 
     // 把文件系统时间戳转成人看的字符串；失败返回空串。
     std::wstring FileTimestampText(const std::wstring& path);

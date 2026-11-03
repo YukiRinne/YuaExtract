@@ -17,6 +17,9 @@
 // 同一个来源，不能各写一份常量。本文件与界面同属一个 exe，不新增任何模块依赖。
 #include "YuaExtractHost.h"
 
+#include "AtomicFile.h"
+#include "PathSafety.h"
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -24,10 +27,13 @@
 #include <Windows.h>
 #include <winhttp.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -186,20 +192,62 @@ namespace Online
         {
             error = 0;
             out.clear();
+            if (path.empty())
+            {
+                error = ERROR_INVALID_PARAMETER;
+                return false;
+            }
+            std::wstring offending;
+            if (PathSafety::HasReparsePoint(path, &offending))
+            {
+                error = ERROR_CANT_ACCESS_FILE;
+                return false;
+            }
 
-            HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            // 共享读、不允许写；不跟随重解析点。
+            HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                        OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                                        nullptr);
             if (file == INVALID_HANDLE_VALUE)
             {
                 error = ::GetLastError();
                 return false;
             }
 
-            std::vector<unsigned char> buffer(64u * 1024u);
-            for (;;)
+            LARGE_INTEGER size{};
+            if (!::GetFileSizeEx(file, &size) || size.QuadPart < 0
+                || !PathSafety::FitsSizeT(static_cast<uint64_t>(size.QuadPart)))
             {
+                error = (::GetLastError() == 0u) ? ERROR_FILE_TOO_LARGE : ::GetLastError();
+                ::CloseHandle(file);
+                return false;
+            }
+            const size_t expected = static_cast<size_t>(size.QuadPart);
+            try
+            {
+                out.assign(expected, 0u);
+            }
+            catch (const std::bad_alloc&)
+            {
+                error = ERROR_NOT_ENOUGH_MEMORY;
+                ::CloseHandle(file);
+                return false;
+            }
+            catch (const std::length_error&)
+            {
+                error = ERROR_FILE_TOO_LARGE;
+                ::CloseHandle(file);
+                return false;
+            }
+
+            size_t offset = 0u;
+            while (offset < expected)
+            {
+                const DWORD chunk = static_cast<DWORD>(
+                    std::min<size_t>(expected - offset, 1u << 20));
                 DWORD read = 0u;
-                if (!::ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr))
+                if (!::ReadFile(file, out.data() + offset, chunk, &read, nullptr))
                 {
                     error = ::GetLastError();
                     ::CloseHandle(file);
@@ -207,9 +255,18 @@ namespace Online
                 }
                 if (read == 0u)
                 {
-                    break;
+                    error = ERROR_HANDLE_EOF;   // 读短 = 文件在读取期间被截断
+                    ::CloseHandle(file);
+                    return false;
                 }
-                out.insert(out.end(), buffer.begin(), buffer.begin() + read);
+                offset += read;
+            }
+            LARGE_INTEGER finalSize{};
+            if (!::GetFileSizeEx(file, &finalSize) || finalSize.QuadPart != size.QuadPart)
+            {
+                error = ERROR_FILE_INVALID;     // 读取期间大小变了
+                ::CloseHandle(file);
+                return false;
             }
             ::CloseHandle(file);
             return true;
@@ -1243,22 +1300,122 @@ namespace Online
             return true;
         }
 
-        // 尽力删一个文件：删不掉不报错、不抛。调用方多半接下来会清掉整个 staging 目录。
-        void DeleteFileBestEffort(const std::wstring& path)
+        // 本进程创建并**登记过的** private staging 目录（规范化 + casefold）。
+        // 只有登记过的目录才允许 CleanupStaging 删除；explicit 用户目录一律拒绝。
+        std::mutex g_ownedStagingMutex;
+        std::set<std::wstring> g_ownedStagingDirectories;
+
+        std::wstring StagingKey(const std::wstring& path)
         {
-            if (!path.empty())
-            {
-                ::DeleteFileW(path.c_str());
-            }
+            const std::wstring normalized = PathSafety::NormalizeFullPath(path);
+            return normalized.empty() ? std::wstring() : ToLowerString(normalized);
         }
 
-        // 递归删一棵目录树。**只用于 staging**：那个目录是本层自己造的、里面全是下载来的
-        // 临时文件，才敢整棵删。所有失败（占用、权限）一律忽略 —— 这里报错也帮不上谁。
-        void RemoveDirectoryTree(const std::wstring& directory)
+        void RegisterOwnedStaging(const std::wstring& path)
+        {
+            const std::wstring key = StagingKey(path);
+            if (key.empty())
+            {
+                return;
+            }
+            std::lock_guard<std::mutex> guard(g_ownedStagingMutex);
+            g_ownedStagingDirectories.insert(key);
+        }
+
+        bool IsOwnedStaging(const std::wstring& path)
+        {
+            const std::wstring key = StagingKey(path);
+            if (key.empty())
+            {
+                return false;
+            }
+            std::lock_guard<std::mutex> guard(g_ownedStagingMutex);
+            return g_ownedStagingDirectories.find(key) != g_ownedStagingDirectories.end();
+        }
+
+        void UnregisterOwnedStaging(const std::wstring& path)
+        {
+            const std::wstring key = StagingKey(path);
+            if (key.empty())
+            {
+                return;
+            }
+            std::lock_guard<std::mutex> guard(g_ownedStagingMutex);
+            g_ownedStagingDirectories.erase(key);
+        }
+
+        // 检查 path 的**所有祖先**（不含末段本身）是否有重解析点。
+        // 清理前必须做：否则父目录被换成 junction 时，FindFirstFile 会穿过去，
+        // 把外部目录里的同名结构当成本次 owned 内容处理。
+        bool AncestorHasReparse(const std::wstring& path, std::wstring& offending)
+        {
+            offending.clear();
+            const std::wstring normalized = PathSafety::NormalizeFullPath(path);
+            if (normalized.empty())
+            {
+                return false;
+            }
+            const PathSafety::SplitPath split = PathSafety::SplitFullPath(normalized);
+            if (!split.valid)
+            {
+                return false;
+            }
+            std::wstring current = split.prefix;
+            if (current.size() > 3u && current.back() == L'\\')
+            {
+                current.pop_back();
+            }
+            const DWORD rootAttributes = ::GetFileAttributesW(current.c_str());
+            if (rootAttributes != INVALID_FILE_ATTRIBUTES
+                && (rootAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+            {
+                offending = current;
+                return true;
+            }
+            for (size_t i = 0u; i + 1u < split.parts.size(); ++i)
+            {
+                if (!current.empty() && current.back() != L'\\')
+                {
+                    current.push_back(L'\\');
+                }
+                current += split.parts[i];
+                const DWORD attributes = ::GetFileAttributesW(current.c_str());
+                if (attributes == INVALID_FILE_ATTRIBUTES)
+                {
+                    break;   // 祖先不存在，更深的路径不可能存在
+                }
+                if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                {
+                    offending = current;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // 递归删除**本进程 owned 的** staging 目录。遇重解析点只 unlink 链接本身
+        // （RemoveDirectoryW 不会进入 junction 目标），绝不递归进链接指向的目录。
+        void RemoveOwnedDirectoryNoFollow(const std::wstring& directory)
         {
             if (directory.empty() || directory.size() <= 3u)
             {
-                return;   // 不删盘根：万一调用方传了个 "C:\"，那不是"尽力"该干的事
+                return;
+            }
+            const DWORD attributes = ::GetFileAttributesW(directory.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES)
+            {
+                return;
+            }
+            if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+            {
+                ::RemoveDirectoryW(directory.c_str());   // 只摘链接，不跟目标
+                return;
+            }
+            // 递归过程中祖先被换成链接：停止，绝不穿过链接去枚举外部目录。
+            std::wstring ancestorOffending;
+            if (PathSafety::HasReparsePoint(directory, &ancestorOffending))
+            {
+                return;
             }
 
             WIN32_FIND_DATAW data{};
@@ -1273,9 +1430,21 @@ namespace Online
                         continue;
                     }
                     const std::wstring path = CombinePath(directory, name);
-                    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                    if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
                     {
-                        RemoveDirectoryTree(path);
+                        // 链接：目录链接用 RemoveDirectoryW 摘掉，文件链接用 DeleteFileW 摘掉。
+                        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                        {
+                            ::RemoveDirectoryW(path.c_str());
+                        }
+                        else
+                        {
+                            ::DeleteFileW(path.c_str());
+                        }
+                    }
+                    else if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                    {
+                        RemoveOwnedDirectoryNoFollow(path);
                         ::RemoveDirectoryW(path.c_str());
                     }
                     else
@@ -1307,6 +1476,116 @@ namespace Online
                 return std::wstring();
             }
             return CombinePath(CombinePath(temp, L"YuaExtract"), L"OnlineStaging");
+        }
+
+        // 在一个父根下建**本次调用独占**的 session_<guid> 子目录（CREATE_NEW 防碰撞）。
+        bool CreateOwnedSessionDirectory(const std::wstring& base, std::wstring& out,
+                                         std::wstring& error)
+        {
+            error.clear();
+            out.clear();
+            if (base.empty())
+            {
+                return false;
+            }
+            // 父根与已存在的祖先都不能是重解析点（绝不能"跟着链接"建到别处）。
+            std::wstring offending;
+            if (PathSafety::HasReparsePoint(base, &offending))
+            {
+                error = L"临时目录根是/含有重解析点，拒绝使用：" + offending;
+                return false;
+            }
+            DWORD createError = 0u;
+            if (!EnsureDirectoryTree(base, createError))
+            {
+                error = L"建不出临时目录根：" + base + L"（Win32 错误码 "
+                      + FormatUInt(createError) + L"）";
+                return false;
+            }
+            if (PathSafety::HasReparsePoint(base, &offending))
+            {
+                error = L"临时目录根在创建后变成/含有重解析点，拒绝使用：" + offending;
+                return false;
+            }
+
+            for (int attempt = 0; attempt < 16; ++attempt)
+            {
+                const std::wstring candidate =
+                    CombinePath(base, L"session_" + Common::AtomicFile::UniqueSuffix());
+                if (::CreateDirectoryW(candidate.c_str(), nullptr))
+                {
+                    if (PathSafety::HasReparsePoint(candidate, &offending))
+                    {
+                        ::RemoveDirectoryW(candidate.c_str());
+                        error = L"新建的临时目录是/含有重解析点，拒绝使用：" + offending;
+                        return false;
+                    }
+                    // 创建成功本身就是"真可写"的证明，不靠 Exists 猜。
+                    RegisterOwnedStaging(candidate);
+                    out = PathSafety::NormalizeFullPath(candidate);
+                    if (out.empty())
+                    {
+                        UnregisterOwnedStaging(candidate);
+                        ::RemoveDirectoryW(candidate.c_str());
+                        error = L"临时目录路径无效：" + candidate;
+                        return false;
+                    }
+                    return true;
+                }
+                const DWORD mkdirError = ::GetLastError();
+                if (mkdirError != ERROR_ALREADY_EXISTS)
+                {
+                    error = L"建不出本次独占的临时目录：" + candidate + L"（Win32 错误码 "
+                          + FormatUInt(mkdirError) + L"）";
+                    return false;
+                }
+            }
+            error = L"连续 16 次建独占临时目录都撞名：" + base;
+            return false;
+        }
+
+        // CREATE_NEW 写一个本次独占的临时文件；失败只删**自己创建**的那个文件。
+        bool WriteOwnedStagingFile(const std::wstring& path, const std::vector<unsigned char>& bytes,
+                                   std::wstring& error)
+        {
+            error.clear();
+            HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                error = L"创建临时文件失败：" + path + L"（Win32 错误码 "
+                      + FormatUInt(::GetLastError()) + L"）";
+                return false;
+            }
+            bool ok = true;
+            size_t offset = 0u;
+            while (offset < bytes.size())
+            {
+                const DWORD chunk = static_cast<DWORD>(
+                    std::min<size_t>(bytes.size() - offset, 1u << 20));
+                DWORD written = 0u;
+                if (!::WriteFile(file, bytes.data() + offset, chunk, &written, nullptr)
+                    || written != chunk)
+                {
+                    error = L"写临时文件失败：" + path + L"（Win32 错误码 "
+                          + FormatUInt(::GetLastError()) + L"）";
+                    ok = false;
+                    break;
+                }
+                offset += written;
+            }
+            if (ok && !::FlushFileBuffers(file))
+            {
+                error = L"刷临时文件失败：" + path + L"（Win32 错误码 "
+                      + FormatUInt(::GetLastError()) + L"）";
+                ok = false;
+            }
+            ::CloseHandle(file);
+            if (!ok)
+            {
+                ::DeleteFileW(path.c_str());   // 只删自己刚创建的文件
+            }
+            return ok;
         }
     }
 
@@ -1593,10 +1872,14 @@ namespace Online
         // 条数不少于**最全的那条**，才敢说"覆盖不会减少覆盖度"。
         const ExtensionSet::LibraryEntry* best = nullptr;
         bool sameDigest = false;
+        // 统一用 LibrarySlotKey（sanitize + casefold）判"同一物理槽位"：
+        // "Game:A" 与 "GameA" 落到同一个库目录，必须算 sameSlot，不能被判成 New。
+        const std::wstring remoteSlot =
+            ExtensionSet::LibrarySlotKey(remote.publisher, remote.title);
         for (const ExtensionSet::LibraryEntry& candidate : local.entries)
         {
-            const bool sameSlot = _wcsicmp(candidate.publisher.c_str(), remote.publisher.c_str()) == 0
-                && _wcsicmp(candidate.title.c_str(), remote.title.c_str()) == 0;
+            const bool sameSlot = !remoteSlot.empty()
+                && ExtensionSet::LibrarySlotKey(candidate.publisher, candidate.title) == remoteSlot;
             const bool sameExe = SameHash(candidate.exeDigest, remote.exeDigest);
             if (!sameSlot && !sameExe)
             {
@@ -1649,29 +1932,28 @@ namespace Online
 
     std::wstring DefaultStagingDirectory()
     {
-        // 临时档案跟日志一起放：<工具目录>\Log\OnlineStaging。
-        // 工具目录不可写时退到 %TEMP%\YuaExtract\OnlineStaging —— 下载回来的东西是
-        // **不可信输入**，宁可放临时目录，也不去试别的地方（§14.4 第 6 条只要求"能删干净"）。
-        //
-        // 顺手把目录建出来：调用方拿到路径就能直接写，判"能不能写"也只能靠真去建一次
-        //（目录属性判不出 ACL）。两个都建不出来时返回空串，调用方必须据此报错。
+        // 临时档案跟日志一起放：<工具目录>\Log\OnlineStaging\session_<guid>。
+        // 工具目录不可写时退到 %TEMP%\YuaExtract\OnlineStaging\session_<guid>。
+        // 每次调用一个**全新独占**子目录：父根验收（无重解析点 + 真能创建）之后，
+        // 用 CREATE_NEW 建 session 目录，并登记为 owned，之后只由 CleanupStaging 清理。
+        std::wstring error;
         const std::wstring primary = PrimaryStagingDirectory();
         if (!primary.empty())
         {
-            DWORD createError = 0u;
-            if (EnsureDirectoryTree(primary, createError))
+            std::wstring session;
+            if (CreateOwnedSessionDirectory(primary, session, error) && !session.empty())
             {
-                return primary;
+                return session;
             }
         }
 
         const std::wstring fallback = FallbackStagingDirectory();
         if (!fallback.empty())
         {
-            DWORD createError = 0u;
-            if (EnsureDirectoryTree(fallback, createError))
+            std::wstring session;
+            if (CreateOwnedSessionDirectory(fallback, session, error) && !session.empty())
             {
-                return fallback;
+                return session;
             }
         }
         return std::wstring();
@@ -1679,27 +1961,34 @@ namespace Online
 
     void CleanupStaging(const std::wstring& stagingDirectory)
     {
-        // 尽力删：删不掉不是错误、不抛（文件可能正被占用、权限不够）。
-        // 调用时机是"校验失败后"与"入库成功后" —— 两处都不该把下载来的东西留在地上。
-        if (!stagingDirectory.empty())
+        // 空串 = no-op：**绝不**去猜"共享默认根"再整棵删（那是老实现的危险行为）。
+        if (stagingDirectory.empty())
         {
-            RemoveDirectoryTree(stagingDirectory);
             return;
         }
-
-        // 没指定就表示"用默认的那个"，而默认可能有迹可循的两个候选（工具目录 / %TEMP%）。
-        // 这里只看**已经存在的**：清理不该为了确认能不能写再去建一个目录出来。
-        const std::wstring primary = PrimaryStagingDirectory();
-        if (!primary.empty() && DirectoryExists(primary))
+        // 只清理本进程创建并登记的 owned 目录。explicit 的 existing 用户目录一律拒绝。
+        if (!IsOwnedStaging(stagingDirectory))
         {
-            RemoveDirectoryTree(primary);
+            return;
         }
-        const std::wstring fallback = FallbackStagingDirectory();
-        if (!fallback.empty() && DirectoryExists(fallback))
+        // 祖先被换成 junction：**不跟进去清理**。保留 owned 登记（不 unregister），
+        // 让调用方以后在路径恢复后还能重试，也避免"报干净实际没清"。
+        std::wstring offending;
+        if (AncestorHasReparse(stagingDirectory, offending))
         {
-            RemoveDirectoryTree(fallback);
+            return;
         }
+        RemoveOwnedDirectoryNoFollow(stagingDirectory);
+        UnregisterOwnedStaging(stagingDirectory);
     }
+
+#ifdef YUA_SECURITY_EXTENSION_TEST_SEAM
+    bool& TestFailDownloadAfterStaging()
+    {
+        static bool failAfterStaging = false;
+        return failAfterStaging;
+    }
+#endif
 
     bool DownloadArchive(const std::wstring& base, const ExtensionSet::LibraryEntry& entry,
                          const std::wstring& stagingDirectory, DownloadResult& out,
@@ -1733,37 +2022,104 @@ namespace Online
             return false;
         }
 
-        const std::wstring staging =
-            stagingDirectory.empty() ? DefaultStagingDirectory() : stagingDirectory;
-        if (staging.empty())
+        // 自定义 staging 必须是**已存在**的普通目录；不替用户创建/接管既有目录，
+        // 也不把它登记为 owned（CleanupStaging 会拒绝删除未 owned 的 explicit 目录）。
+        // 默认路径由 DefaultStagingDirectory 每次生成独占 session_<guid> 并登记。
+        std::wstring staging;
+        if (stagingDirectory.empty())
         {
-            error = L"找不到可用的临时目录（工具目录下的 Log 与 %TEMP% 都写不了）。";
-            return false;
+            staging = DefaultStagingDirectory();
+            if (staging.empty())
+            {
+                error = L"找不到可用的临时目录（工具目录下的 Log 与 %TEMP% 都写不了）。";
+                return false;
+            }
         }
-        DWORD createError = 0u;
-        if (!EnsureDirectoryTree(staging, createError))
+        else
         {
-            error = L"建不出临时目录：" + staging + L"（Win32 错误码 " + FormatUInt(createError)
-                  + L"）";
-            return false;
+            if (!DirectoryExists(stagingDirectory))
+            {
+                error = L"指定的临时目录不存在：" + stagingDirectory;
+                return false;
+            }
+            std::wstring offending;
+            if (PathSafety::HasReparsePoint(stagingDirectory, &offending))
+            {
+                error = L"指定的临时目录是/含有重解析点，拒绝写入：" + offending;
+                return false;
+            }
+            staging = PathSafety::NormalizeFullPath(stagingDirectory);
+            if (staging.empty())
+            {
+                error = L"指定的临时目录路径无效：" + stagingDirectory;
+                return false;
+            }
         }
 
-        const std::wstring path =
-            CombinePath(staging, L"Online_" + publisher + L"_" + title + L".rules.int");
+        // 默认 staging 是本函数刚建出来的 owned session：若后续任何一步失败，
+        // 由 RAII 守卫自动清掉（explicit 用户目录绝不接管/删除）。
+        struct OwnedStagingGuard
+        {
+            const std::wstring* directory = nullptr;
+            ~OwnedStagingGuard()
+            {
+                if (directory != nullptr)
+                {
+                    try
+                    {
+                        CleanupStaging(*directory);
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+            }
+        } stagingGuard;
+        if (stagingDirectory.empty())
+        {
+            stagingGuard.directory = &staging;   // 不复制、不再分配
+        }
+
+        // **唯一 CREATE_NEW 文件名**：不覆盖任何预存在文件（哪怕同名）。
+        std::wstring path;
+        {
+            for (int attempt = 0; attempt < 16; ++attempt)
+            {
+                const std::wstring candidate = CombinePath(
+                    staging, L"Online_" + Common::AtomicFile::UniqueSuffix() + L".rules.int");
+                if (!FileExists(candidate))
+                {
+                    path = candidate;
+                    break;
+                }
+            }
+            if (path.empty())
+            {
+                error = L"生成唯一临时文件名失败：" + staging;
+                return false;
+            }
+        }
 
         // 本函数**只负责拿到字节**：不校验、不动本地库（§14.4 第 2–5 条在 VerifyArchive，
-        // 入库在 ExtensionSet::InstallToLibrary）。中间隔着两个显式函数调用，
+        // 入库在 ExtensionSet::InstallBytesToLibrary）。中间隔着两个显式函数调用，
         // "下载成功但校验没过"就不可能顺手改了本地库。
         if (request.progress)
         {
             request.progress(10, L"正在下载：" + url);
         }
 
+#ifdef YUA_SECURITY_EXTENSION_TEST_SEAM
+        if (TestFailDownloadAfterStaging())
+        {
+            error = L"测试故障注入：建好私有 staging 后、下载前失败。";
+            return false;   // stagingGuard 负责清掉本次 owned session
+        }
+#endif
+
         HttpResponse response;
         if (!HttpGet(url, kMaxArchiveBytes, L"下载档案", request, response, error))
         {
-            // 失败路径一律不留临时文件（§14.4 第 6 条）。
-            DeleteFileBestEffort(path);
+            // 还没创建任何文件：不调用 DeleteFile（避免误删别的进程刚建出来的同名文件）。
             return false;
         }
         if (response.body.empty())
@@ -1771,22 +2127,23 @@ namespace Online
             // 200 却一个字节都没有 = 这次下载没成功（正常档案至少也有个头）。
             // 这不是"校验"，不必等 VerifyArchive 去说"magic 不对"。
             error = L"下载失败：服务器返回 200，但内容是 0 字节。地址：" + url;
-            DeleteFileBestEffort(path);
             return false;
         }
 
-        if (!WriteAllBytes(path, response.body.data(), response.body.size(), createError))
+        if (!WriteOwnedStagingFile(path, response.body, error))
         {
-            error = L"写临时档案失败：" + path + L"（Win32 错误码 " + FormatUInt(createError) + L"）";
-            DeleteFileBestEffort(path);
+            // WriteOwnedStagingFile 只在**自己 CREATE_NEW 成功**后才负责删除；
+            // 这里不再补删，避免删掉预存在/别人创建的同名文件。
             return false;
         }
 
         out.path = path;
+        out.stagingDirectory = staging;
         out.bytes = static_cast<unsigned long long>(response.body.size());
-        // 摘要就地对内存里的字节算，而不是再读一遍刚落盘的文件：刚落盘的文件理论上
-        // 可能被别的进程换掉，对"我们真正拿到的那串字节"算 sha256 才是对的。
-        out.sha256 = ExtensionSet::Sha256HexBytes(response.body.data(), response.body.size());
+        out.blob = std::move(response.body);
+        // 摘要与 blob 同源：对**我们真正拿到的那串字节**算 sha256，绝不重读 path。
+        out.sha256 = ExtensionSet::Sha256HexBytes(out.blob.data(), out.blob.size());
+        stagingGuard.directory = nullptr;   // 成功：目录所有权交给调用方（CleanupStaging 可清）
 
         if (request.progress)
         {
@@ -1798,28 +2155,54 @@ namespace Online
     bool VerifyArchive(const std::wstring& archivePath, const ExtensionSet::LibraryEntry& entry,
                        std::wstring& detail, std::wstring& error)
     {
+        // 兼容 wrapper：**只读一次**完整字节，之后与字节接口走同一条路。
         detail.clear();
         error.clear();
-
         if (archivePath.empty())
         {
             error = L"没有给出要校验的档案路径。";
             return false;
         }
+        std::vector<unsigned char> blob;
+        DWORD readError = 0u;
+        if (!ReadAllBytes(archivePath, blob, readError))
+        {
+            error = L"读不到要校验的档案：" + archivePath + L"（Win32 错误码 "
+                  + FormatUInt(readError) + L"）";
+            return false;
+        }
+        return VerifyArchiveBytes(blob, entry, detail, error);
+    }
+
+    bool VerifyArchiveBytes(const std::vector<unsigned char>& blob,
+                            const ExtensionSet::LibraryEntry& entry,
+                            std::wstring& detail, std::wstring& error)
+    {
+        detail.clear();
+        error.clear();
+
         if (entry.archiveDigest.empty() || entry.exeDigest.empty())
         {
             error = L"索引里这一条缺「档案摘要」或「目标 exe 摘要」，没有信任根可以对照，拒绝校验。";
             return false;
         }
+        if (blob.empty())
+        {
+            error = L"要校验的档案字节为空。";
+            return false;
+        }
+        if (static_cast<unsigned long long>(blob.size()) > kMaxArchiveBytes)
+        {
+            error = L"要校验的档案超过上限（" + FormatUInt(blob.size()) + L" 字节，上限 "
+                  + FormatUInt(kMaxArchiveBytes) + L" 字节），拒绝校验。";
+            return false;
+        }
 
         // ---------- 第 2 条：sha256 必须等于索引里的「档案摘要」 ----------
         // 这一条把"下到的字节"钉死在索引上：字节只要被动过一个比特就过不去。
-        const std::wstring actualDigest = ExtensionSet::Sha256HexFile(archivePath);
-        if (actualDigest.empty())
-        {
-            error = L"读不到要校验的档案：" + archivePath;
-            return false;
-        }
+        // **摘要与后面的解码都针对传入的同一份 blob**，绝不重开路径。
+        const std::wstring actualDigest =
+            ExtensionSet::Sha256HexBytes(blob.data(), blob.size());
         if (!SameHash(actualDigest, entry.archiveDigest))
         {
             error = L"档案摘要不符：这一份不是索引里指的那一份，已丢弃。\r\n"
@@ -1834,7 +2217,7 @@ namespace Online
         // 本层不重复实现一遍容器解析（两份实现必然分叉）。
         ExtensionSet::Archive archive;
         std::wstring decodeError;
-        if (!ExtensionSet::ReadArchiveFile(archivePath, archive, decodeError))
+        if (!ExtensionSet::DecodeArchive(blob, archive, decodeError))
         {
             error = L"档案结构校验不通过：" + decodeError;
             return false;
