@@ -1,4 +1,4 @@
-﻿// YuaExtract 步骤3「资源名还原」窗口实现。
+// YuaExtract 步骤3「资源名还原」窗口实现。
 //
 // 结构照 CxdecExtractorUI/BatchExtractorUI.cpp（"按队列 + N 工作线程 + 任务列表 +
 // 详细日志"的现成实现）来，但有两点关键差别：
@@ -93,22 +93,40 @@ namespace
 
     const wchar_t* kWindowTitle = L"YuaExtract 资源名还原";
 
-    constexpr int kMargin = 10;
-    constexpr int kRowHeight = 24;
+    constexpr int kMargin = 14;
+    constexpr int kRowHeight = 26;
     constexpr int kRowGap = 8;
-    constexpr int kOutputLabelWidth = 76;
-    constexpr int kWorkerLabelWidth = 60;
-    constexpr int kWorkerEditWidth = 70;
-    constexpr int kSplitTitleHeight = 22;
-    constexpr int kButtonWidth = 110;
-    constexpr int kButtonHeight = 28;
+    constexpr int kOutputLabelWidth = 84;
+    constexpr int kWorkerLabelWidth = 64;
+    constexpr int kWorkerEditWidth = 68;
+    constexpr int kSplitTitleHeight = 26;
+    constexpr int kButtonWidth = 114;
+    constexpr int kButtonHeight = 30;
     constexpr int kCheckHeight = 22;
-    constexpr int kProgressHeight = 8;
+    constexpr int kProgressHeight = 14;
     constexpr int kMinLogHeight = 80;
     constexpr int kMinListHeight = 90;
 
-    constexpr COLORREF kColorMuted = RGB(0x66, 0x66, 0x66);
-    constexpr COLORREF kColorLogBack = RGB(0xF2, 0xF2, 0xF2);
+    // 现代浅色石板蓝（Slate & Cobalt）配色体系，与主窗口保持一致
+    constexpr COLORREF kColorBgCanvas = RGB(0xF1, 0xF5, 0xF9);
+    constexpr COLORREF kColorCardBg = RGB(0xFF, 0xFF, 0xFF);
+    constexpr COLORREF kColorCardHeaderBg = RGB(0xF8, 0xFA, 0xFC);
+    constexpr COLORREF kColorCardBorder = RGB(0xCB, 0xD5, 0xE1);
+    constexpr COLORREF kColorText = RGB(0x0F, 0x17, 0x2A);
+    constexpr COLORREF kColorMuted = RGB(0x64, 0x74, 0x8B);
+    constexpr COLORREF kColorAccent = RGB(0x25, 0x63, 0xEB);
+    constexpr COLORREF kColorAccentHover = RGB(0x1D, 0x4E, 0xD8);
+    constexpr COLORREF kColorAccentPress = RGB(0x1E, 0x40, 0xAF);
+    constexpr COLORREF kColorBtnBg = RGB(0xF8, 0xFA, 0xFC);
+    constexpr COLORREF kColorBtnHover = RGB(0xF1, 0xF5, 0xF9);
+    constexpr COLORREF kColorBtnPress = RGB(0xE2, 0xE8, 0xF0);
+    constexpr COLORREF kColorBtnBorder = RGB(0xCB, 0xD5, 0xE1);
+    constexpr COLORREF kColorBtnDisabledBg = RGB(0xF1, 0xF5, 0xF9);
+    constexpr COLORREF kColorBtnDisabledText = RGB(0x94, 0xA3, 0xB8);
+    constexpr COLORREF kColorOk = RGB(0x15, 0x80, 0x3D);
+    constexpr COLORREF kColorBad = RGB(0xDC, 0x26, 0x26);
+    constexpr COLORREF kColorLogBack = RGB(0xF8, 0xFA, 0xFC);
+    constexpr COLORREF kColorRowStripe = RGB(0xF8, 0xFA, 0xFC);
 
     // 一次任务更新的载荷。字段全部是值传递，界面线程不碰工作线程的内存。
     struct TaskUpdateMessage
@@ -174,8 +192,15 @@ namespace
         HWND BackButton = nullptr;
 
         HFONT FontUi = nullptr;
+        HFONT FontBold = nullptr;
         HFONT FontLog = nullptr;
+        HBRUSH WhiteBrush = nullptr;
         HBRUSH LogBrush = nullptr;
+
+        RECT TopCardRect{};
+        RECT LogCardRect{};
+        RECT ListCardRect{};
+        RECT BottomCardRect{};
 
         std::wstring GameDirectory;
         std::wstring SourceDirectory;
@@ -1802,6 +1827,251 @@ namespace
         UpdateSummary(context);
     }
 
+    // ---------- 现代按钮自绘与画布渲染 ----------
+
+    struct RestoreButtonSubData
+    {
+        WNDPROC OldProc = nullptr;
+        HFONT Font = nullptr;
+        HFONT FontBold = nullptr;
+        bool Primary = false;
+        bool Hover = false;
+        bool Pressed = false;
+        bool Tracking = false;
+    };
+
+    LRESULT CALLBACK ModernRestoreButtonWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        RestoreButtonSubData* data =
+            reinterpret_cast<RestoreButtonSubData*>(::GetPropW(hwnd, L"YuaRestoreBtnData"));
+        if (!data)
+        {
+            return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+
+        switch (msg)
+        {
+            case WM_MOUSEMOVE:
+            {
+                if (!data->Tracking)
+                {
+                    TRACKMOUSEEVENT tme{};
+                    tme.cbSize = sizeof(tme);
+                    tme.dwFlags = TME_LEAVE;
+                    tme.hwndTrack = hwnd;
+                    ::TrackMouseEvent(&tme);
+                    data->Tracking = true;
+                }
+                if (!data->Hover)
+                {
+                    data->Hover = true;
+                    ::InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                break;
+            }
+            case WM_MOUSELEAVE:
+            {
+                data->Tracking = false;
+                if (data->Hover)
+                {
+                    data->Hover = false;
+                    ::InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+            case WM_ERASEBKGND:
+                return 1;
+
+            case BM_SETSTATE:
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_LBUTTONDBLCLK:
+            case WM_SETFOCUS:
+            case WM_KILLFOCUS:
+            case WM_ENABLE:
+            case WM_SETTEXT:
+            {
+                if (msg == BM_SETSTATE)
+                {
+                    data->Pressed = (wParam != 0);
+                }
+                ::SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+                const LRESULT res = ::CallWindowProcW(data->OldProc, hwnd, msg, wParam, lParam);
+                ::SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+                ::InvalidateRect(hwnd, nullptr, FALSE);
+                return res;
+            }
+
+            case WM_PAINT:
+            {
+                PAINTSTRUCT ps{};
+                HDC targetDc = ::BeginPaint(hwnd, &ps);
+                RECT rc{};
+                ::GetClientRect(hwnd, &rc);
+                const int w = rc.right - rc.left;
+                const int h = rc.bottom - rc.top;
+                if (w > 0 && h > 0)
+                {
+                    HDC memDc = ::CreateCompatibleDC(targetDc);
+                    HBITMAP memBmp = ::CreateCompatibleBitmap(targetDc, w, h);
+                    HGDIOBJ oldBmp = ::SelectObject(memDc, memBmp);
+
+                    HBRUSH parentBrush = ::CreateSolidBrush(kColorCardBg);
+                    ::FillRect(memDc, &rc, parentBrush);
+                    ::DeleteObject(parentBrush);
+
+                    const bool enabled = ::IsWindowEnabled(hwnd) != FALSE;
+                    const bool pressed = data->Pressed;
+                    const bool hover = data->Hover && enabled;
+
+                    COLORREF fill = kColorBtnBg;
+                    COLORREF border = kColorBtnBorder;
+                    COLORREF textColor = kColorText;
+                    bool useBold = false;
+
+                    if (!enabled)
+                    {
+                        fill = kColorBtnDisabledBg;
+                        border = RGB(0xE2, 0xE8, 0xF0);
+                        textColor = kColorBtnDisabledText;
+                    }
+                    else if (data->Primary)
+                    {
+                        fill = pressed ? kColorAccentPress : (hover ? kColorAccentHover : kColorAccent);
+                        border = fill;
+                        textColor = RGB(0xFF, 0xFF, 0xFF);
+                        useBold = true;
+                    }
+                    else
+                    {
+                        fill = pressed ? kColorBtnPress : (hover ? kColorBtnHover : kColorBtnBg);
+                        border = hover ? RGB(0x94, 0xA3, 0xB8) : kColorBtnBorder;
+                        textColor = kColorText;
+                    }
+
+                    HBRUSH fillBrush = ::CreateSolidBrush(fill);
+                    HPEN borderPen = ::CreatePen(PS_SOLID, 1, border);
+                    HGDIOBJ oldBrush = ::SelectObject(memDc, fillBrush);
+                    HGDIOBJ oldPen = ::SelectObject(memDc, borderPen);
+                    ::RoundRect(memDc, 0, 0, w, h, 6, 6);
+                    ::SelectObject(memDc, oldPen);
+                    ::SelectObject(memDc, oldBrush);
+                    ::DeleteObject(borderPen);
+                    ::DeleteObject(fillBrush);
+
+                    wchar_t text[128]{};
+                    ::GetWindowTextW(hwnd, text, _countof(text));
+                    ::SetBkMode(memDc, TRANSPARENT);
+                    ::SetTextColor(memDc, textColor);
+                    HGDIOBJ oldFont = ::SelectObject(memDc, useBold ? data->FontBold : data->Font);
+                    RECT textRc = rc;
+                    if (pressed && enabled)
+                    {
+                        ::OffsetRect(&textRc, 0, 1);
+                    }
+                    ::DrawTextW(memDc, text, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    ::SelectObject(memDc, oldFont);
+
+                    ::BitBlt(targetDc, 0, 0, w, h, memDc, 0, 0, SRCCOPY);
+                    ::SelectObject(memDc, oldBmp);
+                    ::DeleteObject(memBmp);
+                    ::DeleteDC(memDc);
+                }
+                ::EndPaint(hwnd, &ps);
+                return 0;
+            }
+            case WM_NCDESTROY:
+            {
+                WNDPROC oldProc = data->OldProc;
+                ::RemovePropW(hwnd, L"YuaRestoreBtnData");
+                delete data;
+                return ::CallWindowProcW(oldProc, hwnd, msg, wParam, lParam);
+            }
+            default:
+                break;
+        }
+        return ::CallWindowProcW(data->OldProc, hwnd, msg, wParam, lParam);
+    }
+
+    void SubclassRestoreButton(HWND hwnd, bool primary, HFONT font, HFONT fontBold)
+    {
+        if (!hwnd)
+        {
+            return;
+        }
+        RestoreButtonSubData* data = new (std::nothrow) RestoreButtonSubData();
+        if (!data)
+        {
+            return;
+        }
+        data->Font = font;
+        data->FontBold = fontBold;
+        data->Primary = primary;
+        data->OldProc = reinterpret_cast<WNDPROC>(
+            ::SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ModernRestoreButtonWndProc)));
+        ::SetPropW(hwnd, L"YuaRestoreBtnData", reinterpret_cast<HANDLE>(data));
+    }
+
+    void DrawCardRect(HDC dc, const RECT& r, bool hasHeader)
+    {
+        if (r.right <= r.left || r.bottom <= r.top)
+        {
+            return;
+        }
+        HBRUSH cardBrush = ::CreateSolidBrush(kColorCardBg);
+        HPEN borderPen = ::CreatePen(PS_SOLID, 1, kColorCardBorder);
+        HGDIOBJ oldBrush = ::SelectObject(dc, cardBrush);
+        HGDIOBJ oldPen = ::SelectObject(dc, borderPen);
+        ::RoundRect(dc, r.left, r.top, r.right, r.bottom, 8, 8);
+        if (hasHeader && (r.bottom - r.top) > kSplitTitleHeight + 6)
+        {
+            HBRUSH hdrBrush = ::CreateSolidBrush(kColorCardHeaderBg);
+            RECT hdrFill{ r.left + 1, r.top + 3, r.right - 1, r.top + kSplitTitleHeight + 4 };
+            ::FillRect(dc, &hdrFill, hdrBrush);
+            ::DeleteObject(hdrBrush);
+            ::MoveToEx(dc, r.left + 1, r.top + kSplitTitleHeight + 4, nullptr);
+            ::LineTo(dc, r.right - 1, r.top + kSplitTitleHeight + 4);
+        }
+        ::SelectObject(dc, oldPen);
+        ::SelectObject(dc, oldBrush);
+        ::DeleteObject(borderPen);
+        ::DeleteObject(cardBrush);
+    }
+
+    void PaintRestoreCanvas(HDC targetDc, const UiContext* context)
+    {
+        if (!context || !context->Window)
+        {
+            return;
+        }
+        RECT client{};
+        ::GetClientRect(context->Window, &client);
+        const int w = client.right - client.left;
+        const int h = client.bottom - client.top;
+        if (w <= 0 || h <= 0)
+        {
+            return;
+        }
+
+        HDC memDc = ::CreateCompatibleDC(targetDc);
+        HBITMAP memBmp = ::CreateCompatibleBitmap(targetDc, w, h);
+        HGDIOBJ oldBmp = ::SelectObject(memDc, memBmp);
+
+        HBRUSH bgBrush = ::CreateSolidBrush(kColorBgCanvas);
+        ::FillRect(memDc, &client, bgBrush);
+        ::DeleteObject(bgBrush);
+
+        DrawCardRect(memDc, context->TopCardRect, false);
+        DrawCardRect(memDc, context->LogCardRect, true);
+        DrawCardRect(memDc, context->ListCardRect, true);
+        DrawCardRect(memDc, context->BottomCardRect, false);
+
+        ::BitBlt(targetDc, 0, 0, w, h, memDc, 0, 0, SRCCOPY);
+        ::SelectObject(memDc, oldBmp);
+        ::DeleteObject(memBmp);
+        ::DeleteDC(memDc);
+    }
+
     // ---------- 布局 ----------
 
     void InitializeTaskListColumns(HWND listView)
@@ -1810,16 +2080,16 @@ namespace
         column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
         column.pszText = const_cast<LPWSTR>(L"封包");
-        column.cx = 130;
+        column.cx = 136;
         ListView_InsertColumn(listView, 0, &column);
 
         column.pszText = const_cast<LPWSTR>(L"状态");
-        column.cx = 70;
+        column.cx = 76;
         column.iSubItem = 1;
         ListView_InsertColumn(listView, 1, &column);
 
         column.pszText = const_cast<LPWSTR>(L"进度");
-        column.cx = 110;
+        column.cx = 114;
         column.iSubItem = 2;
         ListView_InsertColumn(listView, 2, &column);
 
@@ -1829,12 +2099,11 @@ namespace
         ListView_InsertColumn(listView, 3, &column);
 
         column.pszText = const_cast<LPWSTR>(L"详细信息");
-        column.cx = 200;
+        column.cx = 220;
         column.iSubItem = 4;
         ListView_InsertColumn(listView, 4, &column);
 
-        ListView_SetExtendedListViewStyle(listView, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES |
-                                                        LVS_EX_DOUBLEBUFFER);
+        ListView_SetExtendedListViewStyle(listView, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     }
 
     void MoveControl(HWND control, int x, int y, int width, int height)
@@ -1851,57 +2120,76 @@ namespace
         ::GetClientRect(context->Window, &client);
         const int width = client.right - client.left;
         const int height = client.bottom - client.top;
-        const int contentRight = width - kMargin;
+        const int cardLeft = kMargin;
+        const int cardRight = width - kMargin;
+        const int innerLeft = cardLeft + 12;
+        const int innerRight = cardRight - 12;
+        const int innerWidth = innerRight - innerLeft;
 
+        // 1. 顶部配置与总进度卡片
         int y = kMargin;
-        MoveControl(context->OutputLabel, kMargin, y + 3, kOutputLabelWidth, kRowHeight - 4);
+        const int topCardTop = y;
+        y += 10;
+        MoveControl(context->OutputLabel, innerLeft, y + 4, kOutputLabelWidth, kRowHeight - 4);
         const int workerBlock = kWorkerLabelWidth + 4 + kWorkerEditWidth;
-        const int outputWidth = std::max(140, contentRight - kMargin - kOutputLabelWidth - 20 - workerBlock);
-        MoveControl(context->OutputEdit, kMargin + kOutputLabelWidth, y, outputWidth, kRowHeight);
-        MoveControl(context->WorkerLabel, kMargin + kOutputLabelWidth + outputWidth + 20,
-                    y + 3, kWorkerLabelWidth, kRowHeight - 4);
-        MoveControl(context->WorkerEdit, kMargin + kOutputLabelWidth + outputWidth + 20 + kWorkerLabelWidth + 4,
+        const int outputWidth = std::max(140, innerWidth - kOutputLabelWidth - 20 - workerBlock);
+        MoveControl(context->OutputEdit, innerLeft + kOutputLabelWidth, y, outputWidth, kRowHeight);
+        MoveControl(context->WorkerLabel, innerLeft + kOutputLabelWidth + outputWidth + 20,
+                    y + 4, kWorkerLabelWidth, kRowHeight - 4);
+        MoveControl(context->WorkerEdit, innerLeft + kOutputLabelWidth + outputWidth + 20 + kWorkerLabelWidth + 4,
                     y, kWorkerEditWidth, kRowHeight);
-        y += kRowHeight + kRowGap;
+        y += kRowHeight + 8;
 
-        MoveControl(context->StatusText, kMargin, y, width - kMargin * 2, 20);
+        MoveControl(context->StatusText, innerLeft, y, innerWidth, 20);
         y += 22;
 
-        MoveControl(context->ProgressBar, kMargin, y, width - kMargin * 2, kProgressHeight);
-        y += kProgressHeight + kRowGap;
+        MoveControl(context->ProgressBar, innerLeft, y, innerWidth, kProgressHeight);
+        y += kProgressHeight + 10;
+        context->TopCardRect = RECT{ cardLeft, topCardTop, cardRight, y };
+        y += 8;
 
-        // 底部固定：复选框两行 + 按钮一行。
-        const int bottomY = height - kMargin - kButtonHeight;
-        const int checkTop = bottomY - kCheckHeight * 2 - 6;
-        const int listBottom = checkTop - kRowGap;
+        // 4. 底部操作卡片：复选框两行 + 按钮一行
+        const int bottomCardHeight = kCheckHeight * 2 + 8 + kButtonHeight + 20;
+        const int bottomCardTop = height - kMargin - bottomCardHeight;
+        context->BottomCardRect = RECT{ cardLeft, bottomCardTop, cardRight, height - kMargin };
 
-        MoveControl(context->LogLabel, kMargin, y, 200, kSplitTitleHeight - 4);
-        y += kSplitTitleHeight;
+        const int checkTop = bottomCardTop + 10;
+        const int bottomY = checkTop + kCheckHeight * 2 + 6;
+        const int listCardBottom = bottomCardTop - 8;
 
-        const int remaining = listBottom - y;
-        const int logHeight = std::max(kMinLogHeight, (remaining - kSplitTitleHeight) * 55 / 100);
+        // 2 & 3. 中间两张卡片：详细日志 + 任务概览
+        const int availableMid = listCardBottom - y - 8;
+        const int logCardHeight = std::max(kMinLogHeight + kSplitTitleHeight + 16, availableMid * 48 / 100);
+        context->LogCardRect = RECT{ cardLeft, y, cardRight, y + logCardHeight };
+        MoveControl(context->LogLabel, innerLeft, y + 6, 220, kSplitTitleHeight - 4);
+        MoveControl(context->LogView, innerLeft, y + kSplitTitleHeight + 10, innerWidth,
+                    std::max(kMinLogHeight, logCardHeight - kSplitTitleHeight - 18));
+        y += logCardHeight + 8;
 
-        MoveControl(context->LogView, kMargin, y, width - kMargin * 2, logHeight);
-        y += logHeight + kRowGap;
-
-        MoveControl(context->ListLabel, kMargin, y, 200, kSplitTitleHeight - 4);
-        y += kSplitTitleHeight;
-
-        MoveControl(context->TaskList, kMargin, y, width - kMargin * 2,
-                    std::max(kMinListHeight, listBottom - y));
+        const int listCardHeight = std::max(kMinListHeight + kSplitTitleHeight + 16, listCardBottom - y);
+        context->ListCardRect = RECT{ cardLeft, y, cardRight, y + listCardHeight };
+        MoveControl(context->ListLabel, innerLeft, y + 6, 220, kSplitTitleHeight - 4);
+        const int listViewHeight = std::max(kMinListHeight, listCardHeight - kSplitTitleHeight - 18);
+        MoveControl(context->TaskList, innerLeft, y + kSplitTitleHeight + 10, innerWidth, listViewHeight);
+        if (context->TaskList && innerWidth > 570)
+        {
+            ListView_SetColumnWidth(context->TaskList, 4, innerWidth - 556 - 20);
+        }
 
         // 复选框的文字不短（第二个要如实描述机制，更长），给足宽度：
-        // 按 contentRight 的 85% 排，最小 460 —— 折行了就成两行文字，看着像排版坏了。
-        const int checkWidth = std::max(460, (contentRight - kMargin) * 85 / 100);
-        MoveControl(context->KeepCheck, kMargin, checkTop, checkWidth, kCheckHeight);
-        MoveControl(context->InferCheck, kMargin, checkTop + kCheckHeight, checkWidth, kCheckHeight);
+        const int checkWidth = std::max(460, innerWidth);
+        MoveControl(context->KeepCheck, innerLeft, checkTop, checkWidth, kCheckHeight);
+        MoveControl(context->InferCheck, innerLeft, checkTop + kCheckHeight + 2, checkWidth, kCheckHeight);
 
-        int buttonX = contentRight - kButtonWidth;
+        int buttonX = innerRight - kButtonWidth;
         MoveControl(context->BackButton, buttonX, bottomY, kButtonWidth, kButtonHeight);
         buttonX -= kButtonWidth + kRowGap;
         MoveControl(context->OpenDirButton, buttonX, bottomY, kButtonWidth, kButtonHeight);
         buttonX -= kButtonWidth + kRowGap;
         MoveControl(context->StartButton, buttonX, bottomY, kButtonWidth, kButtonHeight);
+
+        ::RedrawWindow(context->Window, nullptr, nullptr,
+                       RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
     }
 
     // ---------- 控件创建 ----------
@@ -1925,14 +2213,17 @@ namespace
 
         context->OutputLabel =
             CreateChild(window, context, L"STATIC", L"还原输出目录", SS_LEFT, 0, IDC_RS_OUTPUT_LABEL);
+        ::SendMessageW(context->OutputLabel, WM_SETFONT, reinterpret_cast<WPARAM>(context->FontBold), TRUE);
         context->OutputEdit = CreateChild(window, context, L"EDIT", L"",
-                                          WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
+                                          WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 0,
                                           IDC_RS_OUTPUT_EDIT);
+        ::SendMessageW(context->OutputEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(6, 6));
         context->WorkerLabel =
             CreateChild(window, context, L"STATIC", L"工作线程", SS_LEFT, 0, IDC_RS_WORKER_LABEL);
+        ::SendMessageW(context->WorkerLabel, WM_SETFONT, reinterpret_cast<WPARAM>(context->FontBold), TRUE);
         context->WorkerEdit = CreateChild(window, context, L"EDIT", L"4",
                                           WS_BORDER | ES_NUMBER | ES_CENTER | WS_TABSTOP,
-                                          WS_EX_CLIENTEDGE, IDC_RS_WORKER_EDIT);
+                                          0, IDC_RS_WORKER_EDIT);
 
         context->StatusText = CreateChild(window, context, L"STATIC", L"总任务 0 | 运行中 0 | 排队 0 | 完成 0 | 失败 0",
                                           SS_LEFT, 0, IDC_RS_STATUS);
@@ -1941,18 +2232,20 @@ namespace
                                            PBS_SMOOTH, 0, IDC_RS_PROGRESS);
         ::SendMessageW(context->ProgressBar, PBM_SETRANGE32, 0, 100);
 
-        // 两个分组标题只是"分开两块区域"的视觉分隔，不是交互控件。
-        context->LogLabel = CreateChild(window, context, L"STATIC", L"详细日志", SS_LEFT, 0, IDC_RS_LOG_LABEL);
+        // 两个分组标题用卡片标题条视觉呈现
+        context->LogLabel = CreateChild(window, context, L"STATIC", L"▎ 详细日志", SS_LEFT, 0, IDC_RS_LOG_LABEL);
+        ::SendMessageW(context->LogLabel, WM_SETFONT, reinterpret_cast<WPARAM>(context->FontBold), TRUE);
         context->LogView = CreateChild(window, context, L"EDIT", L"",
                                        WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                                       WS_EX_CLIENTEDGE, IDC_RS_LOG);
+                                       0, IDC_RS_LOG);
         if (context->LogView)
         {
             ::SendMessageW(context->LogView, WM_SETFONT, reinterpret_cast<WPARAM>(context->FontLog), TRUE);
         }
 
-        context->ListLabel = CreateChild(window, context, L"STATIC", L"任务概览", SS_LEFT, 0,
+        context->ListLabel = CreateChild(window, context, L"STATIC", L"▎ 任务概览", SS_LEFT, 0,
                                          IDC_RS_LIST_LABEL);
+        ::SendMessageW(context->ListLabel, WM_SETFONT, reinterpret_cast<WPARAM>(context->FontBold), TRUE);
         context->TaskList = CreateChild(window, context, WC_LISTVIEWW, L"",
                                         LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP |
                                             WS_BORDER,
@@ -1973,10 +2266,15 @@ namespace
 
         context->StartButton = CreateChild(window, context, L"BUTTON", L"开始", BS_PUSHBUTTON | WS_TABSTOP, 0,
                                            IDC_RS_START);
+        SubclassRestoreButton(context->StartButton, true, context->FontUi, context->FontBold);
+
         context->OpenDirButton = CreateChild(window, context, L"BUTTON", L"打开还原目录",
                                              BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_RS_OPEN_DIR);
+        SubclassRestoreButton(context->OpenDirButton, false, context->FontUi, context->FontBold);
+
         context->BackButton = CreateChild(window, context, L"BUTTON", L"返回主程序",
                                           BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_RS_BACK);
+        SubclassRestoreButton(context->BackButton, false, context->FontUi, context->FontBold);
     }
 
     // ---------- 窗口过程 ----------
@@ -2134,6 +2432,29 @@ namespace
                 return 0;
             }
 
+            case WM_ERASEBKGND:
+            {
+                if (context)
+                {
+                    PaintRestoreCanvas(reinterpret_cast<HDC>(wParam), context);
+                    return 1;
+                }
+                break;
+            }
+
+            case WM_PAINT:
+            {
+                if (context)
+                {
+                    PAINTSTRUCT ps{};
+                    HDC dc = ::BeginPaint(hwnd, &ps);
+                    PaintRestoreCanvas(dc, context);
+                    ::EndPaint(hwnd, &ps);
+                    return 0;
+                }
+                break;
+            }
+
             case WM_SIZE:
             {
                 if (context)
@@ -2146,17 +2467,100 @@ namespace
             case WM_GETMINMAXINFO:
             {
                 MINMAXINFO* info = reinterpret_cast<MINMAXINFO*>(lParam);
-                info->ptMinTrackSize.x = 720;
-                info->ptMinTrackSize.y = 620;
+                info->ptMinTrackSize.x = 760;
+                info->ptMinTrackSize.y = 640;
                 return 0;
             }
 
-            case WM_CTLCOLORSTATIC:
+            case WM_NOTIFY:
             {
-                if (context && reinterpret_cast<HWND>(lParam) == context->LogView)
+                if (!context)
                 {
-                    ::SetBkColor(reinterpret_cast<HDC>(wParam), kColorLogBack);
-                    return reinterpret_cast<LRESULT>(context->LogBrush);
+                    break;
+                }
+                const NMHDR* hdr = reinterpret_cast<const NMHDR*>(lParam);
+                if (hdr && hdr->idFrom == IDC_RS_LIST && hdr->code == NM_CUSTOMDRAW)
+                {
+                    NMLVCUSTOMDRAW* cd = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
+                    switch (cd->nmcd.dwDrawStage)
+                    {
+                        case CDDS_PREPAINT:
+                            return CDRF_NOTIFYITEMDRAW;
+                        case CDDS_ITEMPREPAINT:
+                        {
+                            const int row = static_cast<int>(cd->nmcd.dwItemSpec);
+                            cd->clrTextBk = (row % 2 == 1) ? kColorRowStripe : kColorCardBg;
+                            cd->clrText = kColorText;
+                            return CDRF_NOTIFYSUBITEMDRAW;
+                        }
+                        case CDDS_ITEMPREPAINT | CDDS_SUBITEM:
+                        {
+                            const int row = static_cast<int>(cd->nmcd.dwItemSpec);
+                            cd->clrTextBk = (row % 2 == 1) ? kColorRowStripe : kColorCardBg;
+                            cd->clrText = kColorText;
+                            if (cd->iSubItem == 1)
+                            {
+                                const unsigned int taskId = static_cast<unsigned int>(cd->nmcd.lItemlParam);
+                                ScopedCriticalSection guard(&context->QueueLock);
+                                const int idx = FindTaskIndexLocked(context, taskId);
+                                if (idx >= 0)
+                                {
+                                    const RestoreTaskState st = context->Tasks[static_cast<size_t>(idx)].State;
+                                    if (st == kStateCompleted)
+                                    {
+                                        cd->clrText = kColorOk;
+                                    }
+                                    else if (st == kStateRunning)
+                                    {
+                                        cd->clrText = kColorAccent;
+                                    }
+                                    else if (st == kStateFailed)
+                                    {
+                                        cd->clrText = kColorBad;
+                                    }
+                                    else
+                                    {
+                                        cd->clrText = kColorMuted;
+                                    }
+                                }
+                            }
+                            return CDRF_NEWFONT;
+                        }
+                        default:
+                            break;
+                    }
+                }
+                break;
+            }
+
+            case WM_CTLCOLORSTATIC:
+            case WM_CTLCOLOREDIT:
+            {
+                if (context)
+                {
+                    HWND ctrl = reinterpret_cast<HWND>(lParam);
+                    HDC dc = reinterpret_cast<HDC>(wParam);
+                    if (ctrl == context->LogView)
+                    {
+                        ::SetTextColor(dc, kColorText);
+                        ::SetBkColor(dc, kColorLogBack);
+                        return reinterpret_cast<LRESULT>(context->LogBrush);
+                    }
+                    if (ctrl == context->LogLabel || ctrl == context->ListLabel)
+                    {
+                        ::SetTextColor(dc, kColorText);
+                        ::SetBkColor(dc, kColorCardHeaderBg);
+                        return reinterpret_cast<LRESULT>(context->LogBrush);
+                    }
+                    if (ctrl == context->StatusText)
+                    {
+                        ::SetTextColor(dc, kColorMuted);
+                        ::SetBkColor(dc, kColorCardBg);
+                        return reinterpret_cast<LRESULT>(context->WhiteBrush);
+                    }
+                    ::SetTextColor(dc, kColorText);
+                    ::SetBkColor(dc, kColorCardBg);
+                    return reinterpret_cast<LRESULT>(context->WhiteBrush);
                 }
                 break;
             }
@@ -2306,9 +2710,17 @@ namespace
                     {
                         ::DeleteObject(context->FontUi);
                     }
+                    if (context->FontBold)
+                    {
+                        ::DeleteObject(context->FontBold);
+                    }
                     if (context->FontLog)
                     {
                         ::DeleteObject(context->FontLog);
+                    }
+                    if (context->WhiteBrush)
+                    {
+                        ::DeleteObject(context->WhiteBrush);
                     }
                     if (context->LogBrush)
                     {
@@ -2409,7 +2821,9 @@ HWND ShowRestoreWindow(HINSTANCE instance, const WindowOptions& options)
         ? options.SourceDirectory
         : TrimTrailingSeparators(options.DefaultOutputDirectory);
     context->FontUi = CreateUiFont(9, false, L"微软雅黑");
+    context->FontBold = CreateUiFont(9, true, L"微软雅黑");
     context->FontLog = CreateUiFont(9, false, L"Consolas");
+    context->WhiteBrush = ::CreateSolidBrush(kColorCardBg);
     context->LogBrush = ::CreateSolidBrush(kColorLogBack);
     ::InitializeCriticalSection(&context->QueueLock);
     context->StopEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -2434,8 +2848,8 @@ HWND ShowRestoreWindow(HINSTANCE instance, const WindowOptions& options)
 
     // 宽高按图2 的比例给：顶部一行、统计行、日志、任务列表、复选框、按钮。
     RECT ownerRect{};
-    int width = 780;
-    int height = 740;
+    int width = 840;
+    int height = 760;
     int left = CW_USEDEFAULT;
     int top = CW_USEDEFAULT;
     if (options.Owner && ::GetWindowRect(options.Owner, &ownerRect))
@@ -2457,9 +2871,17 @@ HWND ShowRestoreWindow(HINSTANCE instance, const WindowOptions& options)
         {
             ::DeleteObject(context->FontUi);
         }
+        if (context->FontBold)
+        {
+            ::DeleteObject(context->FontBold);
+        }
         if (context->FontLog)
         {
             ::DeleteObject(context->FontLog);
+        }
+        if (context->WhiteBrush)
+        {
+            ::DeleteObject(context->WhiteBrush);
         }
         if (context->LogBrush)
         {

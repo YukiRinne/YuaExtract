@@ -37,6 +37,23 @@ namespace
     // 节流到 100ms 一条后总量降到几百条，队列不可能再被打满。
     constexpr DWORD kProgressThrottleMs = 100u;
 
+    // 现代浅色石板蓝（Slate & Cobalt）配色体系
+    constexpr COLORREF kColorBgCanvas = RGB(0xF1, 0xF5, 0xF9);
+    constexpr COLORREF kColorCardBg = RGB(0xFF, 0xFF, 0xFF);
+    constexpr COLORREF kColorCardBorder = RGB(0xCB, 0xD5, 0xE1);
+    constexpr COLORREF kColorText = RGB(0x0F, 0x17, 0x2A);
+    constexpr COLORREF kColorMuted = RGB(0x64, 0x74, 0x8B);
+    constexpr COLORREF kColorAccent = RGB(0x25, 0x63, 0xEB);
+    constexpr COLORREF kColorAccentHover = RGB(0x1D, 0x4E, 0xD8);
+    constexpr COLORREF kColorAccentPress = RGB(0x1E, 0x40, 0xAF);
+    constexpr COLORREF kColorBtnBg = RGB(0xF8, 0xFA, 0xFC);
+    constexpr COLORREF kColorBtnHover = RGB(0xF1, 0xF5, 0xF9);
+    constexpr COLORREF kColorBtnPress = RGB(0xE2, 0xE8, 0xF0);
+    constexpr COLORREF kColorBtnBorder = RGB(0xCB, 0xD5, 0xE1);
+    constexpr COLORREF kColorOk = RGB(0x15, 0x80, 0x3D);
+    constexpr COLORREF kColorBad = RGB(0xDC, 0x26, 0x26);
+    constexpr COLORREF kColorRowStripe = RGB(0xF8, 0xFA, 0xFC);
+
     enum class UiTaskState
     {
         Queued,
@@ -95,6 +112,11 @@ namespace
         HWND NotifyPopup;
         HWND NotifySound;
         HWND WorkerInfo;
+        HFONT FontUi;
+        HFONT FontBold;
+        HBRUSH WhiteBrush;
+        RECT TopCardRect;
+        RECT ListCardRect;
         CRITICAL_SECTION QueueLock;
         CRITICAL_SECTION LogLock;
         HANDLE QueueEvent;
@@ -704,7 +726,7 @@ namespace
                                            failedCount);
         ::SetWindowTextW(context->StatusText, status.c_str());
 
-        std::wstring title = FormatString(L"Cxdec Batch Extractor - 运行中 %ld / 排队 %u / 完成 %u",
+        std::wstring title = FormatString(L"YuaExtract - XP3 批量解包器 - 运行中 %ld / 排队 %u / 完成 %u",
                                           context->ActiveWorkers,
                                           queuedCount,
                                           finishedCount);
@@ -874,31 +896,340 @@ namespace
         PostTaskUpdate((UiContext*)context, taskId, state, current, total, packagePath, detail);
     }
 
+    HFONT CreateExtractorFont(int pointSize, bool bold)
+    {
+        LOGFONTW lf{};
+        lf.lfHeight = -::MulDiv(pointSize, 96, 72);
+        lf.lfWeight = bold ? FW_SEMIBOLD : FW_NORMAL;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        lf.lfQuality = CLEARTYPE_QUALITY;
+        ::wcscpy_s(lf.lfFaceName, L"微软雅黑");
+        return ::CreateFontIndirectW(&lf);
+    }
+
+    struct ExtractorButtonSubData
+    {
+        WNDPROC OldProc = nullptr;
+        HFONT Font = nullptr;
+        HFONT FontBold = nullptr;
+        bool Primary = false;
+        bool Hover = false;
+        bool Pressed = false;
+        bool Tracking = false;
+    };
+
+    LRESULT CALLBACK ModernExtractorButtonWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        ExtractorButtonSubData* data =
+            reinterpret_cast<ExtractorButtonSubData*>(::GetPropW(hwnd, L"YuaExtBtnData"));
+        if (!data)
+        {
+            return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+
+        switch (msg)
+        {
+            case WM_MOUSEMOVE:
+            {
+                if (!data->Tracking)
+                {
+                    TRACKMOUSEEVENT tme{};
+                    tme.cbSize = sizeof(tme);
+                    tme.dwFlags = TME_LEAVE;
+                    tme.hwndTrack = hwnd;
+                    ::TrackMouseEvent(&tme);
+                    data->Tracking = true;
+                }
+                if (!data->Hover)
+                {
+                    data->Hover = true;
+                    ::InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                break;
+            }
+            case WM_MOUSELEAVE:
+            {
+                data->Tracking = false;
+                if (data->Hover)
+                {
+                    data->Hover = false;
+                    ::InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+            case WM_ERASEBKGND:
+                return 1;
+
+            case BM_SETSTATE:
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_LBUTTONDBLCLK:
+            case WM_SETFOCUS:
+            case WM_KILLFOCUS:
+            case WM_ENABLE:
+            case WM_SETTEXT:
+            {
+                if (msg == BM_SETSTATE)
+                {
+                    data->Pressed = (wParam != 0);
+                }
+                ::SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+                const LRESULT res = ::CallWindowProcW(data->OldProc, hwnd, msg, wParam, lParam);
+                ::SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+                ::InvalidateRect(hwnd, nullptr, FALSE);
+                return res;
+            }
+
+            case WM_PAINT:
+            {
+                PAINTSTRUCT ps{};
+                HDC targetDc = ::BeginPaint(hwnd, &ps);
+                RECT rc{};
+                ::GetClientRect(hwnd, &rc);
+                const int w = rc.right - rc.left;
+                const int h = rc.bottom - rc.top;
+                if (w > 0 && h > 0)
+                {
+                    HDC memDc = ::CreateCompatibleDC(targetDc);
+                    HBITMAP memBmp = ::CreateCompatibleBitmap(targetDc, w, h);
+                    HGDIOBJ oldBmp = ::SelectObject(memDc, memBmp);
+
+                    HBRUSH parentBrush = ::CreateSolidBrush(kColorCardBg);
+                    ::FillRect(memDc, &rc, parentBrush);
+                    ::DeleteObject(parentBrush);
+
+                    const bool enabled = ::IsWindowEnabled(hwnd) != FALSE;
+                    const bool pressed = data->Pressed;
+                    const bool hover = data->Hover && enabled;
+
+                    COLORREF fill = kColorBtnBg;
+                    COLORREF border = kColorBtnBorder;
+                    COLORREF textColor = kColorText;
+                    bool useBold = false;
+
+                    if (data->Primary)
+                    {
+                        fill = pressed ? kColorAccentPress : (hover ? kColorAccentHover : kColorAccent);
+                        border = fill;
+                        textColor = RGB(0xFF, 0xFF, 0xFF);
+                        useBold = true;
+                    }
+                    else
+                    {
+                        fill = pressed ? kColorBtnPress : (hover ? kColorBtnHover : kColorBtnBg);
+                        border = hover ? RGB(0x94, 0xA3, 0xB8) : kColorBtnBorder;
+                        textColor = kColorText;
+                    }
+
+                    HBRUSH fillBrush = ::CreateSolidBrush(fill);
+                    HPEN borderPen = ::CreatePen(PS_SOLID, 1, border);
+                    HGDIOBJ oldBrush = ::SelectObject(memDc, fillBrush);
+                    HGDIOBJ oldPen = ::SelectObject(memDc, borderPen);
+                    ::RoundRect(memDc, 0, 0, w, h, 6, 6);
+                    ::SelectObject(memDc, oldPen);
+                    ::SelectObject(memDc, oldBrush);
+                    ::DeleteObject(borderPen);
+                    ::DeleteObject(fillBrush);
+
+                    wchar_t text[128]{};
+                    ::GetWindowTextW(hwnd, text, _countof(text));
+                    ::SetBkMode(memDc, TRANSPARENT);
+                    ::SetTextColor(memDc, textColor);
+                    HGDIOBJ oldFont = ::SelectObject(memDc, useBold ? data->FontBold : data->Font);
+                    RECT textRc = rc;
+                    if (pressed && enabled)
+                    {
+                        ::OffsetRect(&textRc, 0, 1);
+                    }
+                    ::DrawTextW(memDc, text, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    ::SelectObject(memDc, oldFont);
+
+                    ::BitBlt(targetDc, 0, 0, w, h, memDc, 0, 0, SRCCOPY);
+                    ::SelectObject(memDc, oldBmp);
+                    ::DeleteObject(memBmp);
+                    ::DeleteDC(memDc);
+                }
+                ::EndPaint(hwnd, &ps);
+                return 0;
+            }
+            case WM_NCDESTROY:
+            {
+                WNDPROC oldProc = data->OldProc;
+                ::RemovePropW(hwnd, L"YuaExtBtnData");
+                delete data;
+                return ::CallWindowProcW(oldProc, hwnd, msg, wParam, lParam);
+            }
+            default:
+                break;
+        }
+        return ::CallWindowProcW(data->OldProc, hwnd, msg, wParam, lParam);
+    }
+
+    void SubclassExtractorButton(HWND hwnd, bool primary, HFONT font, HFONT fontBold)
+    {
+        if (!hwnd)
+        {
+            return;
+        }
+        ExtractorButtonSubData* data = new (std::nothrow) ExtractorButtonSubData();
+        if (!data)
+        {
+            return;
+        }
+        data->Font = font;
+        data->FontBold = fontBold;
+        data->Primary = primary;
+        data->OldProc = reinterpret_cast<WNDPROC>(
+            ::SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ModernExtractorButtonWndProc)));
+        ::SetPropW(hwnd, L"YuaExtBtnData", reinterpret_cast<HANDLE>(data));
+    }
+
+    void PaintExtractorCanvas(HDC targetDc, const UiContext* context)
+    {
+        if (!context || !context->Window)
+        {
+            return;
+        }
+        RECT client{};
+        ::GetClientRect(context->Window, &client);
+        const int w = client.right - client.left;
+        const int h = client.bottom - client.top;
+        if (w <= 0 || h <= 0)
+        {
+            return;
+        }
+
+        HDC memDc = ::CreateCompatibleDC(targetDc);
+        HBITMAP memBmp = ::CreateCompatibleBitmap(targetDc, w, h);
+        HGDIOBJ oldBmp = ::SelectObject(memDc, memBmp);
+
+        HBRUSH bgBrush = ::CreateSolidBrush(kColorBgCanvas);
+        ::FillRect(memDc, &client, bgBrush);
+        ::DeleteObject(bgBrush);
+
+        HBRUSH cardBrush = ::CreateSolidBrush(kColorCardBg);
+        HPEN borderPen = ::CreatePen(PS_SOLID, 1, kColorCardBorder);
+        HGDIOBJ oldBrush = ::SelectObject(memDc, cardBrush);
+        HGDIOBJ oldPen = ::SelectObject(memDc, borderPen);
+        if (context->TopCardRect.right > context->TopCardRect.left)
+        {
+            ::RoundRect(memDc, context->TopCardRect.left, context->TopCardRect.top,
+                        context->TopCardRect.right, context->TopCardRect.bottom, 8, 8);
+        }
+        if (context->ListCardRect.right > context->ListCardRect.left)
+        {
+            ::RoundRect(memDc, context->ListCardRect.left, context->ListCardRect.top,
+                        context->ListCardRect.right, context->ListCardRect.bottom, 8, 8);
+        }
+        ::SelectObject(memDc, oldPen);
+        ::SelectObject(memDc, oldBrush);
+        ::DeleteObject(borderPen);
+        ::DeleteObject(cardBrush);
+
+        ::BitBlt(targetDc, 0, 0, w, h, memDc, 0, 0, SRCCOPY);
+        ::SelectObject(memDc, oldBmp);
+        ::DeleteObject(memBmp);
+        ::DeleteDC(memDc);
+    }
+
+    void LayoutExtractorDialog(UiContext* context)
+    {
+        if (!context || !context->Window)
+        {
+            return;
+        }
+        RECT client{};
+        ::GetClientRect(context->Window, &client);
+        const int width = client.right - client.left;
+        const int height = client.bottom - client.top;
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        const int margin = 12;
+        const int cardLeft = margin;
+        const int cardRight = width - margin;
+        const int innerLeft = cardLeft + 12;
+        const int innerRight = cardRight - 12;
+        const int innerWidth = innerRight - innerLeft;
+
+        const int btnAddW = 90;
+        const int btnClearW = 94;
+        const int btnBrowseW = 94;
+        const int btnH = 26;
+
+        int y = margin + 10;
+        ::MoveWindow(::GetDlgItem(context->Window, IDC_DropHint), innerLeft, y + 4,
+                     std::max(160, innerWidth - btnAddW - btnClearW - 16), 20, TRUE);
+        ::MoveWindow(::GetDlgItem(context->Window, IDC_AddFiles), innerRight - btnClearW - 8 - btnAddW, y,
+                     btnAddW, btnH, TRUE);
+        ::MoveWindow(::GetDlgItem(context->Window, IDC_ClearCompleted), innerRight - btnClearW, y,
+                     btnClearW, btnH, TRUE);
+        y += btnH + 8;
+
+        if (HWND outputLabel = ::FindWindowExW(context->Window, nullptr, L"Static", L"输出目录"))
+        {
+            ::MoveWindow(outputLabel, innerLeft, y + 4, 62, 20, TRUE);
+        }
+        const int editLeft = innerLeft + 66;
+        const int editWidth = std::max(140, innerRight - btnBrowseW - 8 - editLeft);
+        ::MoveWindow(context->OutputEdit, editLeft, y + 1, editWidth, 24, TRUE);
+        ::MoveWindow(::GetDlgItem(context->Window, IDC_BrowseOutput), innerRight - btnBrowseW, y,
+                     btnBrowseW, btnH, TRUE);
+        y += btnH + 8;
+
+        ::MoveWindow(context->NotifyPopup, innerLeft, y, 88, 20, TRUE);
+        ::MoveWindow(context->NotifySound, innerLeft + 96, y, 96, 20, TRUE);
+        ::MoveWindow(context->WorkerInfo, innerRight - 130, y + 2, 130, 18, TRUE);
+        y += 26;
+
+        ::MoveWindow(context->OverallProgress, innerLeft, y, innerWidth, 14, TRUE);
+        y += 20;
+
+        ::MoveWindow(context->StatusText, innerLeft, y, innerWidth, 18, TRUE);
+        y += 26;
+        context->TopCardRect = RECT{ cardLeft, margin, cardRight, y };
+
+        const int listCardTop = y + 8;
+        const int listCardBottom = height - margin;
+        context->ListCardRect = RECT{ cardLeft, listCardTop, cardRight, listCardBottom };
+        const int listHeight = std::max(80, listCardBottom - listCardTop - 16);
+        ::MoveWindow(context->TaskList, innerLeft, listCardTop + 8, innerWidth, listHeight, TRUE);
+        if (context->TaskList && innerWidth > 320)
+        {
+            ListView_SetColumnWidth(context->TaskList, 3, innerWidth - 295 - 20);
+        }
+
+        ::RedrawWindow(context->Window, nullptr, nullptr,
+                       RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
+
     void InitializeListViewColumns(HWND listView)
     {
         LVCOLUMNW column{};
         column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
         column.pszText = const_cast<LPWSTR>(L"文件");
-        column.cx = 120;
+        column.cx = 130;
         ListView_InsertColumn(listView, 0, &column);
 
         column.pszText = const_cast<LPWSTR>(L"状态");
-        column.cx = 70;
+        column.cx = 75;
         column.iSubItem = 1;
         ListView_InsertColumn(listView, 1, &column);
 
         column.pszText = const_cast<LPWSTR>(L"进度");
-        column.cx = 85;
+        column.cx = 90;
         column.iSubItem = 2;
         ListView_InsertColumn(listView, 2, &column);
 
         column.pszText = const_cast<LPWSTR>(L"详细信息");
-        column.cx = 125;
+        column.cx = 220;
         column.iSubItem = 3;
         ListView_InsertColumn(listView, 3, &column);
 
-        ListView_SetExtendedListViewStyle(listView, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+        ListView_SetExtendedListViewStyle(listView, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     }
 
     unsigned int ResolveWorkerCount()
@@ -925,16 +1256,146 @@ namespace
                 context->NotifyPopup = ::GetDlgItem(hwnd, IDC_NotifyPopup);
                 context->NotifySound = ::GetDlgItem(hwnd, IDC_NotifySound);
                 context->WorkerInfo = ::GetDlgItem(hwnd, IDC_WorkerInfo);
+                context->FontUi = CreateExtractorFont(9, false);
+                context->FontBold = CreateExtractorFont(9, true);
+                context->WhiteBrush = ::CreateSolidBrush(kColorCardBg);
 
                 ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)context);
+                ::SendMessageW(context->OutputEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(6, 6));
+                SubclassExtractorButton(::GetDlgItem(hwnd, IDC_AddFiles), true, context->FontUi, context->FontBold);
+                SubclassExtractorButton(::GetDlgItem(hwnd, IDC_ClearCompleted), false, context->FontUi, context->FontBold);
+                SubclassExtractorButton(::GetDlgItem(hwnd, IDC_BrowseOutput), false, context->FontUi, context->FontBold);
+
                 ::SendMessageW(context->NotifyPopup, BM_SETCHECK, BST_CHECKED, 0);
                 ::SendMessageW(context->NotifySound, BM_SETCHECK, BST_CHECKED, 0);
                 ::SetWindowTextW(context->OutputEdit, context->DefaultOutputDirectory.c_str());
                 ::SetWindowTextW(context->WorkerInfo, FormatString(L"工作线程: %u", (unsigned int)context->Workers.size()).c_str());
                 ::DragAcceptFiles(hwnd, TRUE);
                 InitializeListViewColumns(context->TaskList);
+                LayoutExtractorDialog(context);
                 UpdateSummary(context);
                 return TRUE;
+            }
+            case WM_ERASEBKGND:
+            {
+                if (context)
+                {
+                    PaintExtractorCanvas((HDC)wParam, context);
+                    return TRUE;
+                }
+                break;
+            }
+            case WM_PAINT:
+            {
+                if (context)
+                {
+                    PAINTSTRUCT ps{};
+                    HDC dc = ::BeginPaint(hwnd, &ps);
+                    PaintExtractorCanvas(dc, context);
+                    ::EndPaint(hwnd, &ps);
+                    return TRUE;
+                }
+                break;
+            }
+            case WM_SIZE:
+            {
+                if (context)
+                {
+                    LayoutExtractorDialog(context);
+                    return TRUE;
+                }
+                break;
+            }
+            case WM_GETMINMAXINFO:
+            {
+                MINMAXINFO* info = (MINMAXINFO*)lParam;
+                info->ptMinTrackSize.x = 640;
+                info->ptMinTrackSize.y = 440;
+                return TRUE;
+            }
+            case WM_CTLCOLORSTATIC:
+            case WM_CTLCOLOREDIT:
+            case WM_CTLCOLORBTN:
+            {
+                if (context && context->WhiteBrush)
+                {
+                    HDC dc = (HDC)wParam;
+                    HWND ctrl = (HWND)lParam;
+                    if (ctrl == context->StatusText || ctrl == context->WorkerInfo ||
+                        ctrl == ::GetDlgItem(hwnd, IDC_DropHint))
+                    {
+                        ::SetTextColor(dc, kColorMuted);
+                    }
+                    else
+                    {
+                        ::SetTextColor(dc, kColorText);
+                    }
+                    ::SetBkColor(dc, kColorCardBg);
+                    return (INT_PTR)context->WhiteBrush;
+                }
+                break;
+            }
+            case WM_NOTIFY:
+            {
+                if (context)
+                {
+                    const NMHDR* hdr = (const NMHDR*)lParam;
+                    if (hdr && hdr->idFrom == IDC_TaskList && hdr->code == NM_CUSTOMDRAW)
+                    {
+                        NMLVCUSTOMDRAW* cd = (NMLVCUSTOMDRAW*)lParam;
+                        switch (cd->nmcd.dwDrawStage)
+                        {
+                            case CDDS_PREPAINT:
+                                ::SetWindowLongPtrW(hwnd, DWLP_MSGRESULT, CDRF_NOTIFYITEMDRAW);
+                                return TRUE;
+                            case CDDS_ITEMPREPAINT:
+                            {
+                                const int row = (int)cd->nmcd.dwItemSpec;
+                                cd->clrTextBk = (row % 2 == 1) ? kColorRowStripe : kColorCardBg;
+                                cd->clrText = kColorText;
+                                ::SetWindowLongPtrW(hwnd, DWLP_MSGRESULT, CDRF_NOTIFYSUBITEMDRAW);
+                                return TRUE;
+                            }
+                            case CDDS_ITEMPREPAINT | CDDS_SUBITEM:
+                            {
+                                const int row = (int)cd->nmcd.dwItemSpec;
+                                cd->clrTextBk = (row % 2 == 1) ? kColorRowStripe : kColorCardBg;
+                                cd->clrText = kColorText;
+                                if (cd->iSubItem == 1)
+                                {
+                                    const unsigned int taskId = (unsigned int)cd->nmcd.lItemlParam;
+                                    const int idx = FindTaskIndex(context, taskId);
+                                    if (idx >= 0)
+                                    {
+                                        const UiTaskState st = context->Tasks[(size_t)idx].State;
+                                        if (st == UiTaskState::Completed)
+                                        {
+                                            cd->clrText = kColorOk;
+                                        }
+                                        else if (st == UiTaskState::Extracting || st == UiTaskState::Preparing ||
+                                                 st == UiTaskState::IndexLoaded)
+                                        {
+                                            cd->clrText = kColorAccent;
+                                        }
+                                        else if (st == UiTaskState::Failed)
+                                        {
+                                            cd->clrText = kColorBad;
+                                        }
+                                        else
+                                        {
+                                            cd->clrText = kColorMuted;
+                                        }
+                                    }
+                                }
+                                ::SetWindowLongPtrW(hwnd, DWLP_MSGRESULT, CDRF_NEWFONT);
+                                return TRUE;
+                            }
+                            default:
+                                break;
+                        }
+                    }
+                }
+                break;
             }
             case WM_DROPFILES:
             {
@@ -1217,6 +1678,18 @@ namespace UI
         if (context->StopEvent)
         {
             ::CloseHandle(context->StopEvent);
+        }
+        if (context->FontUi)
+        {
+            ::DeleteObject(context->FontUi);
+        }
+        if (context->FontBold)
+        {
+            ::DeleteObject(context->FontBold);
+        }
+        if (context->WhiteBrush)
+        {
+            ::DeleteObject(context->WhiteBrush);
         }
 
         ::DeleteCriticalSection(&context->LogLock);

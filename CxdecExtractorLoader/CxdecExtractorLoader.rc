@@ -62,19 +62,19 @@ IDI_MainIcon            ICON                    "YuaExtract_1.ico"
 
 // 上游原版功能窗口。首页的「高级操作 → CxdecExtractorLoader 原版功能」按需打开它，
 // 保留全部旧入口（解包 / 运行时恢复 / Hook 撞库 / 提取Key / 封包）。
-IDD_MainForm DIALOGEX 0, 0, 261, 190
+IDD_MainForm DIALOGEX 0, 0, 272, 206
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "YuaExtract - 原版功能"
 FONT 9, "微软雅黑", 400, 0, 0x86
 BEGIN
-    PUSHBUTTON      "加载解包模块",IDC_Extractor,38,17,185,14,NOT WS_TABSTOP
-    PUSHBUTTON      "加载运行时恢复Hash映射模块",IDC_StringDumper,38,42,185,14,NOT WS_TABSTOP
-    PUSHBUTTON      "加载Hook撞库恢复Hash映射模块",IDC_HashRestore,38,67,185,14,NOT WS_TABSTOP
-    PUSHBUTTON      "提取Key",IDC_KeyStatic,38,92,185,14,NOT WS_TABSTOP
-    PUSHBUTTON      "封包（目录 → XP3）",IDC_Repack,38,117,185,14,NOT WS_TABSTOP
-    LTEXT           "提取进度",IDC_KeyProgressLabel,25,150,40,10
-    CONTROL         "",IDC_KeyProgress,"msctls_progress32",WS_BORDER | WS_TABSTOP,25,163,180,12
-    LTEXT           "0%",IDC_KeyProgressText,214,151,20,10
+    PUSHBUTTON      "加载解包模块",IDC_Extractor,28,16,216,18,NOT WS_TABSTOP
+    PUSHBUTTON      "加载运行时恢复Hash映射模块",IDC_StringDumper,28,42,216,18,NOT WS_TABSTOP
+    PUSHBUTTON      "加载Hook撞库恢复Hash映射模块",IDC_HashRestore,28,68,216,18,NOT WS_TABSTOP
+    PUSHBUTTON      "提取Key",IDC_KeyStatic,28,94,216,18,NOT WS_TABSTOP
+    PUSHBUTTON      "封包（目录 → XP3）",IDC_Repack,28,120,216,18,NOT WS_TABSTOP
+    LTEXT           "提取进度",IDC_KeyProgressLabel,28,154,44,10
+    CONTROL         "",IDC_KeyProgress,"msctls_progress32",WS_BORDER | WS_TABSTOP,28,168,188,12
+    LTEXT           "0%",IDC_KeyProgressText,222,169,24,10
 END
 
 // IDD_SelectExe（双击启动时的独立拖放窗口）已废弃：

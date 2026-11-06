@@ -1,4 +1,4 @@
-﻿// YuaExtract 主界面。
+// YuaExtract 主界面。
 //
 // 这一层只做三件事：把上游的功能组织成"解包 → 收集 Hash → 还原名字"三步流程、
 // 把每一步的结果随时显示在右侧概览里、把上游原版入口收进"高级操作"备查。
@@ -278,27 +278,43 @@ namespace
     constexpr UINT kClosePollIntervalMs = 200;
 
     // 96 DPI 下的布局常量。
-    constexpr int kMargin = 10;
-    constexpr int kTabHeight = 30;
-    constexpr int kTabGap = 4;
-    constexpr int kLogButtonHeight = 24;
-    constexpr int kGroupTitleHeight = 20;
-    constexpr int kRowHeight = 24;
+    constexpr int kMargin = 12;
+    constexpr int kHeaderHeight = 46;
+    constexpr int kTabHeight = 32;
+    constexpr int kTabGap = 6;
+    constexpr int kLogButtonHeight = 26;
+    constexpr int kGroupTitleHeight = 26;
+    constexpr int kRowHeight = 26;
     constexpr int kRowGap = 6;
     constexpr int kRightPanelMinWidth = 380;
-    constexpr int kLeftPanelMinWidth = 430;
-    constexpr int kTaskGroupHeight = 68; // 「任务进度」一行（首页与制作页签共用）
+    constexpr int kLeftPanelMinWidth = 440;
+    constexpr int kTaskGroupHeight = 72; // 「任务进度」一行（首页与制作页签共用）
 
-    COLORREF kColorAccent = RGB(0x1F, 0x6F, 0xD6);
-    COLORREF kColorText = RGB(0x33, 0x33, 0x33);
-    COLORREF kColorMuted = RGB(0x7A, 0x7A, 0x7A);
-    COLORREF kColorOk = RGB(0x1B, 0x7F, 0x3B);
-    COLORREF kColorWarn = RGB(0xB0, 0x50, 0x00);
-    COLORREF kColorSection = RGB(0x1F, 0x4E, 0x79);
-    COLORREF kColorTabIdleText = RGB(0x55, 0x55, 0x55);
-    COLORREF kColorTabBorder = RGB(0xC8, 0xC8, 0xC8);
-    COLORREF kColorLogBackground = RGB(0x1E, 0x1E, 0x1E);
-    COLORREF kColorLogText = RGB(0xD4, 0xD4, 0xD4);
+    // 现代浅色卡片视觉配色（Slate & Cobalt 体系）
+    COLORREF kColorBgCanvas = RGB(0xF1, 0xF5, 0xF9);       // 窗口底色 #F1F5F9
+    COLORREF kColorHeaderBg = RGB(0xFF, 0xFF, 0xFF);       // 顶部导航栏背景 #FFFFFF
+    COLORREF kColorHeaderBorder = RGB(0xE2, 0xE8, 0xF0);   // 导航栏底部分割线 #E2E8F0
+    COLORREF kColorCardBg = RGB(0xFF, 0xFF, 0xFF);         // 卡片表面背景 #FFFFFF
+    COLORREF kColorCardHeaderBg = RGB(0xF8, 0xFA, 0xFC);   // 卡片标题栏浅底 #F8FAFC
+    COLORREF kColorCardBorder = RGB(0xCB, 0xD5, 0xE1);     // 卡片边框 #CBD5E1
+    COLORREF kColorCardDivider = RGB(0xE2, 0xE8, 0xF0);    // 卡片内部分割线 #E2E8F0
+    COLORREF kColorAccent = RGB(0x25, 0x63, 0xEB);         // 主强调色 #2563EB (Cobalt Blue)
+    COLORREF kColorAccentHover = RGB(0x1D, 0x4E, 0xD8);    // 主强调悬停 #1D4ED8
+    COLORREF kColorAccentPressed = RGB(0x1E, 0x40, 0xAF);  // 主强调按下 #1E40AF
+    COLORREF kColorAccentSoft = RGB(0xEF, 0xF6, 0xFF);     // 浅蓝高亮底 #EFF6FF
+    COLORREF kColorText = RGB(0x1E, 0x29, 0x3B);           // 主正文 #1E293B (Slate 800)
+    COLORREF kColorMuted = RGB(0x64, 0x74, 0x8B);          // 次级文字 #64748B (Slate 500)
+    COLORREF kColorOk = RGB(0x15, 0x80, 0x3D);             // 成功绿 #15803D
+    COLORREF kColorWarn = RGB(0xB4, 0x53, 0x09);           // 警告琥珀色 #B45309
+    COLORREF kColorDangerBg = RGB(0xFF, 0xF1, 0xF2);       // 危险按钮浅底 #FFF1F2
+    COLORREF kColorDangerHover = RGB(0xFF, 0xE4, 0xE6);    // 危险按钮悬停 #FFE4E6
+    COLORREF kColorDangerBorder = RGB(0xFE, 0xCD, 0xD3);   // 危险按钮边框 #FECDD3
+    COLORREF kColorDangerText = RGB(0xBE, 0x12, 0x3C);     // 危险按钮文字 #BE123C
+    COLORREF kColorSection = RGB(0x0F, 0x17, 0x2A);        // 章节标题深色 #0F172A
+    COLORREF kColorTabIdleText = RGB(0x47, 0x55, 0x69);    // 未选中页签文字 #475569
+    COLORREF kColorTabBorder = RGB(0xE2, 0xE8, 0xF0);      // 页签边框 #E2E8F0
+    COLORREF kColorLogBackground = RGB(0x0F, 0x17, 0x2A);  // 日志深色底 #0F172A
+    COLORREF kColorLogText = RGB(0xE2, 0xE8, 0xF0);        // 日志浅色字 #E2E8F0
 
     // ---------- 概览面板的富文本 ----------
 
@@ -327,6 +343,7 @@ namespace
 
     void AppendSectionTitle(std::vector<TextRun>& runs, const wchar_t* title)
     {
+        AppendRun(runs, L"▎", kColorAccent, true, 10);
         AppendRun(runs, title, kColorSection, true, 10);
         AppendRun(runs, L"\r\n", kColorText, false);
     }
@@ -343,6 +360,12 @@ namespace
         int Severity = 0;
     };
 
+    struct CardBox
+    {
+        RECT Rect{};
+        bool HasHeader = true;
+    };
+
     // ---------- 状态 ----------
 
     struct UiContext
@@ -356,7 +379,9 @@ namespace
         HFONT FontBold = nullptr;
         HFONT FontMono = nullptr;
         HBRUSH WhiteBrush = nullptr;
+        HBRUSH CanvasBrush = nullptr;
         HBRUSH LogBrush = nullptr;
+        std::vector<CardBox> ActiveCards;
 
         std::wstring ExePath;
         WorkspacePaths Paths;
@@ -832,7 +857,7 @@ namespace
         RefillTitleList(context);
     }
 
-    // ---------- 字体与画刷 ----------
+    // ---------- 字体、画刷与现代控件自绘 ----------
 
     HFONT CreateUiFont(int pointSize, bool bold)
     {
@@ -845,17 +870,437 @@ namespace
         return ::CreateFontIndirectW(&lf);
     }
 
+    enum class ButtonRole
+    {
+        Secondary = 0,
+        Primary = 1,
+        ModeRadio = 2,
+        Danger = 3,
+        LogToggle = 4,
+    };
+
+    ButtonRole RoleForButtonId(int id)
+    {
+        switch (id)
+        {
+            case IDC_YUA_FUNC_SET_EXTRACT:
+            case IDC_YUA_FUNC_SET_CRACK:
+            case IDC_YUA_FUNC_CLASSIC:
+                return ButtonRole::ModeRadio;
+            case IDC_YUA_STEP1:
+            case IDC_YUA_STEP2:
+            case IDC_YUA_STEP3:
+            case IDC_YUA_EXE_BROWSE:
+            case IDC_YUA_SET_GENERATE:
+            case IDC_YUA_SET_INSTALL:
+            case IDC_YUA_SETM_UPDATE:
+            case IDC_YUA_ONLINE_REFRESH:
+            case IDC_YUA_ONLINE_INSTALL:
+            case IDC_YUA_META_OK:
+                return ButtonRole::Primary;
+            case IDC_YUA_AUX_CLEAN:
+            case IDC_YUA_TASK_CANCEL:
+                return ButtonRole::Danger;
+            case IDC_YUA_LOGBTN:
+                return ButtonRole::LogToggle;
+            default:
+                return ButtonRole::Secondary;
+        }
+    }
+
+    struct ModernButtonData
+    {
+        WNDPROC OldProc = nullptr;
+        ButtonRole Role = ButtonRole::Secondary;
+        HFONT FontUi = nullptr;
+        HFONT FontBold = nullptr;
+        COLORREF ParentBg = RGB(0xFF, 0xFF, 0xFF);
+        bool Hovered = false;
+    };
+
+    constexpr wchar_t kModernBtnProp[] = L"YuaModernBtnData";
+
+    LRESULT CALLBACK ModernButtonWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        ModernButtonData* data = reinterpret_cast<ModernButtonData*>(::GetPropW(hwnd, kModernBtnProp));
+        if (!data)
+        {
+            return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+
+        switch (msg)
+        {
+            case WM_ERASEBKGND:
+                return 1;
+
+            case WM_MOUSEMOVE:
+            {
+                static POINT lastCursor{ -1, -1 };
+                POINT currentCursor{};
+                ::GetCursorPos(&currentCursor);
+                const bool moved = (currentCursor.x != lastCursor.x || currentCursor.y != lastCursor.y);
+                lastCursor = currentCursor;
+                if (moved && !data->Hovered)
+                {
+                    data->Hovered = true;
+                    TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
+                    ::TrackMouseEvent(&tme);
+                    ::InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                break;
+            }
+
+            case WM_MOUSELEAVE:
+            {
+                if (data->Hovered)
+                {
+                    data->Hovered = false;
+                    ::InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                break;
+            }
+
+            case BM_SETCHECK:
+            case BM_SETSTATE:
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_LBUTTONDBLCLK:
+            case WM_SETFOCUS:
+            case WM_KILLFOCUS:
+            case WM_ENABLE:
+            case WM_SETTEXT:
+            {
+                ::SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+                const LRESULT result = ::CallWindowProcW(data->OldProc, hwnd, msg, wParam, lParam);
+                ::SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+                ::InvalidateRect(hwnd, nullptr, FALSE);
+                ::UpdateWindow(hwnd);
+                return result;
+            }
+
+            case WM_PAINT:
+            {
+                PAINTSTRUCT ps{};
+                HDC hdc = ::BeginPaint(hwnd, &ps);
+                RECT rc{};
+                ::GetClientRect(hwnd, &rc);
+                const int width = rc.right - rc.left;
+                const int height = rc.bottom - rc.top;
+                if (width > 0 && height > 0)
+                {
+                    HDC memDc = ::CreateCompatibleDC(hdc);
+                    HBITMAP memBmp = ::CreateCompatibleBitmap(hdc, width, height);
+                    HGDIOBJ oldBmp = ::SelectObject(memDc, memBmp);
+
+                    HBRUSH parentBrush = ::CreateSolidBrush(data->ParentBg);
+                    ::FillRect(memDc, &rc, parentBrush);
+                    ::DeleteObject(parentBrush);
+
+                    const bool enabled = ::IsWindowEnabled(hwnd) != FALSE;
+                    const LRESULT state = ::CallWindowProcW(data->OldProc, hwnd, BM_GETSTATE, 0, 0);
+                    const bool pushed = (state & BST_PUSHED) != 0;
+                    const bool checked =
+                        (::CallWindowProcW(data->OldProc, hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    const bool hovered = data->Hovered && enabled;
+
+                    COLORREF bgColor = RGB(0xF8, 0xFA, 0xFC);
+                    COLORREF borderColor = RGB(0xCB, 0xD5, 0xE1);
+                    COLORREF textColor = kColorText;
+                    bool useBold = false;
+
+                    if (!enabled)
+                    {
+                        bgColor = RGB(0xF1, 0xF5, 0xF9);
+                        borderColor = RGB(0xE2, 0xE8, 0xF0);
+                        textColor = RGB(0x94, 0xA3, 0xB8);
+                    }
+                    else if (data->Role == ButtonRole::ModeRadio)
+                    {
+                        if (checked)
+                        {
+                            bgColor = pushed ? kColorAccentPressed : (hovered ? kColorAccentHover : kColorAccent);
+                            borderColor = bgColor;
+                            textColor = RGB(0xFF, 0xFF, 0xFF);
+                            useBold = true;
+                        }
+                        else
+                        {
+                            bgColor = pushed ? RGB(0xE2, 0xE8, 0xF0)
+                                             : (hovered ? kColorAccentSoft : RGB(0xF1, 0xF5, 0xF9));
+                            borderColor = hovered ? RGB(0x93, 0xC5, 0xFD) : RGB(0xCB, 0xD5, 0xE1);
+                            textColor = hovered ? kColorAccent : RGB(0x47, 0x55, 0x69);
+                        }
+                    }
+                    else if (data->Role == ButtonRole::Primary)
+                    {
+                        bgColor = pushed ? kColorAccentPressed : (hovered ? kColorAccentHover : kColorAccent);
+                        borderColor = bgColor;
+                        textColor = RGB(0xFF, 0xFF, 0xFF);
+                        useBold = true;
+                    }
+                    else if (data->Role == ButtonRole::Danger)
+                    {
+                        bgColor = pushed ? RGB(0xFE, 0xCD, 0xD3) : (hovered ? kColorDangerHover : kColorDangerBg);
+                        borderColor = hovered ? RGB(0xFD, 0xA4, 0xAF) : kColorDangerBorder;
+                        textColor = kColorDangerText;
+                    }
+                    else
+                    {
+                        bgColor = pushed ? RGB(0xE2, 0xE8, 0xF0)
+                                         : (hovered ? kColorAccentSoft : RGB(0xF8, 0xFA, 0xFC));
+                        borderColor = hovered ? RGB(0x93, 0xC5, 0xFD) : RGB(0xCB, 0xD5, 0xE1);
+                        textColor = hovered ? kColorAccentHover : kColorText;
+                    }
+
+                    HBRUSH fillBrush = ::CreateSolidBrush(bgColor);
+                    HPEN borderPen = ::CreatePen(PS_SOLID, 1, borderColor);
+                    HGDIOBJ oldBrush = ::SelectObject(memDc, fillBrush);
+                    HGDIOBJ oldPen = ::SelectObject(memDc, borderPen);
+                    ::RoundRect(memDc, 0, 0, width, height, 6, 6);
+                    ::SelectObject(memDc, oldPen);
+                    ::SelectObject(memDc, oldBrush);
+                    ::DeleteObject(borderPen);
+                    ::DeleteObject(fillBrush);
+
+                    wchar_t text[256]{};
+                    ::GetWindowTextW(hwnd, text, _countof(text));
+                    ::SetBkMode(memDc, TRANSPARENT);
+                    ::SetTextColor(memDc, textColor);
+                    HGDIOBJ oldFont = ::SelectObject(memDc, (useBold && data->FontBold) ? data->FontBold : data->FontUi);
+                    RECT textRect = rc;
+                    ::DrawTextW(memDc, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    ::SelectObject(memDc, oldFont);
+
+                    ::BitBlt(hdc, 0, 0, width, height, memDc, 0, 0, SRCCOPY);
+                    ::SelectObject(memDc, oldBmp);
+                    ::DeleteObject(memBmp);
+                    ::DeleteDC(memDc);
+                }
+                ::EndPaint(hwnd, &ps);
+                return 0;
+            }
+
+            case WM_NCDESTROY:
+            {
+                WNDPROC oldProc = data->OldProc;
+                ::RemovePropW(hwnd, kModernBtnProp);
+                delete data;
+                return ::CallWindowProcW(oldProc, hwnd, msg, wParam, lParam);
+            }
+        }
+        return ::CallWindowProcW(data->OldProc, hwnd, msg, wParam, lParam);
+    }
+
+    void SubclassModernButton(HWND button, int id, HFONT fontUi, HFONT fontBold, COLORREF parentBg)
+    {
+        if (!button)
+        {
+            return;
+        }
+        auto* data = new (std::nothrow) ModernButtonData{};
+        if (!data)
+        {
+            return;
+        }
+        data->Role = RoleForButtonId(id);
+        data->FontUi = fontUi;
+        data->FontBold = fontBold;
+        data->ParentBg = parentBg;
+        data->OldProc = reinterpret_cast<WNDPROC>(
+            ::SetWindowLongPtrW(button, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ModernButtonWndProc)));
+        ::SetPropW(button, kModernBtnProp, data);
+    }
+
+    struct ModernGroupData
+    {
+        WNDPROC OldProc = nullptr;
+        HFONT FontBold = nullptr;
+    };
+
+    constexpr wchar_t kModernGroupProp[] = L"YuaModernGroupData";
+
+    LRESULT CALLBACK ModernGroupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        ModernGroupData* data = reinterpret_cast<ModernGroupData*>(::GetPropW(hwnd, kModernGroupProp));
+        if (!data)
+        {
+            return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+
+        switch (msg)
+        {
+            case WM_ERASEBKGND:
+                return 1;
+
+            case WM_PAINT:
+            {
+                PAINTSTRUCT ps{};
+                HDC hdc = ::BeginPaint(hwnd, &ps);
+                RECT rc{};
+                ::GetClientRect(hwnd, &rc);
+                const int width = rc.right - rc.left;
+                const int height = rc.bottom - rc.top;
+                if (width > 0 && height > 0)
+                {
+                    HDC memDc = ::CreateCompatibleDC(hdc);
+                    HBITMAP memBmp = ::CreateCompatibleBitmap(hdc, width, height);
+                    HGDIOBJ oldBmp = ::SelectObject(memDc, memBmp);
+
+                    HBRUSH canvasBrush = ::CreateSolidBrush(kColorBgCanvas);
+                    ::FillRect(memDc, &rc, canvasBrush);
+                    ::DeleteObject(canvasBrush);
+
+                    // 绘制卡片顶部圆角标题栏（向下延伸 8px 让底部变为直角与卡片主体无缝衔接）
+                    HBRUSH headerBrush = ::CreateSolidBrush(kColorCardHeaderBg);
+                    HPEN borderPen = ::CreatePen(PS_SOLID, 1, kColorCardBorder);
+                    HGDIOBJ oldBrush = ::SelectObject(memDc, headerBrush);
+                    HGDIOBJ oldPen = ::SelectObject(memDc, borderPen);
+                    ::RoundRect(memDc, 0, 0, width, height + 8, 8, 8);
+                    ::SelectObject(memDc, oldPen);
+                    ::SelectObject(memDc, oldBrush);
+                    ::DeleteObject(borderPen);
+                    ::DeleteObject(headerBrush);
+
+                    // 标题栏底部分割线
+                    HPEN divPen = ::CreatePen(PS_SOLID, 1, kColorCardDivider);
+                    oldPen = ::SelectObject(memDc, divPen);
+                    ::MoveToEx(memDc, 1, height - 1, nullptr);
+                    ::LineTo(memDc, width - 1, height - 1);
+                    ::SelectObject(memDc, oldPen);
+                    ::DeleteObject(divPen);
+
+                    // 左侧蓝色强调竖条
+                    RECT pill{ 10, 6, 14, height - 6 };
+                    HBRUSH accentBrush = ::CreateSolidBrush(kColorAccent);
+                    ::FillRect(memDc, &pill, accentBrush);
+                    ::DeleteObject(accentBrush);
+
+                    wchar_t text[128]{};
+                    ::GetWindowTextW(hwnd, text, _countof(text));
+                    ::SetBkMode(memDc, TRANSPARENT);
+                    ::SetTextColor(memDc, kColorSection);
+                    HGDIOBJ oldFont = ::SelectObject(memDc, data->FontBold);
+                    RECT textRect{ 20, 0, width - 10, height - 1 };
+                    ::DrawTextW(memDc, text, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                    ::SelectObject(memDc, oldFont);
+
+                    ::BitBlt(hdc, 0, 0, width, height, memDc, 0, 0, SRCCOPY);
+                    ::SelectObject(memDc, oldBmp);
+                    ::DeleteObject(memBmp);
+                    ::DeleteDC(memDc);
+                }
+                ::EndPaint(hwnd, &ps);
+                return 0;
+            }
+
+            case WM_NCDESTROY:
+            {
+                WNDPROC oldProc = data->OldProc;
+                ::RemovePropW(hwnd, kModernGroupProp);
+                delete data;
+                return ::CallWindowProcW(oldProc, hwnd, msg, wParam, lParam);
+            }
+        }
+        return ::CallWindowProcW(data->OldProc, hwnd, msg, wParam, lParam);
+    }
+
+    void SubclassModernGroup(HWND group, HFONT fontBold)
+    {
+        if (!group)
+        {
+            return;
+        }
+        auto* data = new (std::nothrow) ModernGroupData{};
+        if (!data)
+        {
+            return;
+        }
+        data->FontBold = fontBold;
+        data->OldProc = reinterpret_cast<WNDPROC>(
+            ::SetWindowLongPtrW(group, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ModernGroupWndProc)));
+        ::SetPropW(group, kModernGroupProp, data);
+    }
+
+    void PaintMainWindowCanvas(HDC hdc, const UiContext& context)
+    {
+        RECT client{};
+        ::GetClientRect(context.Window, &client);
+        const int width = client.right - client.left;
+        const int height = client.bottom - client.top;
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        HDC memDc = ::CreateCompatibleDC(hdc);
+        HBITMAP memBmp = ::CreateCompatibleBitmap(hdc, width, height);
+        HGDIOBJ oldBmp = ::SelectObject(memDc, memBmp);
+
+        // 1. 整体画布背景
+        HBRUSH canvasBrush = ::CreateSolidBrush(kColorBgCanvas);
+        ::FillRect(memDc, &client, canvasBrush);
+        ::DeleteObject(canvasBrush);
+
+        // 2. 顶部白色导航栏与底部分割线
+        RECT headerRect{ 0, 0, width, kHeaderHeight };
+        HBRUSH headerBrush = ::CreateSolidBrush(kColorHeaderBg);
+        ::FillRect(memDc, &headerRect, headerBrush);
+        ::DeleteObject(headerBrush);
+
+        HPEN headerPen = ::CreatePen(PS_SOLID, 1, kColorHeaderBorder);
+        HGDIOBJ oldPen = ::SelectObject(memDc, headerPen);
+        ::MoveToEx(memDc, 0, kHeaderHeight - 1, nullptr);
+        ::LineTo(memDc, width, kHeaderHeight - 1);
+        ::SelectObject(memDc, oldPen);
+        ::DeleteObject(headerPen);
+
+        // 顶部导航栏右侧副标题
+        if (width > 640 && context.FontUi)
+        {
+            ::SetBkMode(memDc, TRANSPARENT);
+            ::SetTextColor(memDc, kColorMuted);
+            HGDIOBJ oldFont = ::SelectObject(memDc, context.FontUi);
+            RECT brandRect{ 400, 0, width - kMargin, kHeaderHeight - 1 };
+            ::DrawTextW(memDc, L"YuaExtract · Kirikiri Z / CxdecV2 资源提取与还原工作台", -1, &brandRect,
+                        DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            ::SelectObject(memDc, oldFont);
+        }
+
+        // 3. 当前页签的所有卡片背景框
+        HBRUSH cardBrush = ::CreateSolidBrush(kColorCardBg);
+        HPEN cardPen = ::CreatePen(PS_SOLID, 1, kColorCardBorder);
+        HGDIOBJ oldBrush = ::SelectObject(memDc, cardBrush);
+        oldPen = ::SelectObject(memDc, cardPen);
+        for (const CardBox& card : context.ActiveCards)
+        {
+            if (card.Rect.right > card.Rect.left && card.Rect.bottom > card.Rect.top)
+            {
+                ::RoundRect(memDc, card.Rect.left, card.Rect.top, card.Rect.right, card.Rect.bottom, 8, 8);
+            }
+        }
+        ::SelectObject(memDc, oldPen);
+        ::SelectObject(memDc, oldBrush);
+        ::DeleteObject(cardPen);
+        ::DeleteObject(cardBrush);
+
+        ::BitBlt(hdc, 0, 0, width, height, memDc, 0, 0, SRCCOPY);
+        ::SelectObject(memDc, oldBmp);
+        ::DeleteObject(memBmp);
+        ::DeleteDC(memDc);
+    }
+
     // ---------- 文本视图（RichEdit 优先，失败退普通 EDIT） ----------
 
     HWND CreateTextView(HWND parent, UiContext* context, int controlId, bool darkBackground)
     {
         HWND view = nullptr;
-        const DWORD common = WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL;
+        const DWORD common = WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL |
+                             (darkBackground ? WS_BORDER : 0);
 
         if (!context->RichEditClass.empty())
         {
-            view = ::CreateWindowExW(WS_EX_CLIENTEDGE, context->RichEditClass.c_str(), L"", common, 0, 0, 10,
-                                     10, parent, (HMENU)(INT_PTR)controlId, context->Instance, nullptr);
+            view = ::CreateWindowExW(0, context->RichEditClass.c_str(), L"", common, 0, 0, 10, 10, parent,
+                                     (HMENU)(INT_PTR)controlId, context->Instance, nullptr);
             if (view)
             {
                 ::SendMessageW(view, EM_SETBKGNDCOLOR, 0,
@@ -864,13 +1309,19 @@ namespace
                 ::SendMessageW(view, EM_SETREADONLY, TRUE, 0);
                 // 富文本控件默认会把 URL 变成可点的链接，概览里全是路径，别让它抢焦点。
                 ::SendMessageW(view, EM_SETEVENTMASK, 0, 0);
+                // 增加左右内边距，避免文字紧贴边框
+                ::SendMessageW(view, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(10, 10));
             }
         }
 
         if (!view)
         {
-            view = ::CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", common, 0, 0, 10, 10, parent,
-                                     (HMENU)(INT_PTR)controlId, context->Instance, nullptr);
+            view = ::CreateWindowExW(0, L"EDIT", L"", common, 0, 0, 10, 10, parent, (HMENU)(INT_PTR)controlId,
+                                     context->Instance, nullptr);
+            if (view)
+            {
+                ::SendMessageW(view, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(8, 8));
+            }
         }
 
         if (view)
@@ -918,6 +1369,20 @@ namespace
             ::SendMessageW(view, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
 
             ::SendMessageW(view, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(run.Text.c_str()));
+        }
+
+        // 为富文本设置舒适的行距与段后间距（不影响 WM_GETTEXT 读回的纯文本内容）
+        if (!dark)
+        {
+            CHARRANGE all{ 0, -1 };
+            ::SendMessageW(view, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&all));
+            PARAFORMAT2 pf{};
+            pf.cbSize = sizeof(pf);
+            pf.dwMask = PFM_SPACEAFTER | PFM_LINESPACING;
+            pf.dySpaceAfter = 45;
+            pf.bLineSpacingRule = 5;
+            pf.dyLineSpacing = 23;
+            ::SendMessageW(view, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&pf));
         }
 
         CHARRANGE top{ 0, 0 };
@@ -2055,136 +2520,153 @@ namespace
                        SWP_NOZORDER | SWP_NOACTIVATE | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
     }
 
+    void PlaceGroupCard(UiContext& context, int groupId, int x, int y, int width, int height, bool activeOnCurrentTab)
+    {
+        MoveControl(context.Window, groupId, x, y, width, kGroupTitleHeight);
+        if (activeOnCurrentTab)
+        {
+            CardBox card{};
+            card.Rect = RECT{ x, y, x + width, y + height };
+            card.HasHeader = true;
+            context.ActiveCards.push_back(card);
+        }
+    }
+
     // 「任务进度」一行：首页与制作页签共用同一组控件（不做两份进度）。
-    void LayoutTaskRow(UiContext& context, int leftWidth, int y)
+    void LayoutTaskRow(UiContext& context, int leftWidth, int y, bool activeOnCurrentTab)
     {
         HWND window = context.Window;
         const int innerWidth = leftWidth - 24;
-        const int cancelWidth = 66;
-        MoveControl(window, IDC_YUA_GROUP_TASK, kMargin, y, leftWidth, kTaskGroupHeight);
-        MoveControl(window, IDC_YUA_TASK_PROGRESS, kMargin + 12, y + 24, innerWidth - cancelWidth - kRowGap, 18);
-        MoveControl(window, IDC_YUA_TASK_CANCEL, kMargin + 12 + innerWidth - cancelWidth, y + 21, cancelWidth, 24);
-        MoveControl(window, IDC_YUA_TASK_TEXT, kMargin + 12, y + 46, innerWidth, 18);
+        const int cancelWidth = 68;
+        PlaceGroupCard(context, IDC_YUA_GROUP_TASK, kMargin, y, leftWidth, kTaskGroupHeight, activeOnCurrentTab);
+        MoveControl(window, IDC_YUA_TASK_PROGRESS, kMargin + 12, y + 32, innerWidth - cancelWidth - kRowGap, 16);
+        MoveControl(window, IDC_YUA_TASK_CANCEL, kMargin + 12 + innerWidth - cancelWidth, y + 28, cancelWidth, 24);
+        MoveControl(window, IDC_YUA_TASK_TEXT, kMargin + 12, y + 51, innerWidth, 18);
     }
 
-    // 首页左列：首页功能（模式选择）→ 扩展集选择 → 高级操作 → 主流程 → 任务进度 → 辅助操作。
-    void LayoutHomeColumn(UiContext& context, int leftWidth, int y, int contentBottom)
+    // 首页左列：运行模式 → 扩展集选择 → 主流程 → 任务进度 → 辅助操作 → 高级操作。
+    void LayoutHomeColumn(UiContext& context, int leftWidth, int y, int contentBottom, bool activeOnCurrentTab)
     {
         HWND window = context.Window;
 
-        const int funcGroupHeight = 74;
-        MoveControl(window, IDC_YUA_GROUP_FUNC, kMargin, y, leftWidth, funcGroupHeight);
+        const int funcGroupHeight = 64;
+        PlaceGroupCard(context, IDC_YUA_GROUP_FUNC, kMargin, y, leftWidth, funcGroupHeight, activeOnCurrentTab);
         {
             const int innerWidth = leftWidth - 24;
             const int buttonWidth = (innerWidth - 2 * kRowGap) / 3;
             const int ids[] = { IDC_YUA_FUNC_SET_EXTRACT, IDC_YUA_FUNC_SET_CRACK, IDC_YUA_FUNC_CLASSIC };
             for (int index = 0; index < 3; ++index)
             {
-                MoveControl(window, ids[index], kMargin + 12 + index * (buttonWidth + kRowGap), y + 28,
-                            buttonWidth, 30);
+                MoveControl(window, ids[index], kMargin + 12 + index * (buttonWidth + kRowGap), y + 31,
+                            buttonWidth, 26);
             }
         }
         y += funcGroupHeight + 8;
 
         // 扩展集选择（设计稿 §8.3 图3 左列）：会社 → 作品两级列表。
-        const int libGroupHeight = 116;
-        MoveControl(window, IDC_YUA_GROUP_LIB, kMargin, y, leftWidth, libGroupHeight);
+        const int libGroupHeight = 114;
+        PlaceGroupCard(context, IDC_YUA_GROUP_LIB, kMargin, y, leftWidth, libGroupHeight, activeOnCurrentTab);
         {
             const int innerWidth = leftWidth - 24;
             const int half = (innerWidth - kRowGap) / 2;
-            const int listHeight = libGroupHeight - 50;
-            MoveControl(window, IDC_YUA_LIB_PUB_LABEL, kMargin + 12, y + 22, half, 18);
-            MoveControl(window, IDC_YUA_LIB_TITLE_LABEL, kMargin + 12 + half + kRowGap, y + 22, half, 18);
-            MoveControl(window, IDC_YUA_LIB_PUBLISHERS, kMargin + 12, y + 42, half, listHeight);
-            MoveControl(window, IDC_YUA_LIB_TITLES, kMargin + 12 + half + kRowGap, y + 42, half, listHeight);
+            const int listHeight = libGroupHeight - 54;
+            MoveControl(window, IDC_YUA_LIB_PUB_LABEL, kMargin + 12, y + 29, half, 18);
+            MoveControl(window, IDC_YUA_LIB_TITLE_LABEL, kMargin + 12 + half + kRowGap, y + 29, half, 18);
+            MoveControl(window, IDC_YUA_LIB_PUBLISHERS, kMargin + 12, y + 48, half, listHeight);
+            MoveControl(window, IDC_YUA_LIB_TITLES, kMargin + 12 + half + kRowGap, y + 48, half, listHeight);
         }
         y += libGroupHeight + 8;
 
-        const int advGroupHeight = 68;
-        MoveControl(window, IDC_YUA_GROUP_ADV, kMargin, y, leftWidth, advGroupHeight);
-        {
-            const int buttonWidth = static_cast<int>((leftWidth - 24) * 0.62f);
-            MoveControl(window, IDC_YUA_ADVANCED, kMargin + (leftWidth - buttonWidth) / 2, y + 28, buttonWidth, 28);
-        }
-        y += advGroupHeight + 8;
-
-        const int flowGroupHeight = 132;
-        MoveControl(window, IDC_YUA_GROUP_FLOW, kMargin, y, leftWidth, flowGroupHeight);
+        // 主流程紧随模式与扩展集选择之后，保证核心操作动线连贯
+        const int flowGroupHeight = 126;
+        PlaceGroupCard(context, IDC_YUA_GROUP_FLOW, kMargin, y, leftWidth, flowGroupHeight, activeOnCurrentTab);
         {
             const int ids[] = { IDC_YUA_STEP1, IDC_YUA_STEP2, IDC_YUA_STEP3 };
             for (int index = 0; index < 3; ++index)
             {
-                MoveControl(window, ids[index], kMargin + 12, y + 26 + index * (kRowHeight + kRowGap),
+                MoveControl(window, ids[index], kMargin + 12, y + 32 + index * (kRowHeight + kRowGap),
                             leftWidth - 24, kRowHeight);
             }
         }
         y += flowGroupHeight + 8;
 
-        LayoutTaskRow(context, leftWidth, y);
+        LayoutTaskRow(context, leftWidth, y, activeOnCurrentTab);
         y += kTaskGroupHeight + 8;
 
-        const int auxHeight = contentBottom - y;
-        MoveControl(window, IDC_YUA_GROUP_AUX, kMargin, y, leftWidth,
-                    auxHeight > 90 ? auxHeight : 90);
+        // 底部预留「高级操作」卡片，中间剩余高度分配给「辅助操作」卡片，使左右两栏底边齐平
+        const int advGroupHeight = 60;
+        const int minAuxHeight = 112;
+        int auxHeight = contentBottom - advGroupHeight - 8 - y;
+        if (auxHeight < minAuxHeight)
+        {
+            auxHeight = minAuxHeight;
+        }
+        PlaceGroupCard(context, IDC_YUA_GROUP_AUX, kMargin, y, leftWidth, auxHeight, activeOnCurrentTab);
         {
             const int innerWidth = leftWidth - 24;
+            const int third = (innerWidth - 2 * kRowGap) / 3;
             const int half = (innerWidth - kRowGap) / 2;
-            int rowY = y + 26;
-            MoveControl(window, IDC_YUA_AUX_CHECK, kMargin + 12, rowY, innerWidth, kRowHeight);
-            rowY += kRowHeight + kRowGap;
-            MoveControl(window, IDC_YUA_AUX_WORKSPACE, kMargin + 12, rowY, half, kRowHeight);
-            MoveControl(window, IDC_YUA_AUX_CLEAN, kMargin + 12 + half + kRowGap, rowY, half, kRowHeight);
+            int rowY = y + 32;
+            MoveControl(window, IDC_YUA_AUX_CHECK, kMargin + 12, rowY, third, kRowHeight);
+            MoveControl(window, IDC_YUA_AUX_WORKSPACE, kMargin + 12 + third + kRowGap, rowY, third, kRowHeight);
+            MoveControl(window, IDC_YUA_AUX_CLEAN, kMargin + 12 + 2 * (third + kRowGap), rowY,
+                        innerWidth - 2 * (third + kRowGap), kRowHeight);
             rowY += kRowHeight + kRowGap;
             MoveControl(window, IDC_YUA_AUX_RESTOREDIR, kMargin + 12, rowY, half, kRowHeight);
-            MoveControl(window, IDC_YUA_AUX_REPORT, kMargin + 12 + half + kRowGap, rowY, half, kRowHeight);
+            MoveControl(window, IDC_YUA_AUX_REPORT, kMargin + 12 + half + kRowGap, rowY, innerWidth - half - kRowGap,
+                        kRowHeight);
 
-            MoveControl(window, IDC_YUA_HINT, kMargin + 12, rowY + kRowHeight + 4, innerWidth, 18);
+            MoveControl(window, IDC_YUA_HINT, kMargin + 12, rowY + kRowHeight + 5, innerWidth, 18);
         }
+        y += auxHeight + 8;
+
+        PlaceGroupCard(context, IDC_YUA_GROUP_ADV, kMargin, y, leftWidth, advGroupHeight, activeOnCurrentTab);
+        MoveControl(window, IDC_YUA_ADVANCED, kMargin + 12, y + 30, leftWidth - 24, 24);
     }
 
     // 「制作扩展集」页签左列：制作扩展集 → 目录 → 自定义 → 任务进度（设计稿 §8.1）。
-    void LayoutMakeSetColumn(UiContext& context, int leftWidth, int y)
+    void LayoutMakeSetColumn(UiContext& context, int leftWidth, int y, bool activeOnCurrentTab)
     {
         HWND window = context.Window;
         const int innerWidth = leftWidth - 24;
 
-        const int makeGroupHeight = 122;
-        MoveControl(window, IDC_YUA_SET_GROUP_MAKE, kMargin, y, leftWidth, makeGroupHeight);
+        const int makeGroupHeight = 128;
+        PlaceGroupCard(context, IDC_YUA_SET_GROUP_MAKE, kMargin, y, leftWidth, makeGroupHeight, activeOnCurrentTab);
         {
             const int ids[] = { IDC_YUA_SET_GENERATE, IDC_YUA_SET_EDITINFO, IDC_YUA_SET_TEST };
             for (int index = 0; index < 3; ++index)
             {
-                MoveControl(window, ids[index], kMargin + 12, y + 26 + index * (kRowHeight + kRowGap),
+                MoveControl(window, ids[index], kMargin + 12, y + 32 + index * (kRowHeight + kRowGap),
                             innerWidth, kRowHeight);
             }
         }
         y += makeGroupHeight + 8;
 
-        const int dirGroupHeight = 122;
-        MoveControl(window, IDC_YUA_SET_GROUP_DIR, kMargin, y, leftWidth, dirGroupHeight);
+        const int dirGroupHeight = 128;
+        PlaceGroupCard(context, IDC_YUA_SET_GROUP_DIR, kMargin, y, leftWidth, dirGroupHeight, activeOnCurrentTab);
         {
             const int ids[] = { IDC_YUA_SET_OPEN_DRAFT, IDC_YUA_SET_INSTALL, IDC_YUA_SET_OPEN_LIB };
             for (int index = 0; index < 3; ++index)
             {
-                MoveControl(window, ids[index], kMargin + 12, y + 26 + index * (kRowHeight + kRowGap),
+                MoveControl(window, ids[index], kMargin + 12, y + 32 + index * (kRowHeight + kRowGap),
                             innerWidth, kRowHeight);
             }
         }
         y += dirGroupHeight + 8;
 
-        const int customGroupHeight = 90;
-        MoveControl(window, IDC_YUA_SET_GROUP_CUSTOM, kMargin, y, leftWidth, customGroupHeight);
+        const int customGroupHeight = 96;
+        PlaceGroupCard(context, IDC_YUA_SET_GROUP_CUSTOM, kMargin, y, leftWidth, customGroupHeight, activeOnCurrentTab);
         {
             const int ids[] = { IDC_YUA_SET_PICK_SOURCE, IDC_YUA_SET_PICK_TEST };
             for (int index = 0; index < 2; ++index)
             {
-                MoveControl(window, ids[index], kMargin + 12, y + 26 + index * (kRowHeight + kRowGap),
+                MoveControl(window, ids[index], kMargin + 12, y + 32 + index * (kRowHeight + kRowGap),
                             innerWidth, kRowHeight);
             }
         }
         y += customGroupHeight + 8;
 
-        LayoutTaskRow(context, leftWidth, y);
+        LayoutTaskRow(context, leftWidth, y, activeOnCurrentTab);
     }
 
     // 「扩展集」页签左列：扩展集管理与浏览（两行三列）+ 会社/作品两个列表（设计稿 §8.5）。
@@ -2192,13 +2674,14 @@ namespace
     // 这一列**不给任务进度与目标游戏留位置**：本页签做的事（浏览库、拉远端、自检）都不针对
     // 目标游戏、也不跑主界面的后台任务，摆两行用不上的控件只会把列表挤矮。
     // 列表占满剩余高度 —— 这一页的主动作就是在库里翻找。
-    void LayoutSetColumn(UiContext& context, int leftWidth, int y, int contentBottom)
+    void LayoutSetColumn(UiContext& context, int leftWidth, int y, int contentBottom, bool activeOnCurrentTab)
     {
         HWND window = context.Window;
         const int innerWidth = leftWidth - 24;
 
-        const int browseGroupHeight = 96;
-        MoveControl(window, IDC_YUA_SETM_GROUP_BROWSE, kMargin, y, leftWidth, browseGroupHeight);
+        const int browseGroupHeight = 100;
+        PlaceGroupCard(context, IDC_YUA_SETM_GROUP_BROWSE, kMargin, y, leftWidth, browseGroupHeight,
+                       activeOnCurrentTab);
         {
             const int buttonWidth = (innerWidth - 2 * kRowGap) / 3;
             const int ids[] = { IDC_YUA_SETM_REFRESH,      IDC_YUA_SETM_OPEN_ROOT, IDC_YUA_SETM_OPEN_ENTRY,
@@ -2208,22 +2691,21 @@ namespace
                 const int column = index % 3;
                 const int row = index / 3;
                 MoveControl(window, ids[index], kMargin + 12 + column * (buttonWidth + kRowGap),
-                            y + 26 + row * (kRowHeight + kRowGap), buttonWidth, kRowHeight);
+                            y + 32 + row * (kRowHeight + kRowGap), buttonWidth, kRowHeight);
             }
         }
         y += browseGroupHeight + 8;
 
         // 会社 / 作品列表：与首页是同一组控件（LibControls），这里只换位置与高度。
-        // 50 = 分组框标题（22）+ 标签行（20）+ 间距（8），与首页那处的算法一致。
         const int libGroupHeight = (contentBottom - y) > 130 ? (contentBottom - y) : 130;
-        MoveControl(window, IDC_YUA_GROUP_LIB, kMargin, y, leftWidth, libGroupHeight);
+        PlaceGroupCard(context, IDC_YUA_GROUP_LIB, kMargin, y, leftWidth, libGroupHeight, activeOnCurrentTab);
         {
             const int half = (innerWidth - kRowGap) / 2;
-            const int listHeight = libGroupHeight - 50;
-            MoveControl(window, IDC_YUA_LIB_PUB_LABEL, kMargin + 12, y + 22, half, 18);
-            MoveControl(window, IDC_YUA_LIB_TITLE_LABEL, kMargin + 12 + half + kRowGap, y + 22, half, 18);
-            MoveControl(window, IDC_YUA_LIB_PUBLISHERS, kMargin + 12, y + 42, half, listHeight);
-            MoveControl(window, IDC_YUA_LIB_TITLES, kMargin + 12 + half + kRowGap, y + 42, half, listHeight);
+            const int listHeight = libGroupHeight - 56;
+            MoveControl(window, IDC_YUA_LIB_PUB_LABEL, kMargin + 12, y + 29, half, 18);
+            MoveControl(window, IDC_YUA_LIB_TITLE_LABEL, kMargin + 12 + half + kRowGap, y + 29, half, 18);
+            MoveControl(window, IDC_YUA_LIB_PUBLISHERS, kMargin + 12, y + 48, half, listHeight);
+            MoveControl(window, IDC_YUA_LIB_TITLES, kMargin + 12 + half + kRowGap, y + 48, half, listHeight);
         }
     }
 
@@ -2241,18 +2723,6 @@ namespace
     }
 
     // 把控件占的地方先擦成背景色。
-    //
-    // 缺陷现场：切到「制作扩展集」后首页控件还留在画面上，和制作页签的控件叠成两层；
-    // 可见性其实是对的（首页控件 IsWindowVisible 全是 FALSE），是像素没被擦掉。
-    //
-    // 原因是分组框：BS_GROUPBOX 只画边框和标题，从不擦自己内部（单独给它
-    // RedrawWindow(RDW_ERASE) 一个像素都不会变），而父窗口又被 WS_CLIPCHILDREN
-    // 挡在这些控件外面。于是"某个控件还没显示时、别的控件在同一块像素上画过的东西"
-    // 就永远留在分组框里了 —— 切页签时就是那层幽灵。
-    //
-    // 擦不到就换个顺序：先把子窗口全藏起来，父窗口整块客户区就都能被背景刷擦到，
-    // 擦完再让布局与 ShowTabControls 把该显示的显示回来
-    //（LayoutWindow 会摆到每个控件，所以藏了的都会被重新显示）。
     void EraseBehindTabControls(UiContext& context)
     {
         ::EnumChildWindows(context.Window, HideChildForErase, 0);
@@ -2277,6 +2747,7 @@ namespace
         // 隐藏会顺手把键盘焦点带走，所以先记下来，等控件都显示回来再还回去
         //（否则在目标游戏输入框里改到一半、动一下窗口大小，光标就没了）。
         HWND focused = ::GetFocus();
+        context.ActiveCards.clear();
         // 先藏后擦：分组框内部只能靠父窗口在"它还没显示"的时候擦干净（见上）。
         EraseBehindTabControls(context);
 
@@ -2285,22 +2756,22 @@ namespace
         const int clientWidth = client.right;
         const int clientHeight = client.bottom;
 
-        // 顶部页签
-        const int tabWidths[] = { 78, 96, 78, 68 };
+        // 顶部页签（位于白色顶部导航栏内）
+        const int tabWidths[] = { 84, 104, 84, 76 };
         const int tabIds[] = { IDC_YUA_TAB_HOME, IDC_YUA_TAB_MAKE_SET, IDC_YUA_TAB_SET, IDC_YUA_TAB_ABOUT };
         int tabX = kMargin;
+        const int tabY = (kHeaderHeight - kTabHeight) / 2;
         for (int index = 0; index < 4; ++index)
         {
-            // 页签按钮恒可见，选中态由自绘（WM_DRAWITEM → DrawTab）决定。
-            // 这里曾经写成 `context.ActiveTab == tabIds[index] || true`：恒真，行为与传 true 一致，
-            // 但谁"清理"掉那个 `|| true` 就会变成只有当前页签可见 —— 界面直接坏。传 true 说清楚。
-            MoveControl(window, tabIds[index], tabX, kMargin, tabWidths[index], kTabHeight, true);
+            MoveControl(window, tabIds[index], tabX, tabY, tabWidths[index], kTabHeight, true);
             tabX += tabWidths[index] + kTabGap;
         }
 
-        const int contentTop = kMargin + kTabHeight + 8;
+        const int contentTop = kHeaderHeight + 10;
         const int bottomBarY = clientHeight - kMargin - kLogButtonHeight;
-        const int contentBottom = context.LogVisible ? static_cast<int>(clientHeight * 0.60f) : bottomBarY - 6;
+        const int fullContentBottom = bottomBarY - 8;
+        const int rightContentBottom =
+            context.LogVisible ? static_cast<int>(clientHeight * 0.58f) : fullContentBottom;
 
         // 左右分栏：右侧概览占约一半，但不挤掉左侧最小宽度。
         int rightWidth = static_cast<int>(clientWidth * 0.50f);
@@ -2314,7 +2785,7 @@ namespace
             rightWidth = maxRight > kRightPanelMinWidth ? maxRight : kRightPanelMinWidth;
         }
         const int leftWidth = clientWidth - rightWidth - 3 * kMargin;
-        const int rightX = kMargin + leftWidth + 2 * kMargin;
+        const int rightX = kMargin + leftWidth + kMargin;
 
         const bool homeTab = context.ActiveTab == IDC_YUA_TAB_HOME;
         const bool makeTab = context.ActiveTab == IDC_YUA_TAB_MAKE_SET;
@@ -2322,30 +2793,38 @@ namespace
         // 「关于」页签没有左列，PAGE 铺满整宽 —— 两者只差这一点。
         const bool setTab = context.ActiveTab == IDC_YUA_TAB_SET;
 
+        const auto placeRichPanelCard = [&](int id, int px, int py, int pw, int ph) {
+            CardBox card{};
+            card.Rect = RECT{ px, py, px + pw, py + ph };
+            card.HasHeader = false;
+            context.ActiveCards.push_back(card);
+            MoveControl(window, id, px + 4, py + 4, pw - 8, ph - 8);
+        };
+
         if (!homeTab && !makeTab && !setTab)
         {
             MoveControl(window, IDC_YUA_OVERVIEW, 0, 0, 0, 0, false);
             MoveControl(window, IDC_YUA_SET_STATUS, 0, 0, 0, 0, false);
-            MoveControl(window, IDC_YUA_PAGE, kMargin, contentTop, clientWidth - 2 * kMargin,
-                        contentBottom - contentTop);
+            placeRichPanelCard(IDC_YUA_PAGE, kMargin, contentTop, clientWidth - 2 * kMargin,
+                               rightContentBottom - contentTop);
         }
         else if (makeTab)
         {
             MoveControl(window, IDC_YUA_OVERVIEW, 0, 0, 0, 0, false);
             MoveControl(window, IDC_YUA_PAGE, 0, 0, 0, 0, false);
-            MoveControl(window, IDC_YUA_SET_STATUS, rightX, contentTop, rightWidth, contentBottom - contentTop);
+            placeRichPanelCard(IDC_YUA_SET_STATUS, rightX, contentTop, rightWidth, rightContentBottom - contentTop);
         }
         else if (setTab)
         {
             MoveControl(window, IDC_YUA_OVERVIEW, 0, 0, 0, 0, false);
             MoveControl(window, IDC_YUA_SET_STATUS, 0, 0, 0, 0, false);
-            MoveControl(window, IDC_YUA_PAGE, rightX, contentTop, rightWidth, contentBottom - contentTop);
+            placeRichPanelCard(IDC_YUA_PAGE, rightX, contentTop, rightWidth, rightContentBottom - contentTop);
         }
         else
         {
             MoveControl(window, IDC_YUA_PAGE, 0, 0, 0, 0, false);
             MoveControl(window, IDC_YUA_SET_STATUS, 0, 0, 0, 0, false);
-            MoveControl(window, IDC_YUA_OVERVIEW, rightX, contentTop, rightWidth, contentBottom - contentTop);
+            placeRichPanelCard(IDC_YUA_OVERVIEW, rightX, contentTop, rightWidth, rightContentBottom - contentTop);
         }
 
         // 目标游戏一行：首页与「制作扩展集」页签共用（同一份 exe 状态，不做第二个输入框）。
@@ -2354,37 +2833,43 @@ namespace
         int y = contentTop;
         if (homeTab || makeTab)
         {
-            const int exeGroupHeight = 58;
-            MoveControl(window, IDC_YUA_GROUP_EXE, kMargin, y, leftWidth, exeGroupHeight);
-            MoveControl(window, IDC_YUA_EXE_LABEL, kMargin + 12, y + 26, 60, 18);
-            const int browseWidth = 70;
+            const int exeGroupHeight = 62;
+            PlaceGroupCard(context, IDC_YUA_GROUP_EXE, kMargin, y, leftWidth, exeGroupHeight, true);
+            MoveControl(window, IDC_YUA_EXE_LABEL, kMargin + 12, y + 34, 60, 18);
+            const int browseWidth = 72;
             const int editWidth = leftWidth - 12 - 60 - 8 - browseWidth - 8 - 12;
-            MoveControl(window, IDC_YUA_EXE_EDIT, kMargin + 12 + 60 + 8, y + 23,
-                        editWidth > 120 ? editWidth : 120, 22);
-            MoveControl(window, IDC_YUA_EXE_BROWSE, kMargin + leftWidth - 12 - browseWidth, y + 22, browseWidth, 24);
+            MoveControl(window, IDC_YUA_EXE_EDIT, kMargin + 12 + 60 + 8, y + 31,
+                        editWidth > 120 ? editWidth : 120, 24);
+            MoveControl(window, IDC_YUA_EXE_BROWSE, kMargin + leftWidth - 12 - browseWidth, y + 30, browseWidth, 26);
             y += exeGroupHeight + 8;
         }
 
         if (makeTab)
         {
-            LayoutMakeSetColumn(context, leftWidth, y);
+            LayoutMakeSetColumn(context, leftWidth, y, true);
         }
         else if (setTab)
         {
-            LayoutSetColumn(context, leftWidth, y, contentBottom);
+            LayoutSetColumn(context, leftWidth, y, fullContentBottom, true);
+        }
+        else if (homeTab)
+        {
+            LayoutHomeColumn(context, leftWidth, y, fullContentBottom, true);
         }
         else
         {
-            LayoutHomeColumn(context, leftWidth, y, contentBottom);
+            LayoutHomeColumn(context, leftWidth, y, fullContentBottom, false);
         }
 
-        // 底部：日志开关 + 日志窗口
-        MoveControl(window, IDC_YUA_LOGBTN, kMargin, bottomBarY, 150, kLogButtonHeight);
+        // 底部：日志开关 + 日志窗口（有左列的页签将日志置于右栏下半部，不遮挡左列操作卡片）
+        MoveControl(window, IDC_YUA_LOGBTN, kMargin, bottomBarY, 156, kLogButtonHeight);
         if (context.LogVisible)
         {
-            const int logTop = contentBottom + 6;
-            MoveControl(window, IDC_YUA_LOGVIEW, kMargin, logTop, clientWidth - 2 * kMargin,
-                        bottomBarY - 6 - logTop);
+            const int logTop = rightContentBottom + 8;
+            const bool hasLeftColumn = (homeTab || makeTab || setTab);
+            const int logX = hasLeftColumn ? rightX : kMargin;
+            const int logWidth = hasLeftColumn ? rightWidth : (clientWidth - 2 * kMargin);
+            MoveControl(window, IDC_YUA_LOGVIEW, logX, logTop, logWidth, fullContentBottom - logTop);
         }
         else
         {
@@ -2411,23 +2896,25 @@ namespace
         HDC dc = item->hDC;
         RECT rect = item->rcItem;
 
-        const COLORREF background = selected ? RGB(255, 255, 255) : ::GetSysColor(COLOR_BTNFACE);
-        HBRUSH brush = ::CreateSolidBrush(background);
-        ::FillRect(dc, &rect, brush);
-        ::DeleteObject(brush);
-
-        HPEN pen = ::CreatePen(PS_SOLID, 1, selected ? kColorAccent : kColorTabBorder);
-        HGDIOBJ oldPen = ::SelectObject(dc, pen);
-        HGDIOBJ oldBrush = ::SelectObject(dc, ::GetStockObject(NULL_BRUSH));
-        ::Rectangle(dc, rect.left, rect.top, rect.right, rect.bottom);
-        ::SelectObject(dc, oldBrush);
-        ::SelectObject(dc, oldPen);
-        ::DeleteObject(pen);
+        // 先用顶部导航栏白色背景铺满
+        HBRUSH headerBrush = ::CreateSolidBrush(kColorHeaderBg);
+        ::FillRect(dc, &rect, headerBrush);
+        ::DeleteObject(headerBrush);
 
         if (selected)
         {
-            RECT bar = rect;
-            bar.top = bar.bottom - 3;
+            // 选中态：柔和浅蓝胶囊底 + 底部亮蓝指示条
+            HBRUSH pillBrush = ::CreateSolidBrush(kColorAccentSoft);
+            HPEN pillPen = ::CreatePen(PS_SOLID, 1, RGB(0xBF, 0xDB, 0xFE));
+            HGDIOBJ oldBrush = ::SelectObject(dc, pillBrush);
+            HGDIOBJ oldPen = ::SelectObject(dc, pillPen);
+            ::RoundRect(dc, rect.left + 1, rect.top + 1, rect.right - 1, rect.bottom - 3, 6, 6);
+            ::SelectObject(dc, oldPen);
+            ::SelectObject(dc, oldBrush);
+            ::DeleteObject(pillPen);
+            ::DeleteObject(pillBrush);
+
+            RECT bar{ rect.left + 8, rect.bottom - 3, rect.right - 8, rect.bottom };
             HBRUSH accent = ::CreateSolidBrush(kColorAccent);
             ::FillRect(dc, &bar, accent);
             ::DeleteObject(accent);
@@ -2439,15 +2926,10 @@ namespace
         ::SetTextColor(dc, selected ? kColorAccent : kColorTabIdleText);
         // 选中的页签用粗体，看得出一栏里哪个是当前页。
         HGDIOBJ oldFont = ::SelectObject(dc, selected ? fontBold : font);
-        ::DrawTextW(dc, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        RECT textRect = rect;
+        textRect.bottom -= 2;
+        ::DrawTextW(dc, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         ::SelectObject(dc, oldFont);
-
-        if (item->itemState & ODS_FOCUS)
-        {
-            RECT focus = rect;
-            ::InflateRect(&focus, -3, -3);
-            ::DrawFocusRect(dc, &focus);
-        }
     }
 
     void SwitchTab(UiContext& context, int tabId)
@@ -3725,17 +4207,21 @@ namespace
     {
         HWND label = ::CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT, x, y, width, 18,
                                        dialog, nullptr, state->Context->Instance, nullptr);
-        ::SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(state->Context->FontUi), TRUE);
+        ::SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(state->Context->FontBold), TRUE);
         return label;
     }
 
     HWND CreateMetaEdit(HWND dialog, MetaDialogState* state, int id, int x, int y, int width, int height,
                         DWORD extraStyle)
     {
-        HWND edit = ::CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | extraStyle, x, y, width, height, dialog,
-                                      (HMENU)(INT_PTR)id, state->Context->Instance, nullptr);
+        HWND edit = ::CreateWindowExW(0, L"EDIT", L"",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | extraStyle, x, y, width,
+                                      height, dialog, (HMENU)(INT_PTR)id, state->Context->Instance, nullptr);
         ::SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(state->Context->FontUi), TRUE);
+        if ((extraStyle & ES_MULTILINE) == 0)
+        {
+            ::SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(6, 6));
+        }
         return edit;
     }
 
@@ -3744,7 +4230,40 @@ namespace
         HWND button = ::CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | extraStyle, 0, 0,
                                         10, 10, dialog, (HMENU)(INT_PTR)id, state->Context->Instance, nullptr);
         ::SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(state->Context->FontUi), TRUE);
+        SubclassModernButton(button, id, state->Context->FontUi, state->Context->FontBold, kColorCardBg);
         return button;
+    }
+
+    void PaintDialogCardCanvas(HWND hwnd, HDC targetDc)
+    {
+        RECT client{};
+        ::GetClientRect(hwnd, &client);
+        if (client.right <= 0 || client.bottom <= 0)
+        {
+            return;
+        }
+        HDC memDc = ::CreateCompatibleDC(targetDc);
+        HBITMAP memBmp = ::CreateCompatibleBitmap(targetDc, client.right, client.bottom);
+        HGDIOBJ oldBmp = ::SelectObject(memDc, memBmp);
+
+        HBRUSH bgBrush = ::CreateSolidBrush(kColorBgCanvas);
+        ::FillRect(memDc, &client, bgBrush);
+        ::DeleteObject(bgBrush);
+
+        HBRUSH cardBrush = ::CreateSolidBrush(kColorCardBg);
+        HPEN borderPen = ::CreatePen(PS_SOLID, 1, kColorCardBorder);
+        HGDIOBJ oldBrush = ::SelectObject(memDc, cardBrush);
+        HGDIOBJ oldPen = ::SelectObject(memDc, borderPen);
+        ::RoundRect(memDc, 10, 10, client.right - 10, client.bottom - 10, 8, 8);
+        ::SelectObject(memDc, oldPen);
+        ::SelectObject(memDc, oldBrush);
+        ::DeleteObject(borderPen);
+        ::DeleteObject(cardBrush);
+
+        ::BitBlt(targetDc, 0, 0, client.right, client.bottom, memDc, 0, 0, SRCCOPY);
+        ::SelectObject(memDc, oldBmp);
+        ::DeleteObject(memBmp);
+        ::DeleteDC(memDc);
     }
 
     std::wstring ReadDateText(HWND picker)
@@ -3801,11 +4320,11 @@ namespace
         {
             case WM_CREATE:
             {
-                const int labelX = 16;
+                const int labelX = 24;
                 const int labelWidth = 76;
-                const int fieldX = 100;
-                const int fieldWidth = kMetaDialogWidth - fieldX - 16;
-                int y = 16;
+                const int fieldX = 106;
+                const int fieldWidth = kMetaDialogWidth - fieldX - 24;
+                int y = 22;
 
                 CreateMetaLabel(hwnd, state, labelX, y + 3, labelWidth, L"会社");
                 ::SetWindowTextW(
@@ -3848,18 +4367,39 @@ namespace
 
                 CreateMetaLabel(hwnd, state, labelX, y, labelWidth, L"扩展集留言");
                 ::SetWindowTextW(CreateMetaEdit(hwnd, state, IDC_YUA_META_COMMENT, labelX, y + 20,
-                                                kMetaDialogWidth - 32, 84,
+                                                kMetaDialogWidth - 48, 84,
                                                 ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL),
                                  state->Value.comment.c_str());
                 y += 112;
 
                 HWND ok = CreateMetaButton(hwnd, state, IDC_YUA_META_OK, L"确定", BS_DEFPUSHBUTTON | WS_GROUP);
-                ::SetWindowPos(ok, nullptr, kMetaDialogWidth - 16 - 80 - 8 - 80, y, 80, 26,
+                ::SetWindowPos(ok, nullptr, kMetaDialogWidth - 24 - 84 - 8 - 84, y, 84, 28,
                                SWP_NOZORDER | SWP_NOACTIVATE);
                 HWND cancel = CreateMetaButton(hwnd, state, IDC_YUA_META_CANCEL, L"取消", 0);
-                ::SetWindowPos(cancel, nullptr, kMetaDialogWidth - 16 - 80, y, 80, 26,
+                ::SetWindowPos(cancel, nullptr, kMetaDialogWidth - 24 - 84, y, 84, 28,
                                SWP_NOZORDER | SWP_NOACTIVATE);
                 return 0;
+            }
+            case WM_ERASEBKGND:
+            {
+                PaintDialogCardCanvas(hwnd, reinterpret_cast<HDC>(wParam));
+                return 1;
+            }
+            case WM_PAINT:
+            {
+                PAINTSTRUCT ps{};
+                HDC dc = ::BeginPaint(hwnd, &ps);
+                PaintDialogCardCanvas(hwnd, dc);
+                ::EndPaint(hwnd, &ps);
+                return 0;
+            }
+            case WM_CTLCOLORSTATIC:
+            case WM_CTLCOLOREDIT:
+            {
+                HDC dc = reinterpret_cast<HDC>(wParam);
+                ::SetTextColor(dc, kColorText);
+                ::SetBkColor(dc, kColorCardBg);
+                return reinterpret_cast<LRESULT>(state->Context->WhiteBrush);
             }
             case WM_COMMAND:
             {
@@ -4784,6 +5324,11 @@ namespace
         if (button)
         {
             ::SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(context->FontUi), TRUE);
+            if ((extraStyle & BS_TYPEMASK) != BS_OWNERDRAW && (extraStyle & BS_TYPEMASK) != BS_GROUPBOX)
+            {
+                const COLORREF parentBg = (id == IDC_YUA_LOGBTN) ? kColorBgCanvas : kColorCardBg;
+                SubclassModernButton(button, id, context->FontUi, context->FontBold, parentBg);
+            }
         }
         return button;
     }
@@ -4791,9 +5336,13 @@ namespace
     HWND CreateGroup(HWND parent, UiContext* context, int id, const wchar_t* text, bool keepInHome)
     {
         HWND group = CreateButton(parent, context, id, text, BS_GROUPBOX);
-        if (group && keepInHome)
+        if (group)
         {
-            context->HomeControls.push_back(group);
+            SubclassModernGroup(group, context->FontBold);
+            if (keepInHome)
+            {
+                context->HomeControls.push_back(group);
+            }
         }
         return group;
     }
@@ -4826,10 +5375,11 @@ namespace
             ::SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(context.FontUi), TRUE);
             context.TargetControls.push_back(label);
 
-            HWND edit = ::CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 10, 10,
-                                          window, (HMENU)(INT_PTR)IDC_YUA_EXE_EDIT, context.Instance, nullptr);
+            HWND edit = ::CreateWindowExW(0, L"EDIT", L"",
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 10,
+                                          10, window, (HMENU)(INT_PTR)IDC_YUA_EXE_EDIT, context.Instance, nullptr);
             ::SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(context.FontUi), TRUE);
+            ::SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(6, 6));
             context.TargetControls.push_back(edit);
 
             context.TargetControls.push_back(CreateButton(window, &context, IDC_YUA_EXE_BROWSE, L"选择"));
@@ -4861,18 +5411,20 @@ namespace
             ::SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(context.FontUi), TRUE);
             context.LibControls.push_back(label);
 
-            HWND publishers = ::CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-                                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY, 0, 0,
-                                                10, 10, window, (HMENU)(INT_PTR)IDC_YUA_LIB_PUBLISHERS,
-                                                context.Instance, nullptr);
+            HWND publishers = ::CreateWindowExW(
+                0, L"LISTBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                0, 0, 10, 10, window, (HMENU)(INT_PTR)IDC_YUA_LIB_PUBLISHERS, context.Instance, nullptr);
             ::SendMessageW(publishers, WM_SETFONT, reinterpret_cast<WPARAM>(context.FontUi), TRUE);
+            ::SendMessageW(publishers, LB_SETITEMHEIGHT, 0, 20);
             context.LibControls.push_back(publishers);
 
-            HWND titles = ::CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-                                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY, 0, 0,
-                                            10, 10, window, (HMENU)(INT_PTR)IDC_YUA_LIB_TITLES, context.Instance,
-                                            nullptr);
+            HWND titles = ::CreateWindowExW(
+                0, L"LISTBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                0, 0, 10, 10, window, (HMENU)(INT_PTR)IDC_YUA_LIB_TITLES, context.Instance, nullptr);
             ::SendMessageW(titles, WM_SETFONT, reinterpret_cast<WPARAM>(context.FontUi), TRUE);
+            ::SendMessageW(titles, LB_SETITEMHEIGHT, 0, 20);
             context.LibControls.push_back(titles);
         }
 
@@ -5924,58 +6476,60 @@ namespace
             {
                 UiContext& context = *state->Context;
                 const int width = kOnlineDialogWidth;
-                int y = 14;
+                int y = 20;
 
-                HWND label = ::CreateWindowExW(0, L"STATIC", L"仓库地址", WS_CHILD | WS_VISIBLE | SS_LEFT, 16,
-                                               y + 3, 60, 18, hwnd, nullptr, context.Instance, nullptr);
-                ::SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(context.FontUi), TRUE);
+                HWND label = ::CreateWindowExW(0, L"STATIC", L"仓库地址", WS_CHILD | WS_VISIBLE | SS_LEFT, 22,
+                                               y + 4, 62, 18, hwnd, nullptr, context.Instance, nullptr);
+                ::SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(context.FontBold), TRUE);
 
                 const int buttonWidth = 96;
-                const int editWidth = width - 80 - 16 - buttonWidth - 8;
-                HWND endpoint = ::CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 80, y,
-                                                  editWidth, 24, hwnd,
+                const int editWidth = width - 86 - 22 - buttonWidth - 8;
+                HWND endpoint = ::CreateWindowExW(0, L"EDIT", L"",
+                                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
+                                                  86, y, editWidth, 24, hwnd,
                                                   (HMENU)(INT_PTR)IDC_YUA_ONLINE_ENDPOINT, context.Instance,
                                                   nullptr);
                 ::SendMessageW(endpoint, WM_SETFONT, reinterpret_cast<WPARAM>(context.FontUi), TRUE);
+                ::SendMessageW(endpoint, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(6, 6));
                 // 弹窗必须显示当前基址（§14.5）：否则"点了没反应却不知道在打哪个地址"。
                 // 填的是**配置里的原文**（见 ConfiguredEndpointText）—— 用归一化后的生效值填，
                 // 配置写成 http/ftp 时这里会是空的，用户等于看见"我从没填过地址"（验证 P-2）。
                 ::SetWindowTextW(endpoint, ConfiguredEndpointText().c_str());
 
                 PlaceOnlineControl(CreateButton(hwnd, &context, IDC_YUA_ONLINE_REFRESH, L"拉取索引"),
-                                   width - 16 - buttonWidth, y, buttonWidth, 24);
+                                   width - 22 - buttonWidth, y - 1, buttonWidth, 26);
                 y += 32;
 
                 // LBS_NOINTEGRALHEIGHT：列表必须是我给的高度，别被系统吸附到"整数行"上，
                 // 否则它会比下面的进度条高出半行、把布局挤歪。
-                HWND list = ::CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-                                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY |
-                                                  LBS_NOINTEGRALHEIGHT,
-                                              16, y, width - 32, 190, hwnd, (HMENU)(INT_PTR)IDC_YUA_ONLINE_LIST,
+                HWND list = ::CreateWindowExW(0, L"LISTBOX", L"",
+                                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL |
+                                                  LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                                              22, y, width - 44, 188, hwnd, (HMENU)(INT_PTR)IDC_YUA_ONLINE_LIST,
                                               context.Instance, nullptr);
                 ::SendMessageW(list, WM_SETFONT, reinterpret_cast<WPARAM>(context.FontUi), TRUE);
-                y += 198;
+                ::SendMessageW(list, LB_SETITEMHEIGHT, 0, 20);
+                y += 196;
 
-                HWND bar = ::CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE, 16, y, width - 32, 18,
+                HWND bar = ::CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE, 22, y, width - 44, 16,
                                              hwnd, (HMENU)(INT_PTR)IDC_YUA_ONLINE_PROGRESS, context.Instance,
                                              nullptr);
                 ::SendMessageW(bar, PBM_SETRANGE32, 0, 100);
                 ::SendMessageW(bar, PBM_SETPOS, 0, 0);
-                y += 26;
+                y += 24;
 
-                HWND status = ::CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                                WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY |
+                HWND status = ::CreateWindowExW(0, L"EDIT", L"",
+                                                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_READONLY |
                                                     ES_AUTOVSCROLL | WS_VSCROLL,
-                                                16, y, width - 32, 118, hwnd,
+                                                22, y, width - 44, 118, hwnd,
                                                 (HMENU)(INT_PTR)IDC_YUA_ONLINE_STATUS, context.Instance, nullptr);
                 ::SendMessageW(status, WM_SETFONT, reinterpret_cast<WPARAM>(context.FontUi), TRUE);
                 y += 126;
 
                 PlaceOnlineControl(CreateButton(hwnd, &context, IDC_YUA_ONLINE_INSTALL, L"下载并安装选中"),
-                                   width - 16 - 80 - 8 - 150, y, 150, 28);
+                                   width - 22 - 84 - 8 - 154, y, 154, 28);
                 PlaceOnlineControl(CreateButton(hwnd, &context, IDC_YUA_ONLINE_CLOSE, L"关闭"),
-                                   width - 16 - 80, y, 80, 28);
+                                   width - 22 - 84, y, 84, 28);
 
                 // 初始状态栏同时给出两个值：框里那串是"待用的地址"（配置原文），
                 // 「当前生效基址」是配置里真正能用的那个 —— 两者不一样时才是要注意的时候（P-2）。
@@ -5988,6 +6542,28 @@ namespace
                                     L"任一条不过就丢弃，库与库清单一个字节都不改。");
                 RefreshOnlineButtons(*state);
                 return 0;
+            }
+            case WM_ERASEBKGND:
+            {
+                PaintDialogCardCanvas(hwnd, reinterpret_cast<HDC>(wParam));
+                return 1;
+            }
+            case WM_PAINT:
+            {
+                PAINTSTRUCT ps{};
+                HDC dc = ::BeginPaint(hwnd, &ps);
+                PaintDialogCardCanvas(hwnd, dc);
+                ::EndPaint(hwnd, &ps);
+                return 0;
+            }
+            case WM_CTLCOLORSTATIC:
+            case WM_CTLCOLOREDIT:
+            case WM_CTLCOLORLISTBOX:
+            {
+                HDC dc = reinterpret_cast<HDC>(wParam);
+                ::SetTextColor(dc, kColorText);
+                ::SetBkColor(dc, kColorCardBg);
+                return reinterpret_cast<LRESULT>(state->Context->WhiteBrush);
             }
             case WM_COMMAND:
             {
@@ -6278,6 +6854,7 @@ namespace
                                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                                   CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
                 context->WhiteBrush = ::CreateSolidBrush(RGB(255, 255, 255));
+                context->CanvasBrush = ::CreateSolidBrush(kColorBgCanvas);
                 context->LogBrush = ::CreateSolidBrush(kColorLogBackground);
 
                 ::InitializeCriticalSection(&context->Job.Lock);
@@ -6293,6 +6870,21 @@ namespace
                 UpdateHint(*context);
                 UpdateOverview(*context);
                 ::SetTimer(hwnd, kRefreshTimerId, kRefreshIntervalMs, nullptr);
+                return 0;
+            }
+
+            case WM_ERASEBKGND:
+            {
+                PaintMainWindowCanvas(reinterpret_cast<HDC>(wParam), *context);
+                return 1;
+            }
+
+            case WM_PAINT:
+            {
+                PAINTSTRUCT ps{};
+                HDC dc = ::BeginPaint(hwnd, &ps);
+                PaintMainWindowCanvas(dc, *context);
+                ::EndPaint(hwnd, &ps);
                 return 0;
             }
 
@@ -6328,22 +6920,27 @@ namespace
 
             case WM_CTLCOLORSTATIC:
             case WM_CTLCOLOREDIT:
+            case WM_CTLCOLORLISTBOX:
             {
                 HWND control = reinterpret_cast<HWND>(lParam);
+                HDC dc = reinterpret_cast<HDC>(wParam);
                 if (control == ::GetDlgItem(hwnd, IDC_YUA_LOGVIEW))
                 {
-                    ::SetTextColor(reinterpret_cast<HDC>(wParam), kColorLogText);
-                    ::SetBkColor(reinterpret_cast<HDC>(wParam), kColorLogBackground);
+                    ::SetTextColor(dc, kColorLogText);
+                    ::SetBkColor(dc, kColorLogBackground);
                     return reinterpret_cast<LRESULT>(context->LogBrush);
                 }
-                if (control == ::GetDlgItem(hwnd, IDC_YUA_OVERVIEW) ||
-                    control == ::GetDlgItem(hwnd, IDC_YUA_PAGE) ||
-                    control == ::GetDlgItem(hwnd, IDC_YUA_SET_STATUS))
+                if (control == ::GetDlgItem(hwnd, IDC_YUA_HINT) ||
+                    control == ::GetDlgItem(hwnd, IDC_YUA_LIB_PUB_LABEL) ||
+                    control == ::GetDlgItem(hwnd, IDC_YUA_LIB_TITLE_LABEL))
                 {
-                    ::SetBkColor(reinterpret_cast<HDC>(wParam), RGB(255, 255, 255));
+                    ::SetTextColor(dc, kColorMuted);
+                    ::SetBkColor(dc, kColorCardBg);
                     return reinterpret_cast<LRESULT>(context->WhiteBrush);
                 }
-                break;
+                ::SetTextColor(dc, kColorText);
+                ::SetBkColor(dc, kColorCardBg);
+                return reinterpret_cast<LRESULT>(context->WhiteBrush);
             }
 
             case WM_TIMER:
@@ -6740,6 +7337,7 @@ namespace
                     if (context->FontBold) ::DeleteObject(context->FontBold);
                     if (context->FontMono) ::DeleteObject(context->FontMono);
                     if (context->WhiteBrush) ::DeleteObject(context->WhiteBrush);
+                    if (context->CanvasBrush) ::DeleteObject(context->CanvasBrush);
                     if (context->LogBrush) ::DeleteObject(context->LogBrush);
                 }
                 ::PostQuitMessage(0);

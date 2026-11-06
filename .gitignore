@@ -376,6 +376,8 @@ md/
 
 # Temp files
 Release_old/
+# 本地按版本号命名的 Release 产物目录（如 Release-v1.2.0-ui/），含二进制与 ExtensionLibrary，不入库
+/Release-*/
 README_add.txt
 
 # ---- YuaExtract 本仓库追加 ----

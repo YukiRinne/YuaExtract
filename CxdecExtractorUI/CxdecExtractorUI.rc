@@ -52,24 +52,24 @@ END
 // Dialog
 //
 
-IDD_MainForm DIALOGEX 0, 0, 420, 278
-STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+IDD_MainForm DIALOGEX 0, 0, 480, 320
+STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN
 EXSTYLE WS_EX_ACCEPTFILES
-CAPTION "Cxdec Batch Extractor"
-FONT 9, "Microsoft YaHei UI", 400, 0, 0x86
+CAPTION "YuaExtract - XP3 批量解包器"
+FONT 9, "微软雅黑", 400, 0, 0x86
 BEGIN
-    LTEXT           "Drop XP3 files here, or click Add Files to queue them in batch.",IDC_DropHint,7,7,258,10
-    PUSHBUTTON      "Add Files",IDC_AddFiles,306,5,50,14
-    PUSHBUTTON      "Clear Done",IDC_ClearCompleted,360,5,53,14
-    LTEXT           "Output:",-1,7,28,34,10
-    EDITTEXT        IDC_OutputPath,44,25,312,14,ES_AUTOHSCROLL
-    PUSHBUTTON      "Browse",IDC_BrowseOutput,360,25,53,14
-    CONTROL         "完成弹窗",IDC_NotifyPopup,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,7,46,55,10
-    CONTROL         "完成提示音",IDC_NotifySound,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,69,46,60,10
-    LTEXT           "Workers: Auto",IDC_WorkerInfo,300,46,113,10
-    CONTROL         "",IDC_OverallProgress,PROGRESS_CLASS,WS_BORDER | WS_TABSTOP,7,62,406,12
-    LTEXT           "Waiting for tasks",IDC_StatusText,7,79,406,10
-    CONTROL         "",IDC_TaskList,"SysListView32",LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,7,93,406,176
+    LTEXT           "将 XP3 封包拖入此窗口，或点击「添加封包」批量加入解包队列",IDC_DropHint,16,15,290,12
+    PUSHBUTTON      "添加封包",IDC_AddFiles,342,12,58,18
+    PUSHBUTTON      "清理已完成",IDC_ClearCompleted,404,12,60,18
+    LTEXT           "输出目录",-1,16,38,40,12
+    EDITTEXT        IDC_OutputPath,58,36,342,16,ES_AUTOHSCROLL | WS_BORDER,0
+    PUSHBUTTON      "选择目录",IDC_BrowseOutput,404,35,60,18
+    CONTROL         "完成弹窗",IDC_NotifyPopup,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,16,60,58,12
+    CONTROL         "完成提示音",IDC_NotifySound,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,82,60,64,12
+    LTEXT           "工作线程: 自动",IDC_WorkerInfo,360,61,104,12
+    CONTROL         "",IDC_OverallProgress,PROGRESS_CLASS,PBS_SMOOTH | WS_TABSTOP,16,78,448,12
+    LTEXT           "等待添加解包任务",IDC_StatusText,16,94,448,12
+    CONTROL         "",IDC_TaskList,"SysListView32",LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,16,120,448,184
 END
 
 
