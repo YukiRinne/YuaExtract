@@ -47,6 +47,10 @@ static std::wstring g_KrkrExeDirectory;
 // 原版功能窗口（IDD_MainForm）现在由 YuaExtract 主界面按需打开，不再自己撑起整个进程。
 // 只有它确实是"主窗口"时（老用法）才在关闭时结束消息循环，否则关掉它会把整个程序带走。
 static bool g_LegacyDialogOwnsApp = false;
+// 原版功能窗口句柄。主界面按需打开 / 复用，RunLegacyAction 也用它当命令目标。
+static HWND g_LegacyWindow = nullptr;
+// WebView2 桥的日志镜像。默认空 = 只写文件，行为与以前完全一致。
+static Yua::Host::LogSink g_LogSink = nullptr;
 
 namespace
 {
@@ -2755,6 +2759,11 @@ INT_PTR CALLBACK LoaderDialogWindProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         case WM_DESTROY:
         {
             ClearLoaderWindowHandleEnv();
+            if (hwnd == g_LegacyWindow)
+            {
+                // 句柄失效后 RunLegacyAction 会重建窗口，不能留着一个“看起来还开着”的旧值。
+                g_LegacyWindow = nullptr;
+            }
             // 由 YuaExtract 主界面按需打开时，关掉这个窗口只是关掉一个辅助窗口，
             // 不能把整个消息循环带走（否则主界面会跟着消失）。
             if (g_LegacyDialogOwnsApp)
@@ -2949,23 +2958,70 @@ namespace Host
 
     void ShowLegacyFunctionsWindow(HWND owner)
     {
-        static HWND legacyWindow = nullptr;
-        if (legacyWindow != nullptr && ::IsWindow(legacyWindow))
+        if (g_LegacyWindow != nullptr && ::IsWindow(g_LegacyWindow))
         {
-            ::SetForegroundWindow(legacyWindow);
+            ::SetForegroundWindow(g_LegacyWindow);
             return;
         }
 
         // 这个窗口不再是"主窗口"：关闭它不能结束整个进程。
         g_LegacyDialogOwnsApp = false;
-        legacyWindow = ::CreateDialogParamW(::GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_MainForm),
-                                            owner, LoaderDialogWindProc, 0u);
-        if (legacyWindow == nullptr)
+        g_LegacyWindow = ::CreateDialogParamW(::GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_MainForm),
+                                              owner, LoaderDialogWindProc, 0u);
+        if (g_LegacyWindow == nullptr)
         {
             ::MessageBoxW(owner, L"打开原版功能窗口失败。", kProductName, MB_OK | MB_ICONERROR);
             return;
         }
-        ::ShowWindow(legacyWindow, SW_SHOWNORMAL);
+        ::ShowWindow(g_LegacyWindow, SW_SHOWNORMAL);
+    }
+
+    bool RunLegacyAction(HWND owner, const std::wstring& action, std::wstring& errorOut)
+    {
+        int command = 0;
+        if (action == L"extractor")
+        {
+            command = IDC_Extractor;
+        }
+        else if (action == L"dumper")
+        {
+            command = IDC_StringDumper;
+        }
+        else if (action == L"hashRestore")
+        {
+            command = IDC_HashRestore;
+        }
+        else if (action == L"keyStatic")
+        {
+            command = IDC_KeyStatic;
+        }
+        else if (action == L"repack")
+        {
+            command = IDC_Repack;
+        }
+        else
+        {
+            errorOut = L"未知的原版功能：" + action;
+            return false;
+        }
+
+        // 原版动作全部挂在 IDD_MainForm 的按钮上。这里不抄一份实现，
+        // 而是复用同一个对话框与同一批 WM_COMMAND 处理器：行为与用户手点完全一致。
+        if (g_LegacyWindow == nullptr || !::IsWindow(g_LegacyWindow))
+        {
+            ShowLegacyFunctionsWindow(owner);
+        }
+        if (g_LegacyWindow == nullptr)
+        {
+            errorOut = L"原版功能窗口没有建起来。";
+            return false;
+        }
+        g_LegacyDialogOwnsApp = false;
+        ::SetForegroundWindow(g_LegacyWindow);
+        // BN_CLICKED + 按钮句柄：LoaderDialogWindProc 只看 LOWORD(wParam)。
+        ::PostMessageW(g_LegacyWindow, WM_COMMAND, MAKEWPARAM(command, BN_CLICKED),
+                       reinterpret_cast<LPARAM>(::GetDlgItem(g_LegacyWindow, command)));
+        return true;
     }
 
     bool RunStaticKeyExtractionForTarget(HWND owner)
@@ -2981,6 +3037,16 @@ namespace Host
     void LogLine(Log::Level level, const std::wstring& text)
     {
         LoaderLogLevel(level, text.c_str());
+        if (g_LogSink != nullptr)
+        {
+            // 镜像给界面（WebView2 桥）。可能来自 worker 线程，接收方自行保证线程安全。
+            g_LogSink(level, text);
+        }
+    }
+
+    void SetLogSink(LogSink sink)
+    {
+        g_LogSink = sink;
     }
 
     std::wstring Format(const wchar_t* format, ...)

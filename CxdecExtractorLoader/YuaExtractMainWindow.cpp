@@ -19,8 +19,10 @@
 #include <commctrl.h>
 #include <richedit.h>
 #include <shellapi.h>
+#include <WebView2.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -436,6 +438,15 @@ namespace
         std::wstring LastStaticNote;
         // 「扩展集」页签最近一次操作的结论（刷新 / 打开目录 / 自检），显示在右侧「扩展集详情」里。
         std::wstring SetPageNote;
+        // 最近一次「扩展集留言」读出的内容（OnSetShowNote 成功时填，失败时清空）。
+        // NoteText 是弹窗里那段完整中文（WebView 的 notes 事件原样发它）；
+        // 其余四个是档案 META 的原始字段，给前端单独展示用。
+        // 不复用 SetPageNote：那是页签状态行，语义不同。
+        std::wstring NoteText;
+        std::wstring NoteContributor;
+        std::wstring NoteVersion;
+        std::wstring NoteDate;
+        std::wstring NoteComment;
         // 最近一次「运行环境自检」的逐项结论。**存下来**而不是每次重绘都重跑：
         // 详情面板会被反复重绘（切页签、改窗口大小、定时器），自检要读盘 + 解档案，不能当重绘副作用。
         std::vector<SelfCheckItem> SelfCheck;
@@ -470,6 +481,33 @@ namespace
     UiContext* ContextOf(HWND hwnd)
     {
         return reinterpret_cast<UiContext*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+
+    // ---------- WebView2 桥的前置声明 ----------
+    //
+    // 实现在文件末尾的 YuaWebViewBridge.inl（那里能用到本文件的全部动作函数）。
+    // 下面这些声明让布局 / 状态更新在最早期就能把变化镜像给 WebView2：
+    // 桥没启用时全部是空操作，Win32 行为保持不变。
+    namespace Bridge
+    {
+        bool UsingWebView();
+        int LayoutOffsetX();
+        void Attach(UiContext& context);
+        void Detach();
+        void Resize(UiContext& context);
+        void HandlePush(UiContext& context);
+        void HandleWork(UiContext& context, LPARAM parameter);
+        void SetForcedLegacy(bool enabled);
+        void NotifyWorkspace(UiContext& context);
+        void NotifyLibrary(UiContext& context);
+        void NotifyUi(UiContext& context, const wchar_t* reason);
+        void NotifyJob(UiContext& context);
+        void NotifyRestore(UiContext& context, unsigned int state, unsigned int percent);
+        void NotifyLog(Log::Level level, const std::wstring& text);
+        void NotifyToast(const wchar_t* level, const wchar_t* title, const wchar_t* body);
+        void NotifyPicked(const wchar_t* kind, const std::wstring& path);
+        void NotifySelfCheck(UiContext& context);
+        void NotifyNotes(UiContext& context);
     }
 
     // ---------- 扩展集：路径、模式与库清单的小工具 ----------
@@ -855,6 +893,7 @@ namespace
             ::SendMessageW(publishers, LB_SETCURSEL, static_cast<WPARAM>(selected), 0);
         }
         RefillTitleList(context);
+        Bridge::NotifyLibrary(context);
     }
 
     // ---------- 字体、画刷与现代控件自绘 ----------
@@ -2359,6 +2398,12 @@ namespace
             context.Paths = BuildWorkspace(text);
             RefreshSetPaths(context);
             Host::SetTargetExe(text);
+            if (context.Window != nullptr)
+            {
+                // 手工改路径也要同步标题栏与 Bridge 工作区信息，否则失焦后标题仍是旧 exe。
+                ::SetWindowTextW(context.Window, BuildCaption(text).c_str());
+                Bridge::NotifyWorkspace(context);
+            }
         }
     }
 
@@ -2479,6 +2524,8 @@ namespace
             view = ::GetDlgItem(context.Window, IDC_YUA_PAGE);
         }
         SetViewRuns(view, &context, runs, false);
+        // 概览内容真的变了：把工作区快照同步给 WebView2（未启用时是空操作）。
+        Bridge::NotifyWorkspace(context);
     }
 
     void UpdateLogView(UiContext& context)
@@ -2516,7 +2563,9 @@ namespace
         {
             return;
         }
-        ::SetWindowPos(control, nullptr, x, y, width, height,
+        // WebView2 占满客户区时，Win32 控件整体左移 32000 像素：句柄、可见性、文本、
+        // 命令全部原样保留（拖放 / 键盘 / 自动化仍能投递），只是不能从视觉上透出来。
+        ::SetWindowPos(control, nullptr, x + Bridge::LayoutOffsetX(), y, width, height,
                        SWP_NOZORDER | SWP_NOACTIVATE | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
     }
 
@@ -2944,6 +2993,7 @@ namespace
         UpdateOverview(context);
         // 页签选中态与右栏内容都换过了，这里再整窗重绘一次（含自绘页签按钮）。
         RedrawAllControls(context);
+        Bridge::NotifyUi(context, L"tab");
     }
 
     // ---------- 动作 ----------
@@ -3080,6 +3130,8 @@ namespace
         context.RenderedOverview.clear();
         RefreshProbes(context, true);
         UpdateOverview(context);
+        Bridge::NotifyWorkspace(context);
+        Bridge::NotifyPicked(L"exe", exePath);
     }
 
     void OnBrowseExe(UiContext& context)
@@ -3483,6 +3535,7 @@ namespace
         }
         SetTaskProgress(context, percent);
         SetTaskText(context, stage.empty() ? L"正在处理……" : stage);
+        Bridge::NotifyJob(context);
     }
 
     // 模式1 步骤1：加载选中的扩展集 → 写 StaticHash_Output\StaticHash.lst。
@@ -3835,6 +3888,8 @@ namespace
         context.RenderedOverview.clear();
         RefreshProbes(context, true);
         UpdateOverview(context);
+        Bridge::NotifyJob(context);
+        Bridge::NotifyLibrary(context);
     }
 
     // 关窗前的收尾。**超时不等于线程结束**：只有 WAIT_OBJECT_0 才关闭句柄并释放 Job；
@@ -3924,6 +3979,7 @@ namespace
         context.RenderedOverview.clear();
         UpdateHint(context);
         UpdateOverview(context);
+        Bridge::NotifyUi(context, L"mode");
     }
 
     // 步骤3：打开资源名还原窗口。
@@ -4121,6 +4177,8 @@ namespace
         context.RenderedOverview.clear();
         RefreshProbes(context, true);
         UpdateOverview(context);
+        Bridge::NotifyRestore(context, static_cast<unsigned int>(state),
+                              state == Restore::kStateCompleted ? 100u : 0u);
     }
 
     void OnReservedFeature(UiContext& context, const wchar_t* feature)
@@ -4147,6 +4205,7 @@ namespace
         {
             UpdateLogView(context);
         }
+        Bridge::NotifyUi(context, L"logOpen");
     }
 
     // ---------- 首页「扩展集选择」的列表交互（设计稿 §8.3） ----------
@@ -4179,6 +4238,7 @@ namespace
         RefillTitleList(context);
         context.RenderedOverview.clear();
         UpdateOverview(context);
+        Bridge::NotifyUi(context, L"selection");
     }
 
     void OnTitleSelected(UiContext& context)
@@ -4186,6 +4246,7 @@ namespace
         context.SelectedTitle = ListBoxSelectedText(::GetDlgItem(context.Window, IDC_YUA_LIB_TITLES));
         context.RenderedOverview.clear();
         UpdateOverview(context);
+        Bridge::NotifyUi(context, L"selection");
     }
 
     // ---------- 「编辑扩展集信息」弹窗（设计稿 §8.2 图2） ----------
@@ -5228,27 +5289,39 @@ namespace
     // 扩展集留言（只读弹窗）。
     // **与制作页签图2 里那个「扩展集留言」输入框不是一回事**：那个往 META.comment 里写，
     // 这个只是把选中档案里已经写着的留言读出来给人看。
-    void OnSetShowNote(UiContext& context)
+    // 返回值：true = 真的读出了档案（Note* 五个字段已填，可以 NotifyNotes）；
+    //         false = 任何失败（此时五个字段已清空，避免下次把旧留言再发出去）。
+    bool OnSetShowNote(UiContext& context)
     {
+        const auto clearNote = [&context]() {
+            context.NoteText.clear();
+            context.NoteContributor.clear();
+            context.NoteVersion.clear();
+            context.NoteDate.clear();
+            context.NoteComment.clear();
+        };
         if (RejectIfBusy(context, L"查看扩展集留言"))
         {
-            return;
+            clearNote();
+            return false;
         }
         if (context.SelectedPublisher.empty() || context.SelectedTitle.empty())
         {
+            clearNote();
             Host::ShowInfo(context.Window, L"先在左侧「扩展集选择」里选一个会社，再选一个作品，\r\n"
                                            L"然后点「扩展集留言」看这份档案的留言。");
-            return;
+            return false;
         }
         const std::wstring path = SelectedArchivePath(context);
         if (path.empty() || !FileExistsAt(path))
         {
+            clearNote();
             Host::ShowError(context.Window,
                             L"找不到这份扩展集的档案：\r\n" +
                                 (path.empty() ? std::wstring(L"（路径未知）") : path) +
                                 L"\r\n\r\n点「刷新列表」重新扫一遍库；如果它确实不在库里，"
                                 L"先在「制作扩展集」页签生成并安装，或用本页签「在线更新」下载安装。");
-            return;
+            return false;
         }
 
         // 只读 META，所以走 ReadArchiveFile 而不是 LoadArchiveFile：
@@ -5259,11 +5332,12 @@ namespace
         std::wstring error;
         if (!ExtensionSet::ReadArchiveFile(path, archive, error))
         {
+            clearNote();
             Host::ShowError(context.Window,
                             L"读不出这份扩展集档案：\r\n" + path + L"\r\n\r\n" +
                                 (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
             Host::LogLine(Log::Level::Warn, L"[YuaExtract] 读扩展集留言失败：" + path + L"：" + error);
-            return;
+            return false;
         }
 
         const ExtensionSet::Meta& meta = archive.meta;
@@ -5298,7 +5372,18 @@ namespace
         Host::LogLine(Log::Level::Info,
                       L"[YuaExtract] 查看扩展集留言：" + context.SelectedPublisher + L" / " +
                           context.SelectedTitle + L" ← " + path);
-        Host::ShowInfo(context.Window, text);
+        // 存下完整中文与 META 原始字段，WebView 侧由 NotifyNotes 发给壳；
+        // 纯 Win32 界面仍走弹窗，WebView 侧弹窗换成壳里的留言层，不再 ShowInfo。
+        context.NoteText = text;
+        context.NoteContributor = meta.contributor;
+        context.NoteVersion = meta.version;
+        context.NoteDate = meta.date;
+        context.NoteComment = meta.comment;
+        if (!Bridge::UsingWebView())
+        {
+            Host::ShowInfo(context.Window, text);
+        }
+        return true;
     }
 
     // 在线更新：弹窗自己负责拉索引 / 下载 / 入库；关掉之后主界面重新扫一次库，
@@ -6827,6 +6912,12 @@ namespace
 
     // ---------- 窗口过程 ----------
 
+    // ========================================================================
+    // WebView2 桥。放在这里展开（而不是单独一个 cpp）：它要用到上面这一整套
+    // 动作函数与 UiContext，独立编译单元就得把这些全部导出成公开接口。
+    // ========================================================================
+#include "YuaWebViewBridge.inl"
+
     LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         if (msg == WM_NCCREATE)
@@ -6870,6 +6961,8 @@ namespace
                 UpdateHint(*context);
                 UpdateOverview(*context);
                 ::SetTimer(hwnd, kRefreshTimerId, kRefreshIntervalMs, nullptr);
+                // WebView2 壳：起不来就留在纯 Win32 界面（fail-closed，不伪造数据）。
+                Bridge::Attach(*context);
                 return 0;
             }
 
@@ -6891,6 +6984,7 @@ namespace
             case WM_SIZE:
             {
                 LayoutWindow(*context);
+                Bridge::Resize(*context);
                 return 0;
             }
 
@@ -7012,6 +7106,20 @@ namespace
             case Restore::kRestoreNotifyMessage:
             {
                 OnRestoreWindowNotify(*context, static_cast<Restore::RestoreTaskState>(wParam));
+                return 0;
+            }
+
+            case Bridge::kPushMessage:
+            {
+                // 后台线程只入队；真正的 PostWebMessageAsJson 必须在这里（UI 线程）做。
+                Bridge::HandlePush(*context);
+                return 0;
+            }
+
+            case Bridge::kWorkMessage:
+            {
+                // 在线更新的后台线程跑完了：在这里落地安装结果、刷新库。
+                Bridge::HandleWork(*context, lParam);
                 return 0;
             }
 
@@ -7340,6 +7448,7 @@ namespace
                     if (context->CanvasBrush) ::DeleteObject(context->CanvasBrush);
                     if (context->LogBrush) ::DeleteObject(context->LogBrush);
                 }
+                Bridge::Detach();
                 ::PostQuitMessage(0);
                 return 0;
             }
@@ -7350,6 +7459,22 @@ namespace
 
 int RunMainWindow(HINSTANCE instance, const std::wstring& initialExe)
 {
+    // 纯 Win32 回退：命令行 --legacy-win32，或环境变量 YUA_LEGACY_WIN32=1。
+    // 这是排障 / 老系统（没有 WebView2 Runtime）的明确出口，而不是“失败了就偷偷换界面”。
+    {
+        bool forcedLegacy = false;
+        wchar_t env[32]{};
+        if (::GetEnvironmentVariableW(L"YUA_LEGACY_WIN32", env, _countof(env)) > 0)
+        {
+            forcedLegacy = env[0] == L'1' || _wcsicmp(env, L"true") == 0 || _wcsicmp(env, L"yes") == 0;
+        }
+        if (!forcedLegacy && ::wcsstr(::GetCommandLineW(), L"--legacy-win32") != nullptr)
+        {
+            forcedLegacy = true;
+        }
+        Bridge::SetForcedLegacy(forcedLegacy);
+    }
+
     INITCOMMONCONTROLSEX commonControls{ sizeof(commonControls),
                                          ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS | ICC_DATE_CLASSES };
     ::InitCommonControlsEx(&commonControls);
