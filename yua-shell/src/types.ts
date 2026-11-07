@@ -132,6 +132,7 @@ export interface WorkspaceSnapshot {
   restoreRate: number | null;
   restoredCount: number;
   hashedCount: number;
+  reportReady: boolean;
 }
 
 export type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
@@ -156,8 +157,8 @@ type HostRequestMessage =
   | { id: string; type: "openDraftDir" }
   | { id: string; type: "openLibraryRoot" }
   | { id: string; type: "openSelectedSet" }
-  | { id: string; type: "pickSourceDir" }
-  | { id: string; type: "pickTestDir" }
+  | { id: string; type: "pickSourceDir"; clear?: boolean }
+  | { id: string; type: "pickTestDir"; clear?: boolean }
   | { id: string; type: "refreshLibrary" }
   | { id: string; type: "selfCheck" }
   | { id: string; type: "readNotes" }
@@ -173,7 +174,13 @@ type HostRequestMessage =
   | { id: string; type: "startBatch"; outputDir: string; threads: number }
   | { id: string; type: "stopBatch" }
   | { id: string; type: "openLegacy"; action: string }
-  | { id: string; type: "failDemo" };
+  | { id: string; type: "failDemo" }
+  | {
+      id: string;
+      type: "windowControl";
+      action: "minimize" | "maximize" | "close" | "drag" | "resize";
+      edge?: "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se";
+    };
 
 /** Distributes over the request union so every message keeps its own discriminant. */
 type WithProtocolVersion<T> = T extends unknown ? T & { protocolVersion?: 1 } : never;
@@ -204,7 +211,26 @@ export type HostEvent =
   | { type: "notes"; text: string }
   | { type: "picked"; kind: "exe" | "source" | "test" | "output"; path: string }
   | { type: "overlayHint"; overlay: OverlayId; open: boolean }
-  | { type: "uiSync"; patch: Partial<{ tab: TabId; logOpen: boolean; mode: ExtractMode; selectedPublisher: string | null; selectedTitle: string | null }> };
+  | {
+      type: "uiSync";
+      patch: Partial<{
+        tab: TabId;
+        logOpen: boolean;
+        mode: ExtractMode;
+        selectedPublisher: string | null;
+        selectedTitle: string | null;
+        lastAction: string;
+        dryRunNote: string;
+        draftMeta: {
+          publisher: string;
+          title: string;
+          contributor: string;
+          version: string;
+          date: string;
+          comment: string;
+        };
+      }>;
+    };
 
 export interface RestoreStats {
   total: number;

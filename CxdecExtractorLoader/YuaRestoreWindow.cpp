@@ -266,6 +266,9 @@ namespace
         bool Running = false;
         bool FinishIssued = false;
         bool Closed = false;
+        bool Hidden = false;
+        std::wstring LastError;
+        std::wstring MiningStatusText;
         // 本次运行勾没勾「保留未还原文件名的文件」。收尾时的摘要要看它才知道
         // "未还原的那些到底是被丢掉了还是被保留了"，没必要去读复选框（那时它可能已经变了）。
         bool KeepUnrestored = false;
@@ -350,6 +353,32 @@ namespace
             case kStateFailed: return L"失败";
         }
         return L"未知";
+    }
+
+    void ShowRestoreInfo(UiContext* context, const std::wstring& message)
+    {
+        if (context)
+        {
+            context->LastError = message;
+        }
+        if (context && context->Hidden)
+        {
+            return;
+        }
+        Host::ShowInfo(context ? context->Window : nullptr, message);
+    }
+
+    void ShowRestoreError(UiContext* context, const std::wstring& message)
+    {
+        if (context)
+        {
+            context->LastError = message;
+        }
+        if (context && context->Hidden)
+        {
+            return;
+        }
+        Host::ShowError(context ? context->Window : nullptr, message);
     }
 
     // ---------- 日志 ----------
@@ -499,6 +528,8 @@ namespace
         ListView_SetItemText(context->TaskList, row, 4, const_cast<LPWSTR>(snapshot.Info.c_str()));
     }
 
+    void NotifyOwner(UiContext* context, RestoreTaskState state, unsigned int percent);
+
     void UpdateSummary(UiContext* context)
     {
         if (!context)
@@ -547,6 +578,10 @@ namespace
                          FormatString(L"%s - 运行中 %u / 排队 %u / 完成 %u", kWindowTitle, running, queued,
                                       completed)
                              .c_str());
+        if (context->Running)
+        {
+            NotifyOwner(context, kStateRunning, static_cast<unsigned int>(shown));
+        }
     }
 
     // ---------- 收尾 ----------
@@ -816,13 +851,13 @@ namespace
 
         if (packageCount > 0u && !reportOk)
         {
-            Host::ShowError(context->Window, L"还原已跑完，但报告没写出来：\r\n" + reportError);
+            ShowRestoreError(context, L"还原已跑完，但报告没写出来：\r\n" + reportError);
         }
         else if (failed > 0u)
         {
-            Host::ShowInfo(context->Window,
-                           summary + L"\r\n\r\n有封包存在失败条目或未正常收尾，"
-                                     L"详见列表「详细信息」列与日志。");
+            ShowRestoreInfo(context,
+                            summary + L"\r\n\r\n有封包存在失败条目或未正常收尾，"
+                                      L"详见列表「详细信息」列与日志。");
         }
 
         NotifyOwner(context, failed > 0u ? kStateFailed : kStateCompleted, 100u);
@@ -1378,25 +1413,25 @@ namespace
     {
         if (output.empty())
         {
-            Host::ShowInfo(context->Window, L"请先填写还原输出目录。");
+            ShowRestoreInfo(context, L"请先填写还原输出目录。");
             return false;
         }
         std::wstring why;
         if (!PathSafety::ValidateWriteRoots(context->SourceDirectory, output, &why))
         {
             // 与内核同一套真实路径 / 尾点 / 嵌套判定：UI 不能假开始后再让 core 拒绝。
-            Host::ShowError(context->Window,
-                            L"输出目录与解包目录不安全：\r\n" + (why.empty() ? output : why) +
-                                L"\r\n\r\n请换一个与解包目录不相交、无尾点/重解析点的目录。");
+            ShowRestoreError(context,
+                             L"输出目录与解包目录不安全：\r\n" + (why.empty() ? output : why) +
+                                 L"\r\n\r\n请换一个与解包目录不相交、无尾点/重解析点的目录。");
             return false;
         }
         if (_wcsicmp(output.c_str(), context->SourceDirectory.c_str()) == 0 ||
             StartsWithNoCase(context->SourceDirectory, output + L"\\"))
         {
             // 输出目录盖住了解包目录就是就地改写，违反"源目录只读"。
-            Host::ShowError(context->Window,
-                            L"输出目录不能等于、也不能包含解包目录：\r\n" + context->SourceDirectory +
-                                L"\r\n\r\n请换一个目录，源解包结果必须保持原样。");
+            ShowRestoreError(context,
+                             L"输出目录不能等于、也不能包含解包目录：\r\n" + context->SourceDirectory +
+                                 L"\r\n\r\n请换一个目录，源解包结果必须保持原样。");
             return false;
         }
         return true;
@@ -1546,11 +1581,13 @@ namespace
         LogLine(context, true, L"挖掘中：扫描 %s 个文件 / 候选 %s / 命中 %s",
                 FormatCount(scannedFiles).c_str(), FormatCount(candidates).c_str(),
                 FormatCount(hits).c_str());
+        context->MiningStatusText = FormatString(L"推理补充还原挖掘中：扫描 %s 个文件 / 候选 %s / 命中 %s",
+                                                 FormatCount(scannedFiles).c_str(), FormatCount(candidates).c_str(),
+                                                 FormatCount(hits).c_str());
         ::SetWindowTextW(context->StatusText,
-                         FormatString(L"推理补充还原挖掘中：扫描 %s 个文件 / 候选 %s / 命中 %s",
-                                      FormatCount(scannedFiles).c_str(), FormatCount(candidates).c_str(),
-                                      FormatCount(hits).c_str())
-                             .c_str());
+                         context->MiningStatusText.c_str());
+        NotifyOwner(context, kStateRunning,
+                    static_cast<unsigned int>(context->LastAggregatePercent < 0 ? 50 : context->LastAggregatePercent));
     }
 
     // 界面线程处理挖掘结论：写结论日志 → 更新映射计数 → 启动第二遍。
@@ -1581,6 +1618,7 @@ namespace
             context->MiningThread = nullptr;
         }
         context->InSupplementMining = false;
+        context->MiningStatusText.clear();
         context->Supplement = mined;
 
         LogSupplementOutcome(context, mined);
@@ -1608,7 +1646,7 @@ namespace
     {
         if (context->Running)
         {
-            Host::ShowInfo(context->Window, L"还原正在进行中，请等它跑完或直接关闭窗口中止。");
+            ShowRestoreInfo(context, L"还原正在进行中，请等它跑完或直接关闭窗口中止。");
             return;
         }
         if (context->InSupplementMining)
@@ -1620,14 +1658,14 @@ namespace
 
         if (!DirectoryExistsAt(context->SourceDirectory))
         {
-            Host::ShowInfo(context->Window,
-                           L"还没有解包结果，先执行步骤1：\r\n" + context->SourceDirectory);
+            ShowRestoreInfo(context,
+                            L"还没有解包结果，先执行步骤1：\r\n" + context->SourceDirectory);
             return;
         }
         if (!DirectoryExistsAt(context->HashDirectory))
         {
-            Host::ShowInfo(context->Window,
-                           L"还没有 Hash 映射目录，先执行步骤2 并跑一段游戏：\r\n" + context->HashDirectory);
+            ShowRestoreInfo(context,
+                            L"还没有 Hash 映射目录，先执行步骤2 并跑一段游戏：\r\n" + context->HashDirectory);
             return;
         }
 
@@ -1692,9 +1730,9 @@ namespace
         context->FileNameMapEntries = static_cast<unsigned int>(context->Tables.files.size());
         if (context->Tables.directories.empty() && context->Tables.files.empty())
         {
-            Host::ShowInfo(context->Window,
-                           L"映射目录里没有可用的 Hash 映射，先执行步骤2 并跑一段游戏：\r\n" +
-                               context->HashDirectory);
+            ShowRestoreInfo(context,
+                            L"映射目录里没有可用的 Hash 映射，先执行步骤2 并跑一段游戏：\r\n" +
+                                context->HashDirectory);
             return;
         }
         LogLine(context, false, L"映射载入完成：目录 %u 条 / 文件 %u 条，来源 %u 个文件",
@@ -1733,8 +1771,8 @@ namespace
         const std::vector<RestorePackageTask> packages = EnumerateRestorePackages(context->SourceDirectory);
         if (packages.empty())
         {
-            Host::ShowInfo(context->Window,
-                           L"解包目录里没有可还原的封包（顶层子目录）：\r\n" + context->SourceDirectory);
+            ShowRestoreInfo(context,
+                            L"解包目录里没有可还原的封包（顶层子目录）：\r\n" + context->SourceDirectory);
             return;
         }
 
@@ -1817,7 +1855,7 @@ namespace
             context->Running = false;
             SetInputsEnabled(context, true);
             ::KillTimer(context->Window, kWatchdogTimerId);
-            Host::ShowError(context->Window, L"创建工作线程失败，无法开始还原。");
+            ShowRestoreError(context, L"创建工作线程失败，无法开始还原。");
             return;
         }
         LogLine(context, false, L"已启动 %u 个工作线程。", static_cast<unsigned int>(context->Workers.size()));
@@ -2390,7 +2428,7 @@ namespace
 
     void OnBackToMain(UiContext* context)
     {
-        if (context->Running)
+        if (context->Running && !context->Hidden)
         {
             if (!Host::Confirm(context->Window,
                                L"还原还在进行中。关闭本窗口会中止所有任务"
@@ -2783,12 +2821,15 @@ HWND ShowRestoreWindow(HINSTANCE instance, const WindowOptions& options)
 {
     if (g_Context && g_Context->Window && ::IsWindow(g_Context->Window))
     {
-        // 只允许开一个：重复点「步骤3」把它拉到前面就够了，多开会同时往同一个
-        // 输出目录写，重名改名逻辑会把结果拆得到处都是。
-        ::SetForegroundWindow(g_Context->Window);
-        if (::IsIconic(g_Context->Window))
+        if (!options.Hidden)
         {
-            ::ShowWindow(g_Context->Window, SW_RESTORE);
+            g_Context->Hidden = false;
+            ::ShowWindow(g_Context->Window, SW_SHOWNORMAL);
+            ::SetForegroundWindow(g_Context->Window);
+        }
+        else
+        {
+            g_Context->Hidden = true;
         }
         return g_Context->Window;
     }
@@ -2813,6 +2854,7 @@ HWND ShowRestoreWindow(HINSTANCE instance, const WindowOptions& options)
 
     context->Instance = instance;
     context->Owner = options.Owner;
+    context->Hidden = options.Hidden;
     context->GameDirectory = options.GameDirectory;
     context->SourceDirectory = TrimTrailingSeparators(options.SourceDirectory);
     context->HashDirectory = TrimTrailingSeparators(options.HashDirectory);
@@ -2892,9 +2934,12 @@ HWND ShowRestoreWindow(HINSTANCE instance, const WindowOptions& options)
         return nullptr;
     }
 
-    ::ShowWindow(window, SW_SHOWNORMAL);
-    ::UpdateWindow(window);
-    ::SetForegroundWindow(window);
+    if (!options.Hidden)
+    {
+        ::ShowWindow(window, SW_SHOWNORMAL);
+        ::UpdateWindow(window);
+        ::SetForegroundWindow(window);
+    }
     return window;
 }
 
@@ -2916,6 +2961,211 @@ bool IsRestoreRunning(HWND window)
     const UiContext* context =
         reinterpret_cast<const UiContext*>(::GetWindowLongPtrW(window, GWLP_USERDATA));
     return context != nullptr && context->Running;
+}
+
+bool StartRestoreWithOptions(HWND window, const std::wstring& gameDir,
+                             const std::wstring& sourceDir, const std::wstring& hashDir,
+                             const std::wstring& outputDir, unsigned int threads,
+                             bool keepUnresolved, bool inferNames, std::wstring& error)
+{
+    error.clear();
+    if (!window || !::IsWindow(window))
+    {
+        error = L"还原工作窗口未就绪。";
+        return false;
+    }
+    UiContext* context = reinterpret_cast<UiContext*>(::GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (!context)
+    {
+        error = L"还原上下文未就绪。";
+        return false;
+    }
+    if (context->Running || context->InSupplementMining)
+    {
+        error = L"还原正在进行中。";
+        return false;
+    }
+    context->GameDirectory = gameDir;
+    context->SourceDirectory = TrimTrailingSeparators(sourceDir);
+    context->HashDirectory = TrimTrailingSeparators(hashDir);
+    context->OutputDirectory = TrimTrailingSeparators(outputDir);
+    context->LastError.clear();
+    ::SetWindowTextW(context->OutputEdit, context->OutputDirectory.c_str());
+    ::SetWindowTextW(context->WorkerEdit, std::to_wstring(threads).c_str());
+    ::SendMessageW(context->KeepCheck, BM_SETCHECK, keepUnresolved ? BST_CHECKED : BST_UNCHECKED, 0);
+    ::SendMessageW(context->InferCheck, BM_SETCHECK, inferNames ? BST_CHECKED : BST_UNCHECKED, 0);
+    OnStart(context);
+    if (!context->Running)
+    {
+        error = context->LastError.empty() ? std::wstring(L"无法启动还原任务。") : context->LastError;
+        return false;
+    }
+    return true;
+}
+
+void StopRestoreRun(HWND window)
+{
+    if (!window || !::IsWindow(window))
+    {
+        return;
+    }
+    UiContext* context = reinterpret_cast<UiContext*>(::GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (!context)
+    {
+        return;
+    }
+    if (context->InSupplementMining)
+    {
+        context->MiningStatusText = L"正在中止补充还原挖掘……";
+    }
+    if (context->StopEvent)
+    {
+        ::SetEvent(context->StopEvent);
+    }
+    if (context->QueueEvent)
+    {
+        ::SetEvent(context->QueueEvent);
+    }
+    ::PostMessageW(window, kMsgWatchdog, 0, 0);
+}
+
+bool QueryRestoreSnapshot(HWND window, const std::wstring& sourceDir, RunSnapshot& out)
+{
+    out = RunSnapshot{};
+    UiContext* context = (window && ::IsWindow(window))
+                             ? reinterpret_cast<UiContext*>(::GetWindowLongPtrW(window, GWLP_USERDATA))
+                             : nullptr;
+    const std::wstring effectiveSource = TrimTrailingSeparators(sourceDir);
+    if (context && !context->Running && !context->InSupplementMining && !effectiveSource.empty() &&
+        _wcsicmp(context->SourceDirectory.c_str(), effectiveSource.c_str()) != 0)
+    {
+        ScopedCriticalSection guard(&context->QueueLock);
+        context->Tasks.clear();
+        context->Queue.clear();
+        context->FirstPassResults.clear();
+        context->SourceDirectory = effectiveSource;
+    }
+    if (context)
+    {
+        out.running = context->Running;
+        out.inMining = context->InSupplementMining;
+        out.miningText = context->MiningStatusText;
+        out.lastError = context->LastError;
+        out.mined = context->Supplement.newEntries;
+        ScopedCriticalSection guard(&context->QueueLock);
+        if (!context->Tasks.empty())
+        {
+            out.total = static_cast<unsigned int>(context->Tasks.size());
+            unsigned long long agg = 0u;
+            std::vector<RestorePackageResult> results;
+            for (const TaskRecord& task : context->Tasks)
+            {
+                TaskSnapshot ts;
+                ts.id = task.Id;
+                ts.pack = task.PackageName;
+                ts.files = task.FileCount;
+                const unsigned int pct = ComputeTaskProgressPercent(task.Step, task.Percent);
+                ts.progress = static_cast<double>(pct) / 100.0;
+                agg += pct;
+                ts.current = task.CurrentEntry.empty() ? task.Info : task.CurrentEntry;
+                ts.detail = task.Info;
+                if (task.State == kStateQueued)
+                {
+                    ts.status = context->InSupplementMining ? L"mining" : L"queued";
+                    if (context->InSupplementMining)
+                    {
+                        ts.progress = 1.0;
+                    }
+                    ++out.queued;
+                }
+                else if (task.State == kStateRunning)
+                {
+                    ts.status = context->InSupplementMining ? L"mining" : L"running";
+                    if (context->InSupplementMining)
+                    {
+                        ts.progress = 1.0;
+                    }
+                    ++out.runningCount;
+                }
+                else if (task.State == kStateCompleted)
+                {
+                    ts.status = L"done";
+                    ts.progress = 1.0;
+                    ++out.done;
+                }
+                else
+                {
+                    ts.status = L"failed";
+                    ++out.failed;
+                }
+                if (task.Finished)
+                {
+                    results.push_back(task.Result);
+                }
+                out.tasks.push_back(std::move(ts));
+            }
+            if (!context->FirstPassResults.empty())
+            {
+                const RestoreTotals firstTotals = SumRestoreResults(context->FirstPassResults);
+                if (firstTotals.hashNamedFiles > 0u)
+                {
+                    out.pass1Rate = static_cast<double>(firstTotals.restoredFiles) /
+                                    static_cast<double>(firstTotals.hashNamedFiles);
+                }
+                std::map<std::wstring, size_t> secondIdx;
+                for (size_t i = 0; i < results.size(); ++i)
+                {
+                    secondIdx[results[i].packageName] = i;
+                }
+                for (const RestorePackageResult& first : context->FirstPassResults)
+                {
+                    const auto it = secondIdx.find(first.packageName);
+                    if (it == secondIdx.end())
+                    {
+                        results.push_back(first);
+                    }
+                    else
+                    {
+                        results[it->second].restoredFiles += first.restoredFiles;
+                        results[it->second].copiedBytes += first.copiedBytes;
+                    }
+                }
+            }
+            const RestoreTotals totals = SumRestoreResults(results);
+            out.restored = totals.restoredFiles;
+            out.hashed = totals.hashNamedFiles;
+            out.kept = context->KeepUnrestored ? totals.headerSuffixedFiles : 0u;
+            out.discarded = totals.droppedUnrestoredFiles;
+            out.suffixFixed = totals.headerSuffixedFiles;
+            out.aggregateProgress = context->InSupplementMining
+                                        ? 0.95
+                                        : (out.total > 0u ? (static_cast<double>(agg) / out.total / 100.0) : 0.0);
+            return true;
+        }
+    }
+
+    if (!effectiveSource.empty() && DirectoryExistsAt(effectiveSource))
+    {
+        const std::vector<RestorePackageTask> packages = EnumerateRestorePackages(effectiveSource);
+        out.total = static_cast<unsigned int>(packages.size());
+        out.queued = out.total;
+        unsigned int nextId = 1u;
+        for (const RestorePackageTask& pkg : packages)
+        {
+            TaskSnapshot ts;
+            ts.id = nextId++;
+            ts.pack = pkg.packageName;
+            ts.status = L"queued";
+            ts.progress = 0.0;
+            ts.files = pkg.fileCount;
+            ts.detail = FormatString(L"%s 个文件 / %s", FormatCount(pkg.fileCount).c_str(),
+                                     FormatSize(pkg.bytes).c_str());
+            ts.current = ts.detail;
+            out.tasks.push_back(std::move(ts));
+        }
+        return !out.tasks.empty();
+    }
+    return false;
 }
 }
 }

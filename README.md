@@ -25,6 +25,10 @@
 
 ```text
 YuaExtract.exe
+shell/
+  index.html
+  assets/
+  brand/
 CxdecExtractordll/
   CxdecExtractor.dll
   CxdecStringDumper.dll
@@ -34,7 +38,7 @@ CxdecExtractordll/
   ...
 ```
 
-建议使用 Windows 10 / 11。项目沿用 Windows 7 SP1 的目标设置，但本轮验证在 Windows 11 上完成，未重新验证 Windows 7 兼容性。程序与注入模块均为 **x86 / Win32**，不面向 64 位游戏进程。
+建议使用 Windows 10 / 11（需安装 x86 版 Microsoft Edge WebView2 Runtime；若传入 `--legacy-win32` 或设置环境变量 `YUA_LEGACY_WIN32=1`，可使用保留的原生 Win32 界面）。项目沿用 Windows 7 SP1 的目标设置，但本轮验证在 Windows 11 上完成，未重新验证 Windows 7 兼容性。程序与注入模块均为 **x86 / Win32**，不面向 64 位游戏进程。
 
 ## 使用流程
 
@@ -43,7 +47,7 @@ CxdecExtractordll/
 1. 打开工具，选择目标游戏主程序，在首页选择「传统动态模式」。
 2. **步骤 1：解包 XP3。** 提取结果进入工作区的 `Extractor_Output`。
 3. **步骤 2：收集 Hash。** 按界面提示运行游戏，访问需要还原的资源以收集名字映射。
-4. **步骤 3：还原资源名。** 在独立还原窗口选择映射和输出目录，运行后查看 `RestoreReport.txt`。
+4. **步骤 3：还原资源名。** 在还原面板（或 `--legacy-win32` 下的独立还原窗口）确认映射与输出目录，运行后查看 `RestoreReport.txt`。
 
 默认只输出已还原的哈希名资源，同时保留原本就是明文名的文件。若要保留未知资源，勾选「保留未还原文件名的文件」；工具会在可识别时按文件头补后缀。
 
@@ -63,7 +67,7 @@ CxdecExtractordll/
 
 `rules.int` 保存资源名、盐、归属信息及少量例外映射，常规哈希由名字和盐重新计算；不包含图片、音频或脚本等游戏资源本体。制作时合并已有成果并进行自校验；复用时检查归属后展开映射。
 
-在线下载仅接受 HTTPS，并设有超时与体积上限。工具对照索引检查 SHA-256，验证档案结构、CRC 与相关摘要，再用**同一份已校验字节**安装。校验与摘要不能独立证明每个名字都正确，来源可信度和实际还原结果仍需用户判断。
+在线下载仅接受公网 HTTPS（在连接前拒绝 `localhost`、`127.0.0.0/8` / `::1` 本机回环、链路本地、私网与保留段地址），禁止重定向，并设有超时与体积上限。工具对照索引检查 SHA-256，验证档案结构、CRC 与相关摘要，再用**同一份已校验字节**安装。校验与摘要不能独立证明每个名字都正确，来源可信度和实际还原结果仍需用户判断。
 
 安装会在替换前检查现有清单，并对普通写入失败尝试回滚；无法回滚时保留备份并报告。**这不等于跨文件的断电或进程崩溃原子性保证。**
 
@@ -96,7 +100,18 @@ $msbuild = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBui
 if ($LASTEXITCODE -ne 0) { throw 'Release 构建失败' }
 ```
 
-构建前请正常关闭正在使用这些模块的工具与测试程序，避免文件占用。产物位于 `Release\YuaExtract.exe` 与 `Release\CxdecExtractordll\`；调试构建将配置改为 `Debug`，输出位于 `Debug\`。
+构建前端壳并同步至输出目录：
+
+```powershell
+Push-Location yua-shell
+npm ci
+npm run build
+Pop-Location
+New-Item -ItemType Directory -Path Release\shell -Force | Out-Null
+Copy-Item -Path yua-shell\dist\* -Destination Release\shell -Recurse -Force
+```
+
+构建前请正常关闭正在使用这些模块的工具与测试程序，避免文件占用。产物位于 `Release\YuaExtract.exe`、`Release\shell\` 与 `Release\CxdecExtractordll\`；调试构建将配置改为 `Debug`，输出位于 `Debug\`。
 
 GitHub Actions 在 `main` 更新时构建 Release / Debug 并提供工作流产物。**源码推送不等于发布新版 Releases**；仓库的发行流程由 `v*` 标签触发。
 

@@ -88,6 +88,11 @@ function RestoreOverlay() {
   });
   const running = s.restoreTasks.some((x) => x.status === "running" || x.status === "mining" || x.status === "queued")
     || (s.job.kind === "restore" && (s.job.status === "running" || s.job.status === "cancelling"));
+  useEffect(() => {
+    if (!running && s.workspace.restoreDir) {
+      setOpts((prev) => ({ ...prev, outputDir: s.workspace.restoreDir! }));
+    }
+  }, [s.workspace.restoreDir, running]);
   const done = s.job.kind === "restore" && s.job.status === "success" && !s.restoreTasks.some((x) => x.status === "running" || x.status === "mining" || x.status === "queued");
   const failed = s.job.kind === "restore" && s.job.status === "error";
   const [burst, setBurst] = useState(0);
@@ -115,6 +120,9 @@ function RestoreOverlay() {
             </span>
             <div className="row">
               <button className="btn" onClick={() => s.send({ type: "openRestoreDir" })}>{t.openRestore}</button>
+              {(done || s.workspace.reportReady) && (
+                <button className="btn" onClick={() => s.send({ type: "openRestoreReport" })}>{t.viewReport}</button>
+              )}
               {running ? (
                 <button className="btn-danger" onClick={() => s.send({ type: "stopRestore" })}>{t.stopRestore}</button>
               ) : (
@@ -129,7 +137,7 @@ function RestoreOverlay() {
       >
         <div className="row">
           <label className="grow">{t.outputDir}<input className="field" value={opts.outputDir} onChange={(e) => setOpts({ ...opts, outputDir: e.target.value })} /></label>
-          <label>{t.threads}<input className="field" type="number" min={1} max={16} value={opts.threads} onChange={(e) => setOpts({ ...opts, threads: Number(e.target.value) || 1 })} style={{ width: 88 }} /></label>
+          <label>{t.threads}<input className="field" type="number" min={1} max={32} value={opts.threads} onChange={(e) => setOpts({ ...opts, threads: Math.max(1, Math.min(32, Number(e.target.value) || 1)) })} style={{ width: 88 }} /></label>
         </div>
         <div className="opt-toggles">
           <button type="button" className="chip" aria-pressed={opts.keepUnresolved} onClick={() => setOpts({ ...opts, keepUnresolved: !opts.keepUnresolved })}>
@@ -268,6 +276,9 @@ function BatchOverlay() {
   const [out, setOut] = useState(s.workspace.extractDir || "Extractor_Output");
   const [threads, setThreads] = useState(4);
   const [hot, setHot] = useState(false);
+  useEffect(() => {
+    if (s.workspace.extractDir) setOut(s.workspace.extractDir);
+  }, [s.workspace.extractDir]);
   const running = s.job.kind === "extract" && s.job.status === "running" && s.overlays.batch;
   const addFiles = (names: string[]) => s.send({ type: "enqueueXp3", names });
   return (
@@ -311,7 +322,7 @@ function BatchOverlay() {
       </div>
       <div className="row">
         <label className="grow">{t.output}<input className="field" value={out} onChange={(e) => setOut(e.target.value)} /></label>
-        <label>{t.threads}<input className="field" type="number" min={1} max={16} value={threads} onChange={(e) => setThreads(Number(e.target.value) || 1)} style={{ width: 88 }} /></label>
+        <label>{t.threads}<input className="field" type="number" min={1} max={32} value={threads} onChange={(e) => setThreads(Math.max(1, Math.min(32, Number(e.target.value) || 1)))} style={{ width: 88 }} /></label>
       </div>
       <div className="pack-list" style={{ marginTop: 12 }}>
         {s.batchTasks.map((task, i) => (
@@ -336,6 +347,16 @@ function OnlineOverlay() {
   const t = s.t;
   const [endpoint, setEndpoint] = useState(s.remoteBase || s.info?.onlineBase || "");
   const [sel, setSel] = useState<string | null>(null);
+  useEffect(() => {
+    if (!endpoint && (s.remoteBase || s.info?.onlineBase)) {
+      setEndpoint(s.remoteBase || s.info?.onlineBase || "");
+    }
+  }, [s.remoteBase, s.info?.onlineBase, endpoint]);
+  useEffect(() => {
+    if (s.remotes.length > 0 && (!sel || !s.remotes.some((r) => r.id === sel))) {
+      setSel(s.remotes[0].id);
+    }
+  }, [s.remotes, sel]);
   const selected = s.remotes.find((r) => r.id === sel);
   const running = s.job.status === "running" && s.job.kind.startsWith("online");
   return (
@@ -395,13 +416,23 @@ function MetaOverlay() {
   const s = useStore();
   const t = s.t;
   const [meta, setMeta] = useState({
-    publisher: s.selectedPublisher || "",
-    title: s.selectedTitle || "",
-    contributor: "meika",
-    version: "1.3.0",
-    date: "2026-11-06",
-    comment: "",
+    publisher: s.draftMeta.publisher || s.selectedPublisher || "",
+    title: s.draftMeta.title || s.workspace.title || s.selectedTitle || "",
+    contributor: s.draftMeta.contributor || "",
+    version: s.draftMeta.version || "1.0.0",
+    date: s.draftMeta.date || new Date().toISOString().slice(0, 10),
+    comment: s.draftMeta.comment || "",
   });
+  useEffect(() => {
+    setMeta((prev) => ({
+      publisher: s.draftMeta.publisher || prev.publisher || s.selectedPublisher || "",
+      title: s.draftMeta.title || prev.title || s.workspace.title || s.selectedTitle || "",
+      contributor: s.draftMeta.contributor || prev.contributor || "",
+      version: s.draftMeta.version || prev.version || "1.0.0",
+      date: s.draftMeta.date || prev.date || new Date().toISOString().slice(0, 10),
+      comment: s.draftMeta.comment || prev.comment || "",
+    }));
+  }, [s.draftMeta, s.selectedPublisher, s.selectedTitle, s.workspace.title]);
   return (
     <Frame
       id="meta"
@@ -412,7 +443,7 @@ function MetaOverlay() {
           <span />
           <div className="row">
             <button className="btn" onClick={() => s.openOverlay("meta", false)}>{t.cancel}</button>
-            <button className="btn-primary" style={{ width: "auto" }} onClick={() => { s.send({ type: "saveMeta", meta }); s.openOverlay("meta", false); }}>{t.ok}</button>
+            <button className="btn-primary" style={{ width: "auto" }} onClick={() => { s.set({ draftMeta: meta }); s.send({ type: "saveMeta", meta }); s.openOverlay("meta", false); }}>{t.ok}</button>
           </div>
         </>
       }
@@ -487,6 +518,10 @@ function Palette() {
       { id: "s1", label: s.locale === "zh" ? "解包 XP3" : "Extract XP3", run: () => { s.send({ type: "runStep", step: 1 }); s.set({ palette: false }); } },
       { id: "s2", label: s.locale === "zh" ? "收集 Hash" : "Collect hashes", run: () => { s.send({ type: "runStep", step: 2 }); s.set({ palette: false }); } },
       { id: "s3", label: s.locale === "zh" ? "还原资源名" : "Restore names", run: () => { s.send({ type: "runStep", step: 3 }); s.set({ palette: false }); } },
+      { id: "meta", label: s.t.editInfo, run: () => { s.set({ palette: false }); s.openOverlay("meta"); } },
+      { id: "selfcheck", label: s.t.selfCheck, run: () => { s.set({ tab: "library", palette: false }); s.send({ type: "selfCheck" }); } },
+      { id: "openws", label: s.t.openWs, run: () => { s.send({ type: "openWorkspace" }); s.set({ palette: false }); } },
+      { id: "openrestore", label: s.t.openRestore, run: () => { s.send({ type: "openRestoreDir" }); s.set({ palette: false }); } },
       { id: "online", label: s.t.online, run: () => { s.openOverlay("online"); s.send({ type: "fetchIndex" }); s.set({ palette: false }); } },
       { id: "theme", label: s.theme === "dark" ? s.t.light : s.t.dark, run: () => s.set({ theme: s.theme === "dark" ? "light" : "dark", palette: false }) },
       { id: "lang", label: s.locale === "zh" ? "English" : "中文", run: () => s.set({ locale: s.locale === "zh" ? "en" : "zh", palette: false }) },
@@ -547,12 +582,12 @@ function ConfirmDialog() {
 
 function Toasts() {
   const s = useStore();
+  const firstId = s.toasts[0]?.id;
   useEffect(() => {
-    if (!s.toasts.length) return;
-    const id = s.toasts[0].id;
-    const timer = window.setTimeout(() => s.dismissToast(id), 3800);
+    if (firstId == null) return;
+    const timer = window.setTimeout(() => s.dismissToast(firstId), 3800);
     return () => window.clearTimeout(timer);
-  }, [s.toasts, s]);
+  }, [firstId, s.dismissToast]);
   const modalOpen = s.palette || !!s.confirm || Object.values(s.overlays).some(Boolean);
   return (
     <div className={`toasts${modalOpen ? " over-modal" : ""}`} aria-live="polite">

@@ -192,6 +192,7 @@ namespace
         // 概览面板要长期显示归属结论，所以这两个必须由任务线程带回来。
         ExtensionSet::LoadFailure Failure = ExtensionSet::LoadFailure::None;
         bool UnverifiedLoad = false;
+        bool FromWebView = false;
 
         // 线程体的输入（起线程之前填好，之后只读）。
         ExtensionSet::GenerateOptions GenerateOptions;
@@ -472,6 +473,7 @@ namespace
         // OnJobDone 里会弹结论框；模态框会继续派发本窗口的定时器消息。
         // 这个标志让关闭轮询在结论框还开着时不要销毁窗口。
         bool JobDoneUi = false;
+        bool InWebViewRequest = false;
         // 反篡改预检（可能含 60 秒有界等待与多次确认框）正在本窗口线程里跑。
         // 期间任何会 SyncTarget / ResetJob / 起进程的重入动作都必须拒掉，
         // 避免第二次点击同时跑一遍预检。
@@ -508,6 +510,33 @@ namespace
         void NotifyPicked(const wchar_t* kind, const std::wstring& path);
         void NotifySelfCheck(UiContext& context);
         void NotifyNotes(UiContext& context);
+        void NotifyOverlay(const wchar_t* overlay, bool open);
+    }
+
+    void ShowUiInfo(UiContext& context, const wchar_t* title, const std::wstring& body)
+    {
+        if (Bridge::UsingWebView())
+        {
+            Bridge::NotifyToast(L"info", title ? title : L"提示", body.c_str());
+        }
+        if (context.InWebViewRequest)
+        {
+            return;
+        }
+        Host::ShowInfo(context.Window, body);
+    }
+
+    void ShowUiError(UiContext& context, const wchar_t* title, const std::wstring& body)
+    {
+        if (Bridge::UsingWebView())
+        {
+            Bridge::NotifyToast(L"error", title ? title : L"错误", body.c_str());
+        }
+        if (context.InWebViewRequest)
+        {
+            return;
+        }
+        Host::ShowError(context.Window, body);
     }
 
     // ---------- 扩展集：路径、模式与库清单的小工具 ----------
@@ -2422,9 +2451,13 @@ namespace
         context.ExtractProbe = ProbeDirectory(context.Paths.ExtractDir, deep);
         context.HashProbe = ProbeDirectory(context.Paths.HashDir, deep);
         context.RestoreProbe = ProbeDirectory(context.Paths.RestoreDir, deep);
-        if (deep)
+        if (deep || context.HashProbe.exists)
         {
             context.Mapping = LoadMappingSummary(context.Paths.HashDir);
+        }
+        else
+        {
+            context.Mapping = MappingSummary{};
         }
         context.ProbedDeep = deep;
     }
@@ -3016,9 +3049,9 @@ namespace
         {
             return false;
         }
-        Host::ShowInfo(context.Window,
-                       std::wstring(L"后台任务还在跑，暂时不能") + action +
-                           L"。\r\n\r\n等任务结束（或点「取消」并等它真正退出）之后再试。");
+        ShowUiInfo(context, L"后台任务正在运行",
+                   std::wstring(L"后台任务还在跑，暂时不能") + action +
+                       L"。\r\n\r\n等任务结束（或点「取消」并等它真正退出）之后再试。");
         return true;
     }
 
@@ -3112,7 +3145,7 @@ namespace
         }
         if (::GetFileAttributesW(context.ExePath.c_str()) == INVALID_FILE_ATTRIBUTES)
         {
-            Host::ShowError(context.Window, L"目标游戏主程序不存在：\r\n" + context.ExePath);
+            ShowUiError(context, L"目标游戏不存在", L"目标游戏主程序不存在：\r\n" + context.ExePath);
             return std::wstring();
         }
         return context.ExePath;
@@ -3120,8 +3153,26 @@ namespace
 
     void ApplyTarget(UiContext& context, const std::wstring& exePath)
     {
+        const std::wstring oldDir = context.Paths.GameDir;
         context.ExePath = exePath;
         context.Paths = BuildWorkspace(exePath);
+        if (_wcsicmp(oldDir.c_str(), context.Paths.GameDir.c_str()) != 0)
+        {
+            context.Stage = 0;
+            context.StageNote.clear();
+            context.SourceOverride.clear();
+            context.TestSourceOverride.clear();
+            context.HasGenerate = false;
+            context.HasDryRun = false;
+            context.HasStatic = false;
+            context.LastGenerateNote.clear();
+            context.LastTestNote.clear();
+            context.LastStaticNote.clear();
+            context.MakeNote.clear();
+            context.LastLoadNote.clear();
+            context.LastLoadVerdict = LoadVerdict::NotLoaded;
+            context.Meta.title = ExeStem(exePath);
+        }
         RefreshSetPaths(context);
         ::SetWindowTextW(::GetDlgItem(context.Window, IDC_YUA_EXE_EDIT), exePath.c_str());
         Host::SetTargetExe(exePath);
@@ -3132,6 +3183,7 @@ namespace
         UpdateOverview(context);
         Bridge::NotifyWorkspace(context);
         Bridge::NotifyPicked(L"exe", exePath);
+        Bridge::NotifyUi(context, nullptr);
     }
 
     void OnBrowseExe(UiContext& context)
@@ -3493,6 +3545,7 @@ namespace
             return false;
         }
         SetJob& job = context.Job;
+        job.FromWebView = context.InWebViewRequest;
         job.Thread = ::CreateThread(nullptr, 0u, SetJobThreadProc, &context, 0u, nullptr);
         if (!job.Thread)
         {
@@ -3595,9 +3648,20 @@ namespace
         struct DoneUiGuard
         {
             bool& Flag;
-            explicit DoneUiGuard(bool& flag) : Flag(flag) { Flag = true; }
-            ~DoneUiGuard() { Flag = false; }
-        } doneUiGuard(context.JobDoneUi);
+            bool& WebViewFlag;
+            bool PrevWebView;
+            DoneUiGuard(bool& flag, bool& wvFlag, bool wvVal)
+                : Flag(flag), WebViewFlag(wvFlag), PrevWebView(wvFlag)
+            {
+                Flag = true;
+                WebViewFlag = wvVal;
+            }
+            ~DoneUiGuard()
+            {
+                Flag = false;
+                WebViewFlag = PrevWebView;
+            }
+        } doneUiGuard(context.JobDoneUi, context.InWebViewRequest, job.FromWebView);
 
         if (context.ClosePending)
         {
@@ -3622,7 +3686,7 @@ namespace
         {
             context.MakeNote = L"任务已取消（" + TimestampNow() + L"）";
             Host::LogLine(Log::Level::Warn, L"[YuaExtract] 后台任务被取消");
-            Host::ShowInfo(context.Window, L"任务已取消。已经写出的文件保留。");
+            ShowUiInfo(context, L"任务已取消", L"任务已取消。已经写出的文件保留。");
             job.Generate = ExtensionSet::GenerateResult{};
             job.Static = ExtensionSet::StaticHashResult{};
             job.DryRun = ExtensionSet::DryRunResult{};
@@ -3630,6 +3694,9 @@ namespace
             context.RenderedOverview.clear();
             RefreshProbes(context, true);
             UpdateOverview(context);
+            Bridge::NotifyJob(context);
+            Bridge::NotifyWorkspace(context);
+            Bridge::NotifyUi(context, nullptr);
             return;
         }
 
@@ -3644,17 +3711,17 @@ namespace
                     context.MakeNote = L"已生成扩展集档案（" + FormatSize(job.Generate.archiveBytes) + L"）：" +
                                        job.Generate.archivePath;
                     Host::LogLine(Log::Level::Info, L"[YuaExtract] 生成扩展集：" + context.MakeNote);
-                    Host::ShowInfo(context.Window,
-                                   L"扩展集档案已生成：\r\n" + job.Generate.archivePath + L"\r\n\r\n" +
-                                       context.LastGenerateNote);
+                    ShowUiInfo(context, L"扩展集档案已生成",
+                               L"扩展集档案已生成：\r\n" + job.Generate.archivePath + L"\r\n\r\n" +
+                                   context.LastGenerateNote);
                 }
                 else
                 {
                     context.MakeNote = L"生成扩展集失败。";
                     Host::LogLine(Log::Level::Warn, L"[YuaExtract] 生成扩展集失败：" + error);
-                    Host::ShowError(context.Window,
-                                    L"生成当前游戏扩展集失败：\r\n" +
-                                        (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
+                    ShowUiError(context, L"生成当前游戏扩展集失败",
+                                L"生成当前游戏扩展集失败：\r\n" +
+                                    (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
                 }
                 break;
             }
@@ -3688,9 +3755,9 @@ namespace
                     }
                     Host::LogLine(Log::Level::Info, L"[YuaExtract] 模式1 步骤1：" + context.LastStaticNote + L" → " +
                                                         job.Static.path);
-                    Host::ShowInfo(context.Window,
-                                   L"静态 Hash 表已生成：\r\n" + job.Static.path + L"\r\n\r\n" +
-                                       ExtensionSet::DescribeLoadResult(job.Load) + L"\r\n" + context.LastStaticNote);
+                    ShowUiInfo(context, L"静态 Hash 表已生成",
+                               L"静态 Hash 表已生成：\r\n" + job.Static.path + L"\r\n\r\n" +
+                                   ExtensionSet::DescribeLoadResult(job.Load) + L"\r\n" + context.LastStaticNote);
                 }
                 else
                 {
@@ -3795,20 +3862,20 @@ namespace
                         {
                             // 调用方参数不完整（库根 / 会社 / 作品名为空）：这不是档案的问题，
                             // 出路是让用户把「扩展集选择」补齐。
-                            Host::ShowError(context.Window,
-                                            L"无法定位扩展集档案：\r\n" +
-                                                (error.empty() ? std::wstring(L"（库根 / 会社 / 作品名不完整）")
-                                                               : error) +
-                                                L"\r\n\r\n请在左侧「扩展集选择」里重新选择会社与作品"
-                                                L"（还没有装过扩展集就先去「制作扩展集」页签生成并安装）。");
+                            ShowUiError(context, L"无法定位扩展集档案",
+                                        L"无法定位扩展集档案：\r\n" +
+                                            (error.empty() ? std::wstring(L"（库根 / 会社 / 作品名不完整）")
+                                                           : error) +
+                                            L"\r\n\r\n请在左侧「扩展集选择」里重新选择会社与作品"
+                                            L"（还没有装过扩展集就先去「制作扩展集」页签生成并安装）。");
                             break;
                         }
                         default:
                         {
                             // 兜底：没归类的失败只如实报错，不编造"别的游戏"这种结论。
-                            Host::ShowError(context.Window,
-                                            L"生成静态 Hash 表失败：\r\n" +
-                                                (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
+                            ShowUiError(context, L"生成静态 Hash 表失败",
+                                        L"生成静态 Hash 表失败：\r\n" +
+                                            (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
                             break;
                         }
                     }
@@ -3864,20 +3931,43 @@ namespace
                     }
                     Host::LogLine(Log::Level::Info, L"[YuaExtract] 干跑测试完成：" + detail);
                     context.MakeNote = L"干跑测试完成（" + TimestampNow() + L"）";
+                    if (Bridge::UsingWebView())
+                    {
+                        Bridge::NotifyToast(L"info", L"干跑测试完成", context.LastTestNote.c_str());
+                    }
                 }
                 else
                 {
                     context.MakeNote = L"干跑测试失败。";
                     Host::LogLine(Log::Level::Warn, L"[YuaExtract] 干跑测试失败：" + error);
-                    Host::ShowError(context.Window,
-                                    L"测试当前扩展集失败：\r\n" +
-                                        (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
+                    ShowUiError(context, L"测试当前扩展集失败",
+                                L"测试当前扩展集失败：\r\n" +
+                                    (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
                 }
                 break;
             }
             default:
                 break;
         }
+
+        // 先将完成态（含 kind / Ok / Error / LastTestNote / MakeNote）通知给 WebView2，
+        // 再清空 job.Kind，避免 NotifyJob 把刚完成的任务误报成 idle。
+        job.Kind = kind;
+        if (kind == JobKind::DryRun && ok)
+        {
+            job.Stage = context.LastTestNote;
+        }
+        else if (kind == JobKind::Generate && ok)
+        {
+            job.Stage = context.MakeNote;
+        }
+        else if (kind == JobKind::StaticHash && ok)
+        {
+            job.Stage = context.StageNote;
+        }
+        job.Percent = ok ? 100 : 0;
+        Bridge::NotifyJob(context);
+        job.Kind = JobKind::None;
 
         // 结论已经转成文本，几 MB 的结果体不必一直留在内存里。
         job.Generate = ExtensionSet::GenerateResult{};
@@ -3888,8 +3978,9 @@ namespace
         context.RenderedOverview.clear();
         RefreshProbes(context, true);
         UpdateOverview(context);
-        Bridge::NotifyJob(context);
+        Bridge::NotifyWorkspace(context);
         Bridge::NotifyLibrary(context);
+        Bridge::NotifyUi(context, nullptr);
     }
 
     // 关窗前的收尾。**超时不等于线程结束**：只有 WAIT_OBJECT_0 才关闭句柄并释放 Job；
@@ -4047,7 +4138,7 @@ namespace
         SyncTargetFromEdit(context);
         if (context.Paths.GameDir.empty())
         {
-            Host::ShowInfo(context.Window, L"请先选择目标游戏主程序（.exe）。");
+            ShowUiInfo(context, L"未选择目标游戏", L"请先选择目标游戏主程序（.exe）。");
             return;
         }
         // 这是唯一会递归扫盘的入口，显式点击才做。
@@ -4055,6 +4146,10 @@ namespace
         RefreshProbes(context, true);
         UpdateOverview(context);
         Host::LogLine(Log::Level::Info, L"[YuaExtract] 检查状态完成，工作区 " + context.Paths.GameDir);
+        if (Bridge::UsingWebView())
+        {
+            Bridge::NotifyToast(L"info", L"工作区状态已刷新", context.Paths.GameDir.c_str());
+        }
     }
 
     void OnAuxOpenWorkspace(UiContext& context)
@@ -4066,7 +4161,7 @@ namespace
         SyncTargetFromEdit(context);
         if (context.Paths.GameDir.empty())
         {
-            Host::ShowInfo(context.Window, L"请先选择目标游戏主程序（.exe）。");
+            ShowUiInfo(context, L"未选择目标游戏", L"请先选择目标游戏主程序（.exe）。");
             return;
         }
         Host::OpenInExplorer(context.Window, context.Paths.GameDir);
@@ -4081,7 +4176,7 @@ namespace
         SyncTargetFromEdit(context);
         if (!context.RestoreProbe.exists)
         {
-            Host::ShowInfo(context.Window, L"还原目录还不存在，先执行步骤3。");
+            ShowUiInfo(context, L"还原目录不存在", L"还原目录还不存在，先执行步骤3。");
             return;
         }
         Host::OpenInExplorer(context.Window, context.Paths.RestoreDir);
@@ -4097,7 +4192,7 @@ namespace
         if (context.Paths.RestoreReport.empty() ||
             ::GetFileAttributesW(context.Paths.RestoreReport.c_str()) == INVALID_FILE_ATTRIBUTES)
         {
-            Host::ShowInfo(context.Window, L"还原报告还不存在，先执行步骤3。");
+            ShowUiInfo(context, L"还原报告不存在", L"还原报告还不存在，先执行步骤3。");
             return;
         }
         Host::OpenWithShell(context.Window, context.Paths.RestoreReport);
@@ -4112,17 +4207,18 @@ namespace
         SyncTargetFromEdit(context);
         if (context.Paths.GameDir.empty())
         {
-            Host::ShowInfo(context.Window, L"请先选择目标游戏主程序（.exe）。");
+            ShowUiInfo(context, L"未选择目标游戏", L"请先选择目标游戏主程序（.exe）。");
             return;
         }
         if (context.RestoreWindow && ::IsWindow(context.RestoreWindow) &&
             Restore::IsRestoreRunning(context.RestoreWindow))
         {
-            Host::ShowInfo(context.Window, L"还原窗口正在跑任务，先等它结束或关掉那个窗口，再清理目录。");
+            ShowUiInfo(context, L"还原正在运行", L"还原窗口正在跑任务，先等它结束或关掉那个窗口，再清理目录。");
             return;
         }
 
-        if (!Host::Confirm(context.Window,
+        if (!context.InWebViewRequest &&
+            !Host::Confirm(context.Window,
                            L"将删除以下目录及其全部内容，不可恢复：\r\n\r\n" + context.Paths.ExtractDir +
                                L"\r\n" + context.Paths.HashDir + L"\r\n" + context.Paths.RestoreDir +
                                L"\r\n\r\n确认清理？",
@@ -4151,14 +4247,18 @@ namespace
 
         if (!firstError.empty())
         {
-            Host::ShowError(context.Window, L"清理过程中有失败项：\r\n" + firstError);
+            ShowUiError(context, L"清理目录有失败项", L"清理过程中有失败项：\r\n" + firstError);
+        }
+        else if (Bridge::UsingWebView())
+        {
+            Bridge::NotifyToast(L"info", L"已清理产物目录", context.Paths.GameDir.c_str());
         }
     }
 
     // 还原窗口跑完（或中止）后的通报。主界面既不管它的线程，也不去猜它的结果 ——
     // 真正的结果在 Restored_Extractor_Output\RestoreReport.txt 里，这里只负责
     // 重新探一次目录、刷新概览，让用户切回来就能看到最新状态。
-    void OnRestoreWindowNotify(UiContext& context, Restore::RestoreTaskState state)
+    void OnRestoreWindowNotify(UiContext& context, Restore::RestoreTaskState state, unsigned int percent)
     {
         if (state == Restore::kStateRunning)
         {
@@ -4172,13 +4272,14 @@ namespace
                                 TimestampNow() + L"）";
             Host::LogLine(state == Restore::kStateCompleted ? Log::Level::Info : Log::Level::Warn,
                           L"[YuaExtract] 还原窗口已结束：" + context.StageNote);
+            context.RenderedOverview.clear();
+            RefreshProbes(context, true);
+            UpdateOverview(context);
+            Bridge::NotifyWorkspace(context);
         }
 
-        context.RenderedOverview.clear();
-        RefreshProbes(context, true);
-        UpdateOverview(context);
         Bridge::NotifyRestore(context, static_cast<unsigned int>(state),
-                              state == Restore::kStateCompleted ? 100u : 0u);
+                              state == Restore::kStateCompleted ? 100u : percent);
     }
 
     void OnReservedFeature(UiContext& context, const wchar_t* feature)
@@ -4617,7 +4718,7 @@ namespace
         }
         if (context.SelectedPublisher.empty() || context.SelectedTitle.empty())
         {
-            Host::ShowInfo(context.Window, L"请先在左侧「扩展集选择」里选择会社，再选择该作扩展集。");
+            ShowUiInfo(context, L"未选择扩展集", L"请先在左侧「扩展集选择」里选择会社，再选择该作扩展集。");
             return;
         }
         if (context.LibraryRoot.empty())
@@ -4651,6 +4752,13 @@ namespace
         }
         if (context.Meta.publisher.empty())
         {
+            if (context.InWebViewRequest)
+            {
+                Bridge::NotifyToast(L"warn", L"请先填写「会社」",
+                                    L"会社是扩展集库的第一级目录，请先在弹出的窗口里填好会社与游戏名称，再生成。");
+                Bridge::NotifyOverlay(L"meta", true);
+                return;
+            }
             Host::ShowInfo(context.Window,
                            L"还没有填「会社」。\r\n\r\n会社是扩展集库的第一级目录，必须手工填（工具不猜）。\r\n"
                            L"先点「编辑当前扩展集信息」填好会社与游戏名称，再生成。");
@@ -4659,7 +4767,7 @@ namespace
         std::wstring error;
         if (!EnsureDirectory(context.DraftDir, error))
         {
-            Host::ShowError(context.Window, L"无法准备扩展集草案目录：\r\n" + error);
+            ShowUiError(context, L"无法准备扩展集草案目录", L"无法准备扩展集草案目录：\r\n" + error);
             return;
         }
 
@@ -4747,18 +4855,18 @@ namespace
         SyncTargetFromEdit(context);
         if (!FileExistsAt(context.DraftArchive))
         {
-            Host::ShowInfo(context.Window,
-                           L"还没有当前游戏的扩展集档案，先执行「生成当前游戏扩展集」。\r\n\r\n" +
-                               (context.DraftArchive.empty() ? std::wstring(L"（未选择目标游戏）")
-                                                             : context.DraftArchive));
+            ShowUiInfo(context, L"尚未生成扩展集档案",
+                       L"还没有当前游戏的扩展集档案，先执行「生成当前游戏扩展集」。\r\n\r\n" +
+                           (context.DraftArchive.empty() ? std::wstring(L"（未选择目标游戏）")
+                                                         : context.DraftArchive));
             return;
         }
         const std::wstring source = EffectiveTestDirectory(context);
         if (!DirectoryExistsAt(source))
         {
-            Host::ShowInfo(context.Window,
-                           L"测试来源目录不存在：\r\n" + (source.empty() ? std::wstring(L"（未设置）") : source) +
-                               L"\r\n\r\n可以用「选择测试来源目录」指定一份解包目录。");
+            ShowUiInfo(context, L"测试来源目录不存在",
+                       L"测试来源目录不存在：\r\n" + (source.empty() ? std::wstring(L"（未设置）") : source) +
+                           L"\r\n\r\n可以用「选择测试来源目录」指定一份解包目录。");
             return;
         }
 
@@ -4780,13 +4888,13 @@ namespace
         SyncTargetFromEdit(context);
         if (context.DraftDir.empty())
         {
-            Host::ShowInfo(context.Window, L"请先选择目标游戏主程序（.exe）。");
+            ShowUiInfo(context, L"未选择目标游戏", L"请先选择目标游戏主程序（.exe）。");
             return;
         }
         std::wstring error;
         if (!EnsureDirectory(context.DraftDir, error))
         {
-            Host::ShowError(context.Window, error);
+            ShowUiError(context, L"无法创建草稿目录", error);
             return;
         }
         Host::OpenInExplorer(context.Window, context.DraftDir);
@@ -4801,10 +4909,10 @@ namespace
         SyncTargetFromEdit(context);
         if (!FileExistsAt(context.DraftArchive))
         {
-            Host::ShowInfo(context.Window,
-                           L"还没有当前游戏的扩展集档案，先执行「生成当前游戏扩展集」。\r\n\r\n" +
-                               (context.DraftArchive.empty() ? std::wstring(L"（未选择目标游戏）")
-                                                             : context.DraftArchive));
+            ShowUiInfo(context, L"尚未生成扩展集档案",
+                       L"还没有当前游戏的扩展集档案，先执行「生成当前游戏扩展集」。\r\n\r\n" +
+                           (context.DraftArchive.empty() ? std::wstring(L"（未选择目标游戏）")
+                                                         : context.DraftArchive));
             return;
         }
         if (context.LibraryRoot.empty())
@@ -4816,8 +4924,9 @@ namespace
         // 而用户看到的却是"什么都没装"。失败原因一律以内核 error 为准。
         if (!ExtensionSet::InstallToLibrary(context.LibraryRoot, context.DraftArchive, error))
         {
-            Host::ShowError(context.Window, L"安装到扩展集库失败：\r\n" +
-                                                (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
+            ShowUiError(context, L"安装到扩展集库失败",
+                        L"安装到扩展集库失败：\r\n" +
+                            (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
             return;
         }
         context.MakeNote = L"已安装到扩展集库：" + context.LibraryRoot + L"（" + TimestampNow() + L"）";
@@ -4825,11 +4934,12 @@ namespace
         RefreshLibrary(context);
         context.RenderedOverview.clear();
         UpdateOverview(context);
-        Host::ShowInfo(context.Window,
-                       L"已安装到扩展集库：\r\n" + context.LibraryRoot + L"\r\n\r\n会社 / 作品：" +
-                           (context.Meta.publisher.empty() ? std::wstring(L"（未填）") : context.Meta.publisher) +
-                           L" / " + (context.Meta.title.empty() ? std::wstring(L"（未填）") : context.Meta.title) +
-                           L"\r\n\r\n首页「该作扩展集提取」现在可以选到它了。");
+        Bridge::NotifyUi(context, nullptr);
+        ShowUiInfo(context, L"已安装到扩展集库",
+                   L"已安装到扩展集库：\r\n" + context.LibraryRoot + L"\r\n\r\n会社 / 作品：" +
+                       (context.Meta.publisher.empty() ? std::wstring(L"（未填）") : context.Meta.publisher) +
+                       L" / " + (context.Meta.title.empty() ? std::wstring(L"（未填）") : context.Meta.title) +
+                       L"\r\n\r\n首页「该作扩展集提取」现在可以选到它了。");
     }
 
     void OnSetOpenLibrary(UiContext& context)
@@ -5212,7 +5322,7 @@ namespace
             Host::LogLine(Log::Level::Warn, L"[YuaExtract] 扩展集库目录不存在（未新建）：" + context.LibraryRoot);
             context.RenderedOverview.clear();
             UpdateOverview(context);
-            Host::ShowInfo(context.Window, text);
+            ShowUiInfo(context, L"扩展集库尚未创建", text);
             return;
         }
         Host::OpenInExplorer(context.Window, context.LibraryRoot);
@@ -5227,7 +5337,7 @@ namespace
         }
         if (context.SelectedPublisher.empty() || context.SelectedTitle.empty())
         {
-            Host::ShowInfo(context.Window, L"先在左侧「扩展集选择」里选一个会社，再选一个作品。");
+            ShowUiInfo(context, L"未选择扩展集", L"先在左侧「扩展集选择」里选一个会社，再选一个作品。");
             return;
         }
         const std::wstring directory = SelectedLibraryDirectory(context);
@@ -5242,7 +5352,7 @@ namespace
             Host::LogLine(Log::Level::Warn, L"[YuaExtract] 打开选中扩展集失败（目录不存在）：" + directory);
             context.RenderedOverview.clear();
             UpdateOverview(context);
-            Host::ShowInfo(context.Window, text);
+            ShowUiInfo(context, L"库内目录不存在", text);
             return;
         }
         if (Host::OpenInExplorer(context.Window, directory))
@@ -5282,7 +5392,11 @@ namespace
 
         if (problems > 0u)
         {
-            Host::ShowError(context.Window, SelfCheckPlainText(context.SelfCheck));
+            ShowUiError(context, L"运行环境自检发现问题", SelfCheckPlainText(context.SelfCheck));
+        }
+        else if (Bridge::UsingWebView())
+        {
+            Bridge::NotifyToast(L"info", L"运行环境自检通过", SelfCheckSummary(context.SelfCheck).c_str());
         }
     }
 
@@ -5308,19 +5422,20 @@ namespace
         if (context.SelectedPublisher.empty() || context.SelectedTitle.empty())
         {
             clearNote();
-            Host::ShowInfo(context.Window, L"先在左侧「扩展集选择」里选一个会社，再选一个作品，\r\n"
-                                           L"然后点「扩展集留言」看这份档案的留言。");
+            ShowUiInfo(context, L"未选择扩展集",
+                       L"先在左侧「扩展集选择」里选一个会社，再选一个作品，\r\n"
+                       L"然后点「扩展集留言」看这份档案的留言。");
             return false;
         }
         const std::wstring path = SelectedArchivePath(context);
         if (path.empty() || !FileExistsAt(path))
         {
             clearNote();
-            Host::ShowError(context.Window,
-                            L"找不到这份扩展集的档案：\r\n" +
-                                (path.empty() ? std::wstring(L"（路径未知）") : path) +
-                                L"\r\n\r\n点「刷新列表」重新扫一遍库；如果它确实不在库里，"
-                                L"先在「制作扩展集」页签生成并安装，或用本页签「在线更新」下载安装。");
+            ShowUiError(context, L"找不到扩展集档案",
+                        L"找不到这份扩展集的档案：\r\n" +
+                            (path.empty() ? std::wstring(L"（路径未知）") : path) +
+                            L"\r\n\r\n点「刷新列表」重新扫一遍库；如果它确实不在库里，"
+                            L"先在「制作扩展集」页签生成并安装，或用本页签「在线更新」下载安装。");
             return false;
         }
 
@@ -5333,9 +5448,9 @@ namespace
         if (!ExtensionSet::ReadArchiveFile(path, archive, error))
         {
             clearNote();
-            Host::ShowError(context.Window,
-                            L"读不出这份扩展集档案：\r\n" + path + L"\r\n\r\n" +
-                                (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
+            ShowUiError(context, L"读不出扩展集档案",
+                        L"读不出这份扩展集档案：\r\n" + path + L"\r\n\r\n" +
+                            (error.empty() ? std::wstring(L"（内核没有给出原因）") : error));
             Host::LogLine(Log::Level::Warn, L"[YuaExtract] 读扩展集留言失败：" + path + L"：" + error);
             return false;
         }
@@ -5379,7 +5494,7 @@ namespace
         context.NoteVersion = meta.version;
         context.NoteDate = meta.date;
         context.NoteComment = meta.comment;
-        if (!Bridge::UsingWebView())
+        if (!context.InWebViewRequest)
         {
             Host::ShowInfo(context.Window, text);
         }
@@ -6401,10 +6516,18 @@ namespace
         // 结论可能有模态框；关闭轮询看到这个标志就不销毁窗口。
         struct DoneUiGuard
         {
-            bool& Flag;
-            explicit DoneUiGuard(bool& flag) : Flag(flag) { Flag = true; }
-            ~DoneUiGuard() { Flag = false; }
-        } doneUiGuard(state.JobDoneUi);
+            OnlineDialogState& State;
+            explicit DoneUiGuard(OnlineDialogState& s) : State(s)
+            {
+                State.JobDoneUi = true;
+                RefreshOnlineButtons(State);
+            }
+            ~DoneUiGuard()
+            {
+                State.JobDoneUi = false;
+                RefreshOnlineButtons(State);
+            }
+        } doneUiGuard(state);
 
         job.Kind = OnlineJobKind::None;
 
@@ -6988,13 +7111,42 @@ namespace
                 return 0;
             }
 
+            case WM_NCCALCSIZE:
+            {
+                if (wParam == TRUE && Bridge::UsingWebView())
+                {
+                    auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+                    if (::IsZoomed(hwnd))
+                    {
+                        HMONITOR monitor = ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                        MONITORINFO mi{};
+                        mi.cbSize = sizeof(mi);
+                        if (monitor != nullptr && ::GetMonitorInfoW(monitor, &mi))
+                        {
+                            params->rgrc[0] = mi.rcWork;
+                        }
+                        else
+                        {
+                            const int fx = ::GetSystemMetrics(SM_CXSIZEFRAME) + ::GetSystemMetrics(SM_CXPADDEDBORDER);
+                            const int fy = ::GetSystemMetrics(SM_CYSIZEFRAME) + ::GetSystemMetrics(SM_CXPADDEDBORDER);
+                            params->rgrc[0].left += fx;
+                            params->rgrc[0].top += fy;
+                            params->rgrc[0].right -= fx;
+                            params->rgrc[0].bottom -= fy;
+                        }
+                    }
+                    return 0;
+                }
+                break;
+            }
+
             case WM_GETMINMAXINFO:
             {
                 MINMAXINFO* info = reinterpret_cast<MINMAXINFO*>(lParam);
                 // 首页左列现在多了「扩展集选择」与「任务进度」两组，最小高度跟着抬一档，
                 // 否则「辅助操作」会被挤出可视区。
                 info->ptMinTrackSize.x = 960;
-                info->ptMinTrackSize.y = 800;
+                info->ptMinTrackSize.y = Bridge::UsingWebView() ? 640 : 800;
                 return 0;
             }
 
@@ -7105,7 +7257,8 @@ namespace
 
             case Restore::kRestoreNotifyMessage:
             {
-                OnRestoreWindowNotify(*context, static_cast<Restore::RestoreTaskState>(wParam));
+                OnRestoreWindowNotify(*context, static_cast<Restore::RestoreTaskState>(wParam),
+                                      static_cast<unsigned int>(lParam));
                 return 0;
             }
 

@@ -74,7 +74,7 @@ export function createHostBridge(): HostBridge {
       available: true,
       mode: "webview2",
       post(msg) {
-        wv.postMessage(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...msg }));
+        wv.postMessage({ protocolVersion: PROTOCOL_VERSION, ...msg });
       },
       subscribe(fn) {
         const handler = (ev: { data: unknown }) => {

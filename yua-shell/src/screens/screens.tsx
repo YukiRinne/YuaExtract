@@ -76,9 +76,21 @@ export function HomeScreen() {
   const next = nextAction(s);
   const items = pipeItems(s);
   const ni = nextIndex(s);
-  const [open, setOpen] = useState<number>(ni);
+  const [open, setOpen] = useState<number>(ni + 1);
   const [help, setHelp] = useState(false);
+  const helpRef = useRef<HTMLDivElement>(null);
   const [q, setQ] = useState("");
+  useEffect(() => {
+    setOpen(ni + 1);
+  }, [ni]);
+  useEffect(() => {
+    if (!help) return;
+    const onDocDown = (e: MouseEvent) => {
+      if (helpRef.current && !helpRef.current.contains(e.target as Node)) setHelp(false);
+    };
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
+  }, [help]);
   const pubs = useMemo(() => {
     const map = new Map<string, number>();
     for (const e of s.library) map.set(e.publisher, (map.get(e.publisher) || 0) + 1);
@@ -129,7 +141,7 @@ export function HomeScreen() {
             <>
               <div style={{ position: "absolute", top: 12, right: 12, display: "flex", gap: 6 }}>
                 <button className="icon-btn" aria-label={t.browse} onClick={(e) => { e.stopPropagation(); s.send({ type: "browseExe" }); }}><FolderOpen size={15} /></button>
-                <button className="icon-btn" aria-label={t.clearGame} onClick={(e) => { e.stopPropagation(); s.set({ workspace: { ...s.workspace, exe: null, title: null } }); }}><X size={15} /></button>
+                <button className="icon-btn" aria-label={t.clearGame} onClick={(e) => { e.stopPropagation(); s.set({ workspace: { ...s.workspace, exe: null, title: null } }); s.send({ type: "setTarget", path: "" }); }}><X size={15} /></button>
               </div>
               <div className="file-row">
                 <div className="file-ico"><FileTerminal size={22} /></div>
@@ -193,11 +205,18 @@ export function HomeScreen() {
         {w.exe && (
           <div className="stamps">
             {[
-              { icon: <FolderOutput size={16} />, name: "Extractor", path: w.extractDir },
-              { icon: <Database size={16} />, name: s.mode === "extension" ? "Static" : "Hash", path: s.mode === "extension" ? w.staticHashDir : w.hashDir },
-              { icon: <ArchiveRestore size={16} />, name: "Restored", path: w.restoreDir },
+              { icon: <FolderOutput size={16} />, name: "Extractor", path: w.extractDir, act: () => s.send({ type: "openWorkspace" }) },
+              { icon: <Database size={16} />, name: s.mode === "extension" ? "Static" : "Hash", path: s.mode === "extension" ? w.staticHashDir : w.hashDir, act: () => s.send({ type: s.mode === "extension" ? "openWorkspace" : "openCollectDir" }) },
+              { icon: <ArchiveRestore size={16} />, name: "Restored", path: w.restoreDir, act: () => s.send({ type: "openRestoreDir" }) },
             ].map((d) => (
-              <div key={d.name} className="stamp" tabIndex={0}>
+              <div
+                key={d.name}
+                className="stamp"
+                role="button"
+                tabIndex={0}
+                onClick={d.act}
+                onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); d.act(); } }}
+              >
                 <i aria-hidden>{d.icon}</i>
                 <span>
                   <em>{d.name}</em>
@@ -223,7 +242,7 @@ export function HomeScreen() {
       </div>
 
       <aside className="col-side">
-        <div className="next-card">
+        <div className="next-card" ref={helpRef}>
           <div className="stripe" />
           <div className="next-top">
             <button className="help" onClick={() => setHelp((v) => !v)} aria-expanded={help}>
@@ -351,9 +370,25 @@ export function MakeScreen() {
           <h2 style={{ fontSize: 14 }}>{t.testResult}</h2>
           <p className="note">{localizeText(s.dryRunNote, s.locale) || t.noDry}</p>
           <dl className="kv" style={{ marginTop: 16 }}>
-            <dt>{t.sourceDir}</dt><dd><PathLine path={s.sourceOverride || s.workspace.hashDir} fallback={`${t.default}`} /></dd>
-            <dt>{t.testDir}</dt><dd><PathLine path={s.testOverride} fallback={t.follow} /></dd>
-            <dt>{t.archivePath}</dt><dd><PathLine path={s.workspace.workspace ? `${s.workspace.workspace}\\rules.int` : null} /></dd>
+            <dt>{t.sourceDir}</dt>
+            <dd style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <PathLine path={s.sourceOverride || s.workspace.restoreDir} fallback={`${t.default}`} />
+              {s.sourceOverride && (
+                <button type="button" className="icon-btn" style={{ width: 22, height: 22 }} title={t.clearGame} aria-label={t.clearGame} onClick={() => s.send({ type: "pickSourceDir", clear: true })}>
+                  <X size={12} />
+                </button>
+              )}
+            </dd>
+            <dt>{t.testDir}</dt>
+            <dd style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <PathLine path={s.testOverride} fallback={t.follow} />
+              {s.testOverride && (
+                <button type="button" className="icon-btn" style={{ width: 22, height: 22 }} title={t.clearGame} aria-label={t.clearGame} onClick={() => s.send({ type: "pickTestDir", clear: true })}>
+                  <X size={12} />
+                </button>
+              )}
+            </dd>
+            <dt>{t.archivePath}</dt><dd><PathLine path={s.workspace.workspace ? `${s.workspace.workspace}\\ExtensionDraft\\rules.int` : null} /></dd>
           </dl>
         </div>
       </div>
@@ -366,7 +401,22 @@ export function LibraryScreen() {
   const t = s.t;
   const [q, setQ] = useState("");
   const [more, setMore] = useState(false);
+  const moreRef = useRef<HTMLDivElement>(null);
+  const checkRef = useRef<HTMLHeadingElement>(null);
   const asked = useRef(false);
+  useEffect(() => {
+    if (!more) return;
+    const onDocDown = (e: MouseEvent) => {
+      if (moreRef.current && !moreRef.current.contains(e.target as Node)) setMore(false);
+    };
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
+  }, [more]);
+  useEffect(() => {
+    if (s.selfCheck.length > 0) {
+      checkRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [s.selfCheck]);
   useEffect(() => {
     if (asked.current) return;
     asked.current = true;
@@ -398,7 +448,7 @@ export function LibraryScreen() {
         <button className={`btn${updates ? "" : " ghost"}`} onClick={() => { s.openOverlay("online"); s.send({ type: "fetchIndex" }); }} aria-label={t.updates} title={t.updates}>
           <CloudDownload size={14} /><span>{t.updates}</span>{updates > 0 && <span className="badge hi">{updates}</span>}
         </button>
-        <div className="more-wrap">
+        <div className="more-wrap" ref={moreRef}>
           <button className="btn" aria-haspopup="menu" aria-expanded={more} aria-label={s.locale === "zh" ? "更多" : "More"} onClick={() => setMore((v) => !v)}>
             <MoreHorizontal size={16} />
           </button>
@@ -469,7 +519,7 @@ export function LibraryScreen() {
             </dl>
           )}
           <p className="note" style={{ marginTop: 16 }}>{t.cannotVerify}</p>
-          <h2 style={{ fontSize: 14 }}>{t.selfCheck}</h2>
+          <h2 ref={checkRef} style={{ fontSize: 14 }}>{t.selfCheck}</h2>
           {!s.selfCheck.length && <p className="note">{t.selfCheckNever}</p>}
           {s.selfCheck.map((it) => (
             <div key={it.id} className="row" style={{ marginTop: 8, alignItems: "flex-start" }}>

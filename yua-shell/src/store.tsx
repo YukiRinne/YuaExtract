@@ -71,6 +71,14 @@ export interface UiState {
   testOverride: string;
   lastAction: string;
   dryRunNote: string;
+  draftMeta: {
+    publisher: string;
+    title: string;
+    contributor: string;
+    version: string;
+    date: string;
+    comment: string;
+  };
   dropping: boolean;
   confirm: ConfirmSpec | null;
   palette: boolean;
@@ -96,6 +104,7 @@ const emptyWs: WorkspaceSnapshot = {
   restoreRate: null,
   restoredCount: 0,
   hashedCount: 0,
+  reportReady: false,
 };
 
 const initial: UiState = {
@@ -135,6 +144,14 @@ const initial: UiState = {
   testOverride: "",
   lastAction: "",
   dryRunNote: "",
+  draftMeta: {
+    publisher: "",
+    title: "",
+    contributor: "",
+    version: "1.0.0",
+    date: new Date().toISOString().slice(0, 10),
+    comment: "",
+  },
   dropping: false,
   confirm: null,
   palette: false,
@@ -142,6 +159,8 @@ const initial: UiState = {
 
 type Action =
   | { type: "patch"; patch: Partial<UiState> }
+  | { type: "overlay"; id: OverlayId; open: boolean }
+  | { type: "dismissToast"; id: number }
   | { type: "event"; ev: HostEvent };
 
 let logSeq = 1;
@@ -149,6 +168,16 @@ let toastSeq = 1;
 
 function reducer(state: UiState, action: Action): UiState {
   if (action.type === "patch") return { ...state, ...action.patch };
+  if (action.type === "overlay") {
+    return {
+      ...state,
+      overlays: { ...state.overlays, [action.id]: action.open },
+      palette: action.id === "palette" ? action.open : state.palette,
+    };
+  }
+  if (action.type === "dismissToast") {
+    return { ...state, toasts: state.toasts.filter((t) => t.id !== action.id) };
+  }
   const ev = action.ev;
   switch (ev.type) {
     case "hello":
@@ -265,12 +294,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const set = useCallback((patch: Partial<UiState>) => dispatch({ type: "patch", patch }), []);
 
   const openOverlay = useCallback((id: OverlayId, open = true) => {
-    dispatch({ type: "patch", patch: { overlays: { ...state.overlays, [id]: open }, palette: id === "palette" ? open : state.palette } });
-  }, [state.overlays, state.palette]);
+    dispatch({ type: "overlay", id, open });
+  }, []);
 
   const dismissToast = useCallback((id: number) => {
-    dispatch({ type: "patch", patch: { toasts: state.toasts.filter((t) => t.id !== id) } });
-  }, [state.toasts]);
+    dispatch({ type: "dismissToast", id });
+  }, []);
 
   const notify = useCallback((title: string, body = "", level: ToastItem["level"] = "info") => {
     dispatch({ type: "event", ev: { type: "toast", level, title, body } });

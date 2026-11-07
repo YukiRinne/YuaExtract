@@ -1,21 +1,7 @@
-import { useEffect, useState } from "react";
-import { reduced } from "./widgets";
-
 export function DeskBackdrop() {
-  const [pos, setPos] = useState({ x: 0, y: 0 });
-  useEffect(() => {
-    if (reduced()) return;
-    const onMove = (e: PointerEvent) => {
-      const nx = (e.clientX / window.innerWidth - 0.5) * 2;
-      const ny = (e.clientY / window.innerHeight - 0.5) * 2;
-      setPos({ x: nx, y: ny });
-    };
-    window.addEventListener("pointermove", onMove);
-    return () => window.removeEventListener("pointermove", onMove);
-  }, []);
-  const far = { transform: `translate3d(${pos.x * 8}px, ${pos.y * 6}px, 0)` };
-  const mid = { transform: `translate3d(${pos.x * -14}px, ${pos.y * -9}px, 0)` };
-  const near = { transform: `translate3d(${pos.x * 18}px, ${pos.y * -12}px, 0)` };
+  const far = undefined;
+  const mid = undefined;
+  const near = undefined;
   return (
     <div className="desk-bg" aria-hidden>
       <div className="cx-far" style={far}>

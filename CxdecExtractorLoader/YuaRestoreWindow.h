@@ -31,6 +31,40 @@ namespace Yua
             std::wstring DefaultOutputDirectory; // Restored_Extractor_Output
             std::wstring LogDirectory;      // 工具目录\Log
             HWND Owner = nullptr;
+            bool Hidden = false;            // WebView2 壳内嵌还原层使用：后台宿主窗口不弹窗显示
+        };
+
+        struct TaskSnapshot
+        {
+            unsigned int id = 0;
+            std::wstring pack;
+            std::wstring status;
+            double progress = 0.0;
+            std::wstring current;
+            std::wstring detail;
+            unsigned int files = 0;
+        };
+
+        struct RunSnapshot
+        {
+            bool running = false;
+            bool inMining = false;
+            std::wstring miningText;
+            std::wstring lastError;
+            unsigned int total = 0;
+            unsigned int runningCount = 0;
+            unsigned int queued = 0;
+            unsigned int done = 0;
+            unsigned int failed = 0;
+            unsigned long long restored = 0;
+            unsigned long long hashed = 0;
+            unsigned long long kept = 0;
+            unsigned long long discarded = 0;
+            unsigned long long suffixFixed = 0;
+            unsigned int mined = 0;
+            double aggregateProgress = 0.0;
+            double pass1Rate = -1.0;
+            std::vector<TaskSnapshot> tasks;
         };
 
         // 还原窗口的窗口类名。主界面按类名查找它来判断"还原窗口是不是还开着"。
@@ -46,6 +80,14 @@ namespace Yua
         // 还原窗口是否正在跑任务。主界面的「清理目录」要先问一句，
         // 免得把正在写输出的目录删掉。
         bool IsRestoreRunning(HWND window);
+
+        // WebView2 壳内嵌还原层的控制与快照接口。
+        bool StartRestoreWithOptions(HWND window, const std::wstring& gameDir,
+                                     const std::wstring& sourceDir, const std::wstring& hashDir,
+                                     const std::wstring& outputDir, unsigned int threads,
+                                     bool keepUnresolved, bool inferNames, std::wstring& error);
+        void StopRestoreRun(HWND window);
+        bool QueryRestoreSnapshot(HWND window, const std::wstring& sourceDir, RunSnapshot& out);
 
         // 还原窗口用来跟主界面报信的私有消息：
         //   wParam = 状态码（见 RestoreTaskState），lParam = 当前累计进度百分比。

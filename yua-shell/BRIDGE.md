@@ -7,10 +7,11 @@ When the WebView2 object is missing (browser preview), `src/mock/backend.ts` han
 ## Transport
 
 ```
-UI  →  chrome.webview.postMessage(JSON.stringify(HostRequest))
-C++ →  webview.PostWebMessageAsString(JSON.stringify(HostEvent))
-     or PostWebMessageAsJson
+UI  →  chrome.webview.postMessage({ protocolVersion: 1, ...HostRequest })
+C++ →  webview.PostWebMessageAsJson(JSON_UTF16(HostEvent))
 ```
+
+Important: `chrome.webview.postMessage` must receive a plain JS object, **not** `JSON.stringify(...)`. Passing a string causes WebView2 to wrap it as a JSON string literal in `get_WebMessageAsJson()`, which is not a JSON object. `YuaWebViewBridge.inl` also includes a defensive string-unwrapping fallback.
 
 Each `HostRequest` has an `id` string the host may echo in related logs. Events are not request/response paired; the host pushes state (`workspace`, `job`, `log`, …) whenever it changes.
 
@@ -39,13 +40,14 @@ Types live in `src/types.ts` (`HostRequest`, `HostEvent`).
 | `refreshLibrary` | 刷新列表 | Rescan library + manifest | `library` |
 | `selfCheck` | 运行环境自检 | Seven read-only checks | `selfCheck` |
 | `readNotes` | 扩展集留言 | Decode META comment (do not decode archive on every paint) | `notes` |
-| `fetchIndex` | 拉取索引 | HTTPS GET `index.txt`, no redirects | `remoteIndex` or error |
+| `fetchIndex` | 拉取索引 | Public HTTPS GET `index.txt`, no redirects, rejects localhost/loopback/private/reserved IPs before connecting | `remoteIndex` or error |
 | `downloadRemote` | 下载并安装选中 | Download + 9-point trust chain; confirm overwrite if local-richer | `job`, `library`, `toast` |
-| `startRestore` | 还原窗口「开始」 | Offline restore, N threads, optional keep/infer | `restoreTasks`, `job`, `workspace` |
+| `startRestore` | 还原窗口「开始」 | Offline restore via hidden `YuaRestoreWindow` engine, N threads, optional keep/infer | `restoreTasks`, `job`, `workspace` |
 | `stopRestore` | Close / abort | Cooperative stop, keep copied files | `restoreTasks`, `job` |
 | `startCollectDemo` / `stopGame` / `clearCollectFiles` / `openCollectDir` | Collect console | Game process control + mapping logs | `collect` |
 | `enqueueXp3` / `startBatch` / `stopBatch` | Batch extractor window | Queue `*.xp3`, extract into `Extractor_Output` | `batch` |
 | `openLegacy` | 原版功能 | Open upstream loader dialog (`extractor`/`dumper`/`hashRestore`/`keyStatic`/`repack`) | `overlayHint {legacy}` |
+| `windowControl` | Titlebar drag / resize / min / max / close | Native Win32 window state & `WM_SYSCOMMAND` move/resize | — |
 | `failDemo` | Screenshot / QA only | Optional; host may ignore | — |
 
 ### `runStep` semantics
@@ -82,13 +84,14 @@ Types live in `src/types.ts` (`HostRequest`, `HostEvent`).
 | `notes` | text | Comment / contributor block |
 | `picked` | kind + path | Dialog results |
 | `overlayHint` | overlay id + open | Host asks the shell to show restore/collect/batch/legacy |
+| `ui` | reason + sourceDir/testDir/draftMeta/lastAction/dryRunNote + notes | Syncs MakeScreen overrides, draft metadata, dry-run summary, and note fields |
 
 ## Security notes (must stay on the C++ side)
 
-- Online updates: HTTPS only, no redirects, triple timeouts, size cap, sha256 must match the index, refuse on any container/CRC/digest failure with zero local writes.
+- Online updates: Public HTTPS only (`OnlineHostPolicy` rejects `localhost`, `127.0.0.0/8`, `::1`, link-local, private, and reserved addresses before connecting), no redirects, triple timeouts, size cap, sha256 must match the index, refuse on any container/CRC/digest failure with zero local writes.
 - Never auto-load a downloaded archive; installing ≠ using. Attribution still happens on homepage mode-1 step 1.
 - The archive stores names, not hash layers; the tool cannot prove names are “correct” — restore rate is the ground truth.
 
 ## Hosting the shell
 
-Ship `dist/` next to `YuaExtract.exe` and navigate WebView2 to `shell/index.html` (relative `base: "./"`). Inject `window.chrome.webview` before script execution. The mock backend is tree-shaken only if you compile with a define; in this repo it stays so browser QA remains clickable.
+Ship `dist/*` in `<LoaderDir>\shell\` next to `YuaExtract.exe`. `YuaWebViewBridge.inl` maps virtual host `https://yua.local/` to `<LoaderDir>\shell\` via `SetVirtualHostNameToFolderMapping` and navigates to `https://yua.local/index.html`. Production builds (`vite build`) tree-shake `src/mock/backend.ts` out of `shell/assets/`; if `window.chrome.webview` is absent in a production bundle, the UI fails closed.

@@ -475,10 +475,10 @@ label.check { display: flex; gap: 8px; align-items: flex-start; }
   width: 100%;
   position: relative;
   overflow: hidden;
-  background: #eadce8;
+  background: var(--paper);
 }
-html[data-theme="dark"] .desk { background: #161320; }
-.desk-bg { position: absolute; inset: 0; pointer-events: none; }
+html[data-theme="dark"] .desk { background: var(--paper); }
+.desk-bg { display: none; }
 .blob {
   position: absolute; border-radius: 50%; filter: blur(64px);
   transition: transform 700ms linear;
@@ -500,29 +500,25 @@ html[data-theme="dark"] .blob-c { background: #1e3a44; }
 }
 html[data-theme="dark"] .grain { mix-blend-mode: soft-light; opacity: 0.28; }
 .window {
-  position: absolute;
-  inset: 36px 48px 36px 96px;
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
-  backdrop-filter: blur(22px) saturate(1.4);
-  -webkit-backdrop-filter: blur(22px) saturate(1.4);
-  border-radius: 28px;
-  border: 1px solid color-mix(in srgb, var(--surface) 65%, var(--line));
-  box-shadow: var(--ambient), var(--key),
-    inset 0 1px 0 color-mix(in srgb, var(--hibiscus-ink) 70%, transparent),
-    inset 0 -1px 0 rgba(42, 36, 64, 0.07);
+  position: relative;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--paper);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-radius: 0;
+  border: 0;
+  box-shadow: none;
   display: flex; flex-direction: column;
   overflow: hidden;
   z-index: 2;
 }
 html[data-theme="dark"] .window {
-  box-shadow: var(--ambient), var(--key), inset 0 1px 0 rgba(250, 240, 246, 0.08);
+  box-shadow: none;
 }
 .peek {
-  position: absolute; left: 14px; bottom: 18%; z-index: 3;
-  width: 92px; height: 92px; object-fit: cover; object-position: top center;
-  pointer-events: none; border-radius: 50%;
-  border: 4px solid var(--surface);
-  box-shadow: 0 12px 24px rgba(80, 40, 70, 0.18);
+  display: none;
 }
 .greet {
   padding: 18px 28px 8px;
@@ -750,14 +746,12 @@ html[data-theme="dark"] .cx-near text { fill: #efe8f2; }
   white-space: normal; overflow: visible; text-overflow: unset; max-width: none;
 }
 @media (max-width: 1200px) {
-  .window { inset: 18px 20px 18px 20px; }
-  .peek { width: 56px; height: 56px; left: 10px; }
+  .window { inset: 0; }
   .greet h1 { font-size: 22px; }
   .col-side { max-width: 280px; min-width: 220px; }
 }
 @media (max-width: 1100px) {
-  .peek { display: none; }
-  .window { inset: 10px 12px; border-radius: 22px; }
+  .window { inset: 0; border-radius: 0; }
   .col-main { padding: 8px 12px 12px; }
 }
 
@@ -972,6 +966,52 @@ html[data-theme="dark"] .cx-near text { fill: #efe8f2; }
 }
 .meter > i { min-width: 0; }
 .meter[data-nonzero="true"] > i { min-width: 8px; }
+
+.win-ctrls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 6px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line);
+}
+.win-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dim);
+  display: inline-grid;
+  place-items: center;
+  transition: background 140ms var(--ease), color 140ms var(--ease);
+}
+.win-btn:hover {
+  background: color-mix(in srgb, var(--line) 55%, transparent);
+  color: var(--ink);
+}
+.win-btn.win-close:hover {
+  background: var(--bad);
+  color: #fff;
+}
+.win-btn:focus-visible, .stamp:focus-visible {
+  outline: 2px solid var(--hibiscus);
+  outline-offset: 2px;
+}
+.stamp { cursor: pointer; }
+.win-resize {
+  position: fixed;
+  z-index: 95;
+}
+.win-resize-n { top: 0; left: 8px; right: 8px; height: 5px; cursor: ns-resize; }
+.win-resize-s { bottom: 0; left: 8px; right: 8px; height: 5px; cursor: ns-resize; }
+.win-resize-w { left: 0; top: 8px; bottom: 8px; width: 5px; cursor: ew-resize; }
+.win-resize-e { right: 0; top: 8px; bottom: 8px; width: 5px; cursor: ew-resize; }
+.win-resize-nw { top: 0; left: 0; width: 10px; height: 10px; cursor: nwse-resize; z-index: 96; }
+.win-resize-ne { top: 0; right: 0; width: 10px; height: 10px; cursor: nesw-resize; z-index: 96; }
+.win-resize-sw { bottom: 0; left: 0; width: 10px; height: 10px; cursor: nesw-resize; z-index: 96; }
+.win-resize-se { bottom: 0; right: 0; width: 10px; height: 10px; cursor: nwse-resize; z-index: 96; }
 
 /* Fail-closed bridge diagnostic — shown only when the WebView2 host is missing in production. */
 .bridge-diag {

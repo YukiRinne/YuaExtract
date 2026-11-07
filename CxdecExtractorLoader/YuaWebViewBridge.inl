@@ -581,6 +581,9 @@ namespace Bridge
         // Online::Classify 使用，保证「列表显示的状态」和「下载时判定的状态」同一口径。
         std::vector<ExtensionSet::LibraryEntry> remoteEntries;
         ExtensionSet::LibraryCatalog remoteCatalogSnapshot;
+        volatile LONG onlineCancel = 0;
+        volatile LONG onlineActive = 0;
+        bool pushPosted = false;
     };
 
     State& S()
@@ -608,10 +611,19 @@ namespace Bridge
         {
             return;
         }
+        bool shouldPost = false;
         ::EnterCriticalSection(&state.lock);
         state.pending.push_back(json);
+        if (!state.pushPosted)
+        {
+            state.pushPosted = true;
+            shouldPost = true;
+        }
         ::LeaveCriticalSection(&state.lock);
-        ::PostMessageW(state.main, kPushMessage, 0, 0);
+        if (shouldPost)
+        {
+            ::PostMessageW(state.main, kPushMessage, 0, 0);
+        }
     }
 
     // 队列在 UI 线程排空，只有这里碰 ICoreWebView2::PostWebMessageAsJson。
@@ -626,6 +638,7 @@ namespace Bridge
         std::vector<std::string> batch;
         ::EnterCriticalSection(&state.lock);
         batch.swap(state.pending);
+        state.pushPosted = false;
         ::LeaveCriticalSection(&state.lock);
 
         if (!state.ready || state.webview == nullptr)
@@ -958,6 +971,29 @@ namespace Bridge
             patch.emplace_back("selectedTitle",
                                context.SelectedTitle.empty() ? "null" : JsonString(context.SelectedTitle));
         }
+        if (what.empty() || what == L"meta")
+        {
+            const std::wstring defaultTitle =
+                context.Meta.title.empty() ? ExeStem(context.ExePath) : context.Meta.title;
+            const std::wstring defaultDate =
+                context.Meta.date.empty() ? TodayText() : context.Meta.date;
+            patch.emplace_back("draftMeta",
+                               JsonObject({
+                                   { "publisher", JsonString(context.Meta.publisher) },
+                                   { "title", JsonString(defaultTitle) },
+                                   { "contributor", JsonString(context.Meta.contributor) },
+                                   { "version", JsonString(context.Meta.version) },
+                                   { "date", JsonString(defaultDate) },
+                                   { "comment", JsonString(context.Meta.comment) },
+                               }));
+        }
+        if (what.empty())
+        {
+            patch.emplace_back("lastAction", JsonString(context.MakeNote));
+            patch.emplace_back("dryRunNote", JsonString(context.LastTestNote));
+            patch.emplace_back("sourceOverride", JsonString(context.SourceOverride));
+            patch.emplace_back("testOverride", JsonString(context.TestSourceOverride));
+        }
         if (patch.empty())
         {
             return;
@@ -1025,8 +1061,12 @@ namespace Bridge
         {
             return;
         }
+        Restore::RunSnapshot snap;
+        Restore::QueryRestoreSnapshot(context.RestoreWindow, context.Paths.ExtractDir, snap);
+
         const wchar_t* status = L"running";
-        std::wstring text = L"还原窗口正在跑任务";
+        std::wstring text = L"正在还原资源名……";
+        std::wstring errText;
         if (state == Restore::kStateCompleted)
         {
             status = L"success";
@@ -1035,45 +1075,65 @@ namespace Bridge
         else if (state == Restore::kStateFailed)
         {
             status = L"error";
-            text = L"还原失败，详见还原窗口日志";
+            text = snap.lastError.empty() ? std::wstring(L"还原结束，有失败项") : snap.lastError;
+            errText = text;
         }
         else if (state == Restore::kStateQueued)
         {
-            status = L"running";
-            text = L"还原任务排队中";
+            status = snap.running ? L"running" : L"idle";
+            text = snap.running ? L"还原任务排队中" : L"已就绪，点击「开始」执行还原";
         }
-        Emit(JobJson(L"restore", status, static_cast<double>(percent) / 100.0, text, std::wstring()));
-        // 还原窗口是独立的 Win32 窗口；主界面这边的任务列表为空是事实，
-        // 不把编造的分包进度推给前端。整体统计只认 RestoreReport.txt：
-        // 任务结束（成功或失败）且报告解析得出来才填真实数字；进行中不编进度，仍是 0 / null。
+        const double progressVal =
+            (state == Restore::kStateCompleted)
+                ? 1.0
+                : (snap.running ? snap.aggregateProgress : static_cast<double>(percent) / 100.0);
+        Emit(JobJson(L"restore", status, progressVal, text, errText));
+
         const RestoreStats restore =
             (state == Restore::kStateCompleted || state == Restore::kStateFailed)
                 ? LoadRestoreStats(context.Paths.RestoreReport, false)
                 : RestoreStats();
+        std::vector<std::string> taskItems;
+        taskItems.reserve(snap.tasks.size());
+        for (const auto& t : snap.tasks)
+        {
+            taskItems.push_back(JsonObject({
+                { "id", JsonString(Host::Format(L"pack-%u", t.id)) },
+                { "pack", JsonString(t.pack) },
+                { "status", JsonString(t.status) },
+                { "progress", JsonDouble(t.progress) },
+                { "current", JsonString(t.current) },
+                { "detail", JsonString(t.detail) },
+                { "files", JsonNumber(static_cast<long long>(t.files)) },
+            }));
+        }
+        const long long restoredCount =
+            restore.present ? static_cast<long long>(restore.restored) : static_cast<long long>(snap.restored);
+        const long long hashedCount =
+            restore.present ? static_cast<long long>(restore.hashed) : static_cast<long long>(snap.hashed);
         Emit(JsonObject({
             { "type", JsonString(L"restoreTasks") },
-            { "tasks", "[]" },
+            { "tasks", JsonArray(taskItems) },
             { "stats",
               JsonObject({
-                  { "total", JsonNumber(0) },
-                  { "running", JsonNumber(0) },
-                  { "queued", JsonNumber(0) },
-                  { "done", JsonNumber(0) },
-                  { "failed", JsonNumber(0) },
-                  { "restored",
-                    restore.present ? JsonNumber(static_cast<long long>(restore.restored)) : JsonNumber(0) },
-                  { "hashed",
-                    restore.present ? JsonNumber(static_cast<long long>(restore.hashed)) : JsonNumber(0) },
-                  { "kept", JsonNumber(0) },
-                  { "discarded", JsonNumber(0) },
-                  { "suffixFixed", JsonNumber(0) },
-                  { "mined", JsonNumber(0) },
-                  { "pass1Rate", "null" },
+                  { "total", JsonNumber(static_cast<long long>(snap.total)) },
+                  { "running", JsonNumber(static_cast<long long>(snap.runningCount)) },
+                  { "queued", JsonNumber(static_cast<long long>(snap.queued)) },
+                  { "done", JsonNumber(static_cast<long long>(snap.done)) },
+                  { "failed", JsonNumber(static_cast<long long>(snap.failed)) },
+                  { "restored", JsonNumber(restoredCount) },
+                  { "hashed", JsonNumber(hashedCount) },
+                  { "kept", JsonNumber(static_cast<long long>(snap.kept)) },
+                  { "discarded", JsonNumber(static_cast<long long>(snap.discarded)) },
+                  { "suffixFixed", JsonNumber(static_cast<long long>(snap.suffixFixed)) },
+                  { "mined", JsonNumber(static_cast<long long>(snap.mined)) },
+                  { "pass1Rate",
+                    snap.pass1Rate >= 0.0 ? JsonDouble(snap.pass1Rate) : std::string("null") },
                   { "finalRate",
                     restore.present ? JsonDouble(restore.ratePercent / 100.0) : std::string("null") },
               }) },
             { "mining",
-              status == std::wstring(L"running") ? JsonString(text) : std::string("null") },
+              !snap.miningText.empty() ? JsonString(snap.miningText) : std::string("null") },
         }));
     }
 
@@ -1206,7 +1266,7 @@ namespace Bridge
             L"fetchIndex",      L"downloadRemote", L"startRestore",   L"stopRestore",
             L"startCollectDemo", L"stopGame",      L"clearCollectFiles", L"openCollectDir",
             L"enqueueXp3",      L"startBatch",     L"stopBatch",      L"openLegacy",
-            L"failDemo",
+            L"failDemo",        L"windowControl",
         };
         for (const wchar_t* known : kTypes)
         {
@@ -1256,12 +1316,16 @@ namespace Bridge
     DWORD WINAPI OnlineThreadProc(LPVOID parameter)
     {
         OnlineWork* work = static_cast<OnlineWork*>(parameter);
+        Online::Request req;
+        req.cancel = []() -> bool {
+            return ::InterlockedCompareExchange(&S().onlineCancel, 0, 0) != 0 || !S().attached;
+        };
         if (work->kind == OnlineWork::Kind::Index)
         {
             Online::IndexResult info;
             std::vector<ExtensionSet::LibraryEntry> entries;
             std::wstring error;
-            work->ok = Online::FetchIndex(work->base, entries, info, error);
+            work->ok = Online::FetchIndex(work->base, entries, info, error, req);
             work->error = error;
             work->httpStatus = static_cast<unsigned int>(info.httpStatus);
             work->entries = std::move(entries);
@@ -1270,7 +1334,7 @@ namespace Bridge
         {
             Online::DownloadResult download;
             std::wstring error;
-            if (!Online::DownloadArchive(work->base, work->entry, std::wstring(), download, error))
+            if (!Online::DownloadArchive(work->base, work->entry, std::wstring(), download, error, req))
             {
                 work->ok = false;
                 work->error = error;
@@ -1302,22 +1366,36 @@ namespace Bridge
                 Online::CleanupStaging(download.stagingDirectory);
             }
         }
-        if (work->notify != nullptr)
+        ::InterlockedExchange(&S().onlineActive, 0);
+        if (work->notify != nullptr && ::IsWindow(work->notify) && S().attached)
         {
             ::PostMessageW(work->notify, kWorkMessage, 0, reinterpret_cast<LPARAM>(work));
+        }
+        else
+        {
+            delete work;
         }
         return 0;
     }
 
     void StartOnlineWork(OnlineWork* work)
     {
+        if (::InterlockedCompareExchange(&S().onlineActive, 1, 0) != 0)
+        {
+            delete work;
+            NotifyToast(L"info", L"在线更新", L"已有在线更新任务正在进行，请稍候。");
+            return;
+        }
+        ::InterlockedExchange(&S().onlineCancel, 0);
         HANDLE thread = ::CreateThread(nullptr, 0u, OnlineThreadProc, work, 0u, nullptr);
         if (thread == nullptr)
         {
+            ::InterlockedExchange(&S().onlineActive, 0);
             delete work;
             NotifyToast(L"error", L"在线更新", L"启动网络线程失败。");
             return;
         }
+        ::SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
         ::CloseHandle(thread); // 线程自己跑完就退，句柄不需要 join（结果靠消息回来）。
     }
 
@@ -1333,7 +1411,7 @@ namespace Bridge
             Emit(JsonObject({
                 { "type", JsonString(L"remoteIndex") },
                 { "items", "[]" },
-                { "base", JsonString(work->base) },
+                { "base", JsonString(Online::ResolveRepositoryBase()) },
                 { "error", JsonString(work->error) },
             }));
             NotifyToast(L"error", index ? L"索引拉取失败" : L"下载失败", work->error.c_str());
@@ -1427,19 +1505,35 @@ namespace Bridge
         });
     }
 
+    std::wstring TrimWhitespace(std::wstring value)
+    {
+        auto blank = [](wchar_t ch) {
+            return ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n';
+        };
+        while (!value.empty() && blank(value.front()))
+        {
+            value.erase(value.begin());
+        }
+        while (!value.empty() && blank(value.back()))
+        {
+            value.pop_back();
+        }
+        return value;
+    }
+
     // 采集控制台运行在注入模块里；主界面只报"是否已启动 + 空进度"，
     // 不复制一份假的计数。
-    std::string CollectSnapshotJson(bool running)
+    std::string CollectSnapshotJson(const UiContext& context, bool running)
     {
         return JsonObject({
             { "type", JsonString(L"collect") },
             { "running", JsonBool(running) },
             { "uptime", JsonNumber(0) },
             { "pid", JsonNumber(0) },
-            { "dirHit", JsonNumber(0) },
-            { "dirTotal", JsonNumber(0) },
-            { "fileHit", JsonNumber(0) },
-            { "fileTotal", JsonNumber(0) },
+            { "dirHit", JsonNumber(static_cast<long long>(context.Mapping.directoryEntries)) },
+            { "dirTotal", JsonNumber(static_cast<long long>(context.ExtractProbe.topLevelEntries)) },
+            { "fileHit", JsonNumber(static_cast<long long>(context.Mapping.fileNameEntries)) },
+            { "fileTotal", JsonNumber(static_cast<long long>(context.ExtractProbe.files)) },
             { "lines", JsonObject({ { "dir", "[]" }, { "file", "[]" } }) },
         });
     }
@@ -1477,17 +1571,41 @@ namespace Bridge
                 }
                 break;
             case 3:
-                if (context.Mode == ActiveMode::SetExtract)
-                {
-                    OnStep3(context, context.StaticHashDir, true);
-                }
-                else if (context.Mode == ActiveMode::SetCrack)
+                if (context.Mode == ActiveMode::SetCrack)
                 {
                     NotifyToast(L"warn", L"二期预留", L"会社合集是二期预留功能。");
                 }
                 else
                 {
-                    OnStep3(context, context.Paths.HashDir, false);
+                    const bool staticHash = (context.Mode == ActiveMode::SetExtract);
+                    const std::wstring& hashDirectory =
+                        staticHash ? context.StaticHashDir : context.Paths.HashDir;
+                    const std::wstring exe = RequireTarget(context);
+                    if (exe.empty())
+                    {
+                        break;
+                    }
+                    if (!context.ExtractProbe.exists)
+                    {
+                        NotifyToast(L"warn", L"尚未解包 XP3",
+                                    ((staticHash ? L"请先执行步骤2（提取动态 XP3 资源）："
+                                                 : L"请先执行步骤1（提取动态 XP3 资源）：") +
+                                     context.Paths.ExtractDir)
+                                        .c_str());
+                        break;
+                    }
+                    const MappingSummary mapping = LoadMappingSummary(hashDirectory);
+                    if (!mapping.ok)
+                    {
+                        NotifyToast(L"warn", L"缺少 Hash 映射",
+                                    ((staticHash ? L"请先执行步骤1（生成静态 Hash 表）："
+                                                 : L"请先执行步骤2（动态收集 Hash）：") +
+                                     hashDirectory)
+                                        .c_str());
+                        break;
+                    }
+                    NotifyRestore(context, Restore::kStateQueued, 0);
+                    NotifyOverlay(L"restore", true);
                 }
                 break;
             default:
@@ -1525,11 +1643,46 @@ namespace Bridge
         }
         if (type == L"setTarget")
         {
-            const std::wstring path = document.MemberText("path");
+            std::wstring path = TrimWhitespace(document.MemberText("path"));
             if (path.empty())
             {
-                NotifyToast(L"error", L"目标无效", L"setTarget 需要非空 path。");
+                ApplyTarget(context, std::wstring());
+                NotifyUi(context, L"meta");
                 return;
+            }
+            const DWORD attr = ::GetFileAttributesW(path.c_str());
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                std::wstring searchPattern = JoinPath(path, L"*.exe");
+                WIN32_FIND_DATAW fd{};
+                HANDLE find = ::FindFirstFileW(searchPattern.c_str(), &fd);
+                std::wstring candidate;
+                if (find != INVALID_HANDLE_VALUE)
+                {
+                    do
+                    {
+                        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+                        const std::wstring name = fd.cFileName;
+                        if (_wcsnicmp(name.c_str(), L"unins", 5) == 0 ||
+                            _wcsnicmp(name.c_str(), L"UnityCrash", 10) == 0 ||
+                            _wcsnicmp(name.c_str(), L"Cxdec", 5) == 0 ||
+                            _wcsnicmp(name.c_str(), L"YuaExtract", 10) == 0)
+                        {
+                            continue;
+                        }
+                        const std::wstring full = JoinPath(path, name);
+                        if (candidate.empty() ||
+                            (candidate.size() > 10 && _wcsicmp(candidate.c_str() + candidate.size() - 10, L"_crack.exe") == 0))
+                        {
+                            candidate = full;
+                        }
+                    } while (::FindNextFileW(find, &fd));
+                    ::FindClose(find);
+                }
+                if (!candidate.empty())
+                {
+                    path = candidate;
+                }
             }
             if (!Host::ValidateGameExe(context.Window, path))
             {
@@ -1537,6 +1690,7 @@ namespace Bridge
                 return;
             }
             ApplyTarget(context, path);
+            NotifyUi(context, L"meta");
             Host::LogLine(Log::Level::Info, L"[YuaExtract] 目标游戏：" + path);
             return;
         }
@@ -1607,6 +1761,18 @@ namespace Bridge
                              static_cast<double>(context.Job.Percent) / 100.0, context.Job.Stage,
                              std::wstring()));
             }
+            if (context.RestoreWindow != nullptr && ::IsWindow(context.RestoreWindow) &&
+                Restore::IsRestoreRunning(context.RestoreWindow))
+            {
+                Restore::StopRestoreRun(context.RestoreWindow);
+                Host::LogLine(Log::Level::Warn, L"[YuaExtract] 已请求停止还原任务");
+                Emit(JobJson(L"restore", L"cancelling", 0.0, L"正在停止还原……", std::wstring()));
+            }
+            if (::InterlockedCompareExchange(&S().onlineActive, 0, 0) != 0)
+            {
+                ::InterlockedExchange(&S().onlineCancel, 1);
+                Host::LogLine(Log::Level::Warn, L"[YuaExtract] 已请求取消在线更新任务");
+            }
             return;
         }
         if (type == L"generateSet") { OnSetGenerate(context); NotifyJob(context); return; }
@@ -1625,15 +1791,31 @@ namespace Bridge
                 NotifyToast(L"error", L"信息无效", L"saveMeta 需要 meta 对象。");
                 return;
             }
-            context.Meta.publisher = meta->MemberText("publisher");
-            context.Meta.title = meta->MemberText("title");
-            context.Meta.contributor = meta->MemberText("contributor");
-            context.Meta.version = meta->MemberText("version");
-            context.Meta.date = meta->MemberText("date");
-            context.Meta.comment = meta->MemberText("comment");
+            auto clip = [](std::wstring s, size_t maxLen) -> std::wstring {
+                s = TrimWhitespace(s);
+                if (s.size() > maxLen) s.resize(maxLen);
+                return s;
+            };
+            context.Meta.publisher = clip(meta->MemberText("publisher"), 128u);
+            context.Meta.title = clip(meta->MemberText("title"), 128u);
+            if (context.Meta.title.empty() && !context.ExePath.empty())
+            {
+                context.Meta.title = ExeStem(context.ExePath);
+            }
+            context.Meta.contributor = clip(meta->MemberText("contributor"), 128u);
+            context.Meta.version = clip(meta->MemberText("version"), 64u);
+            context.Meta.date = clip(meta->MemberText("date"), 64u);
+            if (context.Meta.date.empty())
+            {
+                context.Meta.date = TodayText();
+            }
+            context.Meta.comment = clip(meta->MemberText("comment"), 2048u);
             context.SetPageNote = L"已更新扩展集信息（生成时才会写进档案）。";
+            context.RenderedOverview.clear();
+            UpdateOverview(context);
             Host::LogLine(Log::Level::Info, L"[YuaExtract] 扩展集信息已更新");
             NotifyToast(L"info", L"扩展集信息已更新", L"重新执行「生成」后新信息才会写进档案。");
+            NotifyUi(context, L"meta");
             NotifyLibrary(context);
             return;
         }
@@ -1642,12 +1824,28 @@ namespace Bridge
         if (type == L"openSelectedSet") { OnSetOpenEntry(context); return; }
         if (type == L"pickSourceDir")
         {
+            if (document.MemberBool("clear", false))
+            {
+                context.SourceOverride.clear();
+                context.RenderedOverview.clear();
+                UpdateOverview(context);
+                NotifyPicked(L"source", std::wstring());
+                return;
+            }
             OnSetPickSource(context);
             NotifyPicked(L"source", context.SourceOverride);
             return;
         }
         if (type == L"pickTestDir")
         {
+            if (document.MemberBool("clear", false))
+            {
+                context.TestSourceOverride.clear();
+                context.RenderedOverview.clear();
+                UpdateOverview(context);
+                NotifyPicked(L"test", std::wstring());
+                return;
+            }
             OnSetPickTest(context);
             NotifyPicked(L"test", context.TestSourceOverride);
             return;
@@ -1686,9 +1884,16 @@ namespace Bridge
             if (!endpoint.empty())
             {
                 std::wstring error;
-                if (!Online::SetRepositoryBase(Online::NormalizeBase(endpoint), error))
+                if (!Online::SetRepositoryBase(endpoint, error))
                 {
                     delete work;
+                    Emit(JobJson(L"online-index", L"error", 0.0, L"索引拉取失败", error));
+                    Emit(JsonObject({
+                        { "type", JsonString(L"remoteIndex") },
+                        { "items", "[]" },
+                        { "base", JsonString(Online::ResolveRepositoryBase()) },
+                        { "error", JsonString(error) },
+                    }));
                     NotifyToast(L"error", L"仓库地址无效", error.c_str());
                     return;
                 }
@@ -1749,14 +1954,79 @@ namespace Bridge
         }
         if (type == L"startRestore")
         {
-            if (context.Mode == ActiveMode::SetExtract)
+            const bool staticHash = (context.Mode == ActiveMode::SetExtract);
+            const std::wstring& hashDirectory =
+                staticHash ? context.StaticHashDir : context.Paths.HashDir;
+            const std::wstring exe = RequireTarget(context);
+            if (exe.empty())
             {
-                OnStep3(context, context.StaticHashDir, true);
+                return;
             }
-            else
+            if (!context.ExtractProbe.exists)
             {
-                OnStep3(context, context.Paths.HashDir, false);
+                NotifyToast(L"warn", L"尚未解包 XP3",
+                            ((staticHash ? L"请先执行步骤2（提取动态 XP3 资源）："
+                                         : L"请先执行步骤1（提取动态 XP3 资源）：") +
+                             context.Paths.ExtractDir)
+                                .c_str());
+                return;
             }
+            const MappingSummary mapping = LoadMappingSummary(hashDirectory);
+            if (!mapping.ok)
+            {
+                NotifyToast(L"warn", L"缺少 Hash 映射",
+                            ((staticHash ? L"请先执行步骤1（生成静态 Hash 表）："
+                                         : L"请先执行步骤2（动态收集 Hash）：") +
+                             hashDirectory)
+                                .c_str());
+                return;
+            }
+
+            std::wstring outputDir = context.Paths.RestoreDir;
+            unsigned int threads = 4u;
+            bool keepUnresolved = false;
+            bool inferNames = false;
+            if (const JsonValue* opts = document.Member("opts"))
+            {
+                const std::wstring rawOut = opts->MemberText("outputDir");
+                if (!rawOut.empty())
+                {
+                    const bool isAbs = (rawOut.size() >= 2u && rawOut[1] == L':') ||
+                                       (rawOut.size() >= 2u && (rawOut[0] == L'\\' || rawOut[0] == L'/'));
+                    outputDir = isAbs ? rawOut : JoinPath(context.Paths.GameDir, rawOut);
+                }
+                const int parsedThreads = static_cast<int>(opts->MemberNumber("threads", 4.0));
+                if (parsedThreads >= 1 && parsedThreads <= 32)
+                {
+                    threads = static_cast<unsigned int>(parsedThreads);
+                }
+                keepUnresolved = opts->MemberBool("keepUnresolved", false);
+                inferNames = opts->MemberBool("inferNames", false);
+            }
+
+            if (!context.RestoreWindow || !::IsWindow(context.RestoreWindow))
+            {
+                Restore::WindowOptions options;
+                options.GameDirectory = context.Paths.GameDir;
+                options.SourceDirectory = context.Paths.ExtractDir;
+                options.HashDirectory = hashDirectory;
+                options.DefaultOutputDirectory = outputDir;
+                options.LogDirectory = Host::LogDirectory();
+                options.Owner = context.Window;
+                options.Hidden = true;
+                context.RestoreWindow = Restore::ShowRestoreWindow(context.Instance, options);
+            }
+
+            std::wstring startError;
+            if (!Restore::StartRestoreWithOptions(context.RestoreWindow, context.Paths.GameDir,
+                                                  context.Paths.ExtractDir, hashDirectory, outputDir,
+                                                  threads, keepUnresolved, inferNames, startError))
+            {
+                NotifyToast(L"error", L"无法启动还原", startError.c_str());
+                Emit(JobJson(L"restore", L"error", 0.0, startError, startError));
+                return;
+            }
+            NotifyRestore(context, Restore::kStateRunning, 0);
             NotifyWorkspace(context);
             return;
         }
@@ -1764,12 +2034,9 @@ namespace Bridge
         {
             if (context.RestoreWindow != nullptr && ::IsWindow(context.RestoreWindow))
             {
-                Restore::CloseRestoreWindow(context.RestoreWindow);
-                if (!::IsWindow(context.RestoreWindow))
-                {
-                    context.RestoreWindow = nullptr;
-                }
-                NotifyToast(L"warn", L"已请求关闭还原窗口", L"还原窗口会等当前分包处理完再退出。");
+                Restore::StopRestoreRun(context.RestoreWindow);
+                Emit(JobJson(L"restore", L"cancelling", 0.0, L"正在停止还原……", std::wstring()));
+                NotifyToast(L"warn", L"已请求停止还原", L"正在通知还原线程安全停止（已写出文件保留）。");
             }
             return;
         }
@@ -1778,7 +2045,7 @@ namespace Bridge
             // 真正的采集控制台是注入模块自己的窗口；这里走与原版「动态 Hash 收集」同一条路径。
             OnStep2(context);
             NotifyOverlay(L"collect", true);
-            Emit(CollectSnapshotJson(context.Stage >= 2));
+            Emit(CollectSnapshotJson(context, context.Stage >= 2));
             NotifyToast(L"info", L"已启动 Hash 收集",
                         L"游戏与收集面板由注入模块提供，本页显示的是宿主状态。");
             return;
@@ -1794,23 +2061,48 @@ namespace Bridge
             Host::OpenInExplorer(context.Window, context.Paths.HashDir);
             return;
         }
-        if (type == L"stopGame" || type == L"clearCollectFiles")
+        if (type == L"clearCollectFiles")
+        {
+            if (JobBusy(context) || (context.RestoreWindow && ::IsWindow(context.RestoreWindow) &&
+                                     Restore::IsRestoreRunning(context.RestoreWindow)))
+            {
+                NotifyToast(L"warn", L"任务正在运行", L"请先等待当前任务结束后再清空采集文件。");
+                return;
+            }
+            if (context.Paths.HashDir.empty() ||
+                ::GetFileAttributesW(context.Paths.HashDir.c_str()) == INVALID_FILE_ATTRIBUTES)
+            {
+                NotifyToast(L"info", L"无需清空", L"Hash 输出目录尚不存在或已为空。");
+                return;
+            }
+            std::wstring cleanErr;
+            if (!::Yua::RemoveDirectoryTree(context.Paths.HashDir, cleanErr))
+            {
+                NotifyToast(L"error", L"清空失败", cleanErr.c_str());
+                return;
+            }
+            RefreshProbes(context, true);
+            context.RenderedOverview.clear();
+            UpdateOverview(context);
+            Emit(CollectSnapshotJson(context, false));
+            NotifyWorkspace(context);
+            Host::LogLine(Log::Level::Info, L"[YuaExtract] 已清空 Hash 采集目录：" + context.Paths.HashDir);
+            NotifyToast(L"info", L"已清空采集目录", context.Paths.HashDir.c_str());
+            return;
+        }
+        if (type == L"stopGame")
         {
             // 主界面不持有游戏进程句柄：进程由注入流程启动并随游戏自身退出。
             // 不做假的“已停止”，如实告诉用户去哪里操作。
             Host::LogLine(Log::Level::Warn,
                           L"[YuaExtract] stopGame / clearCollectFiles：主界面没有游戏进程句柄，请在那个窗口里操作");
-            Emit(CollectSnapshotJson(false));
+            Emit(CollectSnapshotJson(context, false));
             NotifyToast(L"warn", L"请在收集窗口里操作",
                         L"主界面不持有游戏进程句柄，关闭游戏 / 清空文件请在注入的收集窗口里执行。");
             return;
         }
         if (type == L"enqueueXp3" || type == L"startBatch")
         {
-            // 批量解包窗口活在游戏进程里（CxdecExtractorUI.dll）。这里做的是“启动并注入”，
-            // 与原版「XP3 动态解包」完全同一条路径；排队在那边进行。
-            OnStep1(context);
-            NotifyOverlay(L"batch", true);
             std::vector<std::wstring> queued;
             const JsonValue* names = document.Member("names");
             if (names != nullptr && names->kind == JsonValue::Kind::Array)
@@ -1823,6 +2115,26 @@ namespace Bridge
                     }
                 }
             }
+            if (type == L"enqueueXp3" && queued.empty())
+            {
+                wchar_t fileBuffer[4096]{};
+                OPENFILENAMEW ofn{};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = context.Window;
+                ofn.lpstrFilter = L"XP3 封包 (*.xp3)\0*.xp3\0所有文件 (*.*)\0*.*\0";
+                ofn.lpstrFile = fileBuffer;
+                ofn.nMaxFile = _countof(fileBuffer);
+                ofn.lpstrInitialDir = context.Paths.GameDir.empty() ? nullptr : context.Paths.GameDir.c_str();
+                ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+                if (::GetOpenFileNameW(&ofn) && fileBuffer[0] != L'\0')
+                {
+                    queued.push_back(FileLabel(fileBuffer));
+                }
+                else
+                {
+                    return;
+                }
+            }
             if (!queued.empty())
             {
                 std::wstring listed;
@@ -1833,7 +2145,12 @@ namespace Bridge
                 Host::LogLine(Log::Level::Info, L"[YuaExtract] 待排队 XP3：" + listed);
                 Emit(BatchSnapshotJson(queued));
             }
-            Emit(JobJson(L"extract", L"running", 0.05, L"已启动解包界面，等待排队", std::wstring()));
+            if (type == L"startBatch")
+            {
+                OnStep1(context);
+                NotifyOverlay(L"batch", true);
+                Emit(JobJson(L"extract", L"running", 0.05, L"已启动解包界面，等待排队", std::wstring()));
+            }
             return;
         }
         if (type == L"stopBatch")
@@ -1857,6 +2174,69 @@ namespace Bridge
                 return;
             }
             Host::LogLine(Log::Level::Info, L"[YuaExtract] 已打开原版功能：" + action);
+            return;
+        }
+        if (type == L"windowControl")
+        {
+            const std::wstring action = document.MemberText("action");
+            if (context.Window == nullptr || !::IsWindow(context.Window))
+            {
+                return;
+            }
+            if (action == L"minimize")
+            {
+                ::ShowWindow(context.Window, SW_MINIMIZE);
+                return;
+            }
+            if (action == L"maximize")
+            {
+                if (::IsZoomed(context.Window))
+                {
+                    ::ShowWindow(context.Window, SW_RESTORE);
+                }
+                else
+                {
+                    ::ShowWindow(context.Window, SW_MAXIMIZE);
+                }
+                return;
+            }
+            if (action == L"close")
+            {
+                ::PostMessageW(context.Window, WM_CLOSE, 0, 0);
+                return;
+            }
+            if (action == L"drag")
+            {
+                if (!::IsZoomed(context.Window))
+                {
+                    ::ReleaseCapture();
+                    ::PostMessageW(context.Window, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0);
+                }
+                return;
+            }
+            if (action == L"resize")
+            {
+                if (::IsZoomed(context.Window))
+                {
+                    return;
+                }
+                const std::wstring edge = document.MemberText("edge");
+                WPARAM wmsz = 0;
+                if (edge == L"w") wmsz = WMSZ_LEFT;
+                else if (edge == L"e") wmsz = WMSZ_RIGHT;
+                else if (edge == L"n") wmsz = WMSZ_TOP;
+                else if (edge == L"nw") wmsz = WMSZ_TOPLEFT;
+                else if (edge == L"ne") wmsz = WMSZ_TOPRIGHT;
+                else if (edge == L"s") wmsz = WMSZ_BOTTOM;
+                else if (edge == L"sw") wmsz = WMSZ_BOTTOMLEFT;
+                else if (edge == L"se") wmsz = WMSZ_BOTTOMRIGHT;
+                if (wmsz != 0)
+                {
+                    ::ReleaseCapture();
+                    ::PostMessageW(context.Window, WM_SYSCOMMAND, SC_SIZE | wmsz, 0);
+                }
+                return;
+            }
             return;
         }
 
@@ -2009,9 +2389,63 @@ namespace Bridge
         }
     }
 
+    void ApplyDwmFramelessShadow(HWND hwnd, bool frameless)
+    {
+        if (hwnd == nullptr || !::IsWindow(hwnd))
+        {
+            return;
+        }
+        struct DwmMargins
+        {
+            int cxLeftWidth;
+            int cxRightWidth;
+            int cyTopHeight;
+            int cyBottomHeight;
+        };
+        HMODULE dwm = ::LoadLibraryW(L"dwmapi.dll");
+        if (dwm != nullptr)
+        {
+            using ExtendFn = HRESULT(WINAPI*)(HWND, const DwmMargins*);
+            using SetAttrFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+            auto extendFn = reinterpret_cast<ExtendFn>(::GetProcAddress(dwm, "DwmExtendFrameIntoClientArea"));
+            auto setAttrFn = reinterpret_cast<SetAttrFn>(::GetProcAddress(dwm, "DwmSetWindowAttribute"));
+            if (extendFn != nullptr)
+            {
+                const DwmMargins margins = frameless ? DwmMargins{ 0, 0, 1, 0 } : DwmMargins{ 0, 0, 0, 0 };
+                extendFn(hwnd, &margins);
+            }
+            if (setAttrFn != nullptr)
+            {
+                const DWORD cornerPref = 2u; // DWMWCP_ROUND
+                setAttrFn(hwnd, 33u /* DWMWA_WINDOW_CORNER_PREFERENCE */, &cornerPref, sizeof(cornerPref));
+            }
+            ::FreeLibrary(dwm);
+        }
+        ::SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+
     // 外壳缺失 / WebView2 运行时不可用：说清楚缺什么、去哪儿补，然后退回纯 Win32 界面。
     void FailClosed(const wchar_t* title, const std::wstring& body)
     {
+        State& state = S();
+        Host::SetLogSink(nullptr);
+        if (state.host != nullptr && ::IsWindow(state.host))
+        {
+            ::DestroyWindow(state.host);
+        }
+        state.host = nullptr;
+        state.hostCreated = false;
+        state.ready = false;
+        if (state.main != nullptr && ::IsWindow(state.main))
+        {
+            ApplyDwmFramelessShadow(state.main, false);
+        }
+        if (state.context != nullptr)
+        {
+            LayoutWindow(*state.context);
+            UpdateOverview(*state.context);
+        }
         Host::ShowError(S().main, std::wstring(title) + L"\r\n\r\n" + body);
         Host::LogLine(Log::Level::Error, std::wstring(L"[YuaExtract] WebView2 不可用：") + title);
     }
@@ -2154,7 +2588,20 @@ namespace Bridge
             }
 
             JsonValue document;
-            if (!ParseJson(json, document) || document.kind != JsonValue::Kind::Object)
+            if (!ParseJson(json, document))
+            {
+                RejectMessage(L"消息不是合法 JSON 对象");
+                return S_OK;
+            }
+            if (document.kind == JsonValue::Kind::String)
+            {
+                JsonValue inner;
+                if (ParseJson(document.text, inner))
+                {
+                    document = std::move(inner);
+                }
+            }
+            if (document.kind != JsonValue::Kind::Object)
             {
                 RejectMessage(L"消息不是合法 JSON 对象");
                 return S_OK;
@@ -2178,6 +2625,13 @@ namespace Bridge
             }
 
             // 到这一步已经是可信请求：分发到真实后端。异常不允许把 UI 线程带走。
+            struct WebViewRequestScope
+            {
+                bool& Flag;
+                bool Prev;
+                explicit WebViewRequestScope(bool& flag) : Flag(flag), Prev(flag) { Flag = true; }
+                ~WebViewRequestScope() { Flag = Prev; }
+            } requestScope(state.context->InWebViewRequest);
             try
             {
                 HandleRequest(*state.context, document);
@@ -2226,6 +2680,13 @@ namespace Bridge
         }
         state.controller = controller;
         controller->AddRef();
+        ICoreWebView2Controller2* controller2 = nullptr;
+        if (SUCCEEDED(controller->QueryInterface(IID_PPV_ARGS(&controller2))) && controller2 != nullptr)
+        {
+            COREWEBVIEW2_COLOR bg{ 255, 0xEE, 0xE3, 0xEB };
+            controller2->put_DefaultBackgroundColor(bg);
+            controller2->Release();
+        }
         controller->put_IsVisible(TRUE);
         controller->put_ZoomFactor(1.0);
 
@@ -2246,7 +2707,14 @@ namespace Bridge
             settings->put_IsStatusBarEnabled(FALSE);
             settings->put_IsZoomControlEnabled(FALSE);
             settings->put_AreDevToolsEnabled(FALSE);
+            settings->put_IsBuiltInErrorPageEnabled(FALSE);
             settings->put_IsScriptEnabled(TRUE);
+            ICoreWebView2Settings3* settings3 = nullptr;
+            if (SUCCEEDED(settings->QueryInterface(IID_PPV_ARGS(&settings3))) && settings3 != nullptr)
+            {
+                settings3->put_AreBrowserAcceleratorKeysEnabled(FALSE);
+                settings3->Release();
+            }
             settings->Release();
         }
 
@@ -2357,6 +2825,8 @@ namespace Bridge
         state.attached = true;
         state.hostCreated = true;
         Host::SetLogSink(&NotifyLog);
+        ApplyDwmFramelessShadow(context.Window, true);
+        ResizeHostWindow();
 
         const std::wstring userData = JoinPath(Host::LogDirectory(), L"WebView2Data");
         const HRESULT created = ::CreateCoreWebView2EnvironmentWithOptions(
@@ -2385,6 +2855,7 @@ namespace Bridge
     void Detach()
     {
         State& state = S();
+        ::InterlockedExchange(&state.onlineCancel, 1);
         Host::SetLogSink(nullptr);
         state.ready = false;
         if (state.webview != nullptr)

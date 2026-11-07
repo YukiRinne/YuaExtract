@@ -681,6 +681,7 @@ function emptyWorkspace(): WorkspaceSnapshot {
     restoreRate: null,
     restoredCount: 0,
     hashedCount: 0,
+    reportReady: false,
   };
 }
 

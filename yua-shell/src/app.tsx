@@ -1,35 +1,39 @@
-import { useEffect, type DragEvent } from "react";
-import { BookOpen, Hammer, Home, Info, Search, Settings } from "lucide-react";
+import { useEffect, useRef, type DragEvent } from "react";
+import { BookOpen, Hammer, Home, Info, Minus, Search, Settings, Square, X } from "lucide-react";
 import { fmtInt } from "./lib/format";
 import { LogDrawer, OverlayRoot } from "./overlays/overlays";
 import { AboutScreen, HomeScreen, LibraryScreen, MakeScreen } from "./screens/screens";
 import { useStore } from "./store";
-import { DeskBackdrop, greeting } from "./ui/desk";
+import { greeting } from "./ui/desk";
 import type { TabId } from "./types";
 
 const LOGO = "./brand/ameto.png";
+const RESIZE_EDGES = ["n", "s", "e", "w", "nw", "ne", "sw", "se"] as const;
 
 export function App() {
   const s = useStore();
   const t = s.t;
+  const sRef = useRef(s);
+  sRef.current = s;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const cur = sRef.current;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
-        s.set({ palette: !s.palette });
+        cur.set({ palette: !cur.palette });
       }
       if (e.key === "Escape") {
-        if (s.palette) { s.set({ palette: false }); return; }
-        if (s.confirm) { s.confirm.resolve(false); return; }
-        const order: Array<keyof typeof s.overlays> = ["settings", "notes", "meta", "online", "legacy", "batch", "collect", "restore"];
-        const open = order.find((id) => s.overlays[id]);
-        if (open) s.openOverlay(open, false);
+        if (cur.palette) { cur.set({ palette: false }); return; }
+        if (cur.confirm) { cur.confirm.resolve(false); return; }
+        const order: Array<keyof typeof cur.overlays> = ["settings", "notes", "meta", "online", "legacy", "batch", "collect", "restore"];
+        const open = order.find((id) => cur.overlays[id]);
+        if (open) cur.openOverlay(open, false);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [s]);
+  }, []);
 
   useEffect(() => {
     // Compile-time demo guard (raw expression, so `vite build` folds it to
@@ -39,13 +43,13 @@ export function App() {
       const qa = new URLSearchParams(window.location.search).get("qa") === "1";
       if (Boolean(window.__YUA_MOCK__) || qa) {
         window.__YUA_SHOT__ = async (name: string) => {
-          await applyShot(name, s);
+          await applyShot(name, sRef.current);
         };
       } else {
         delete window.__YUA_SHOT__;
       }
     }
-  });
+  }, []);
 
   const tabs: { id: TabId; label: string; icon: typeof Home }[] = [
     { id: "home", label: t.tabs.home, icon: Home },
@@ -60,11 +64,11 @@ export function App() {
     const file = [...e.dataTransfer.files][0];
     const path = (file as File & { path?: string }).path || file?.name;
     if (!path) return;
-    if (path.toLowerCase().endsWith(".exe") || !path.includes(".")) {
-      s.send({ type: "setTarget", path: path.endsWith(".exe") ? path : `${path}\\game.exe` });
-    } else if (path.toLowerCase().endsWith(".xp3")) {
+    if (path.toLowerCase().endsWith(".xp3")) {
       s.openOverlay("batch");
       s.send({ type: "enqueueXp3", names: [...e.dataTransfer.files].map((f) => f.name) });
+    } else {
+      s.send({ type: "setTarget", path });
     }
   };
 
@@ -101,10 +105,31 @@ export function App() {
       onDragLeave={() => s.set({ dropping: false })}
       onDrop={onDrop}
     >
-      <DeskBackdrop />
-      <img className="peek" src={LOGO} alt="" />
+      {RESIZE_EDGES.map((edge) => (
+        <div
+          key={edge}
+          className={`win-resize win-resize-${edge}`}
+          aria-hidden
+          onMouseDown={(e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            s.send({ type: "windowControl", action: "resize", edge });
+          }}
+        />
+      ))}
       <div className="window">
-      <header className="titlebar">
+      <header
+        className="titlebar"
+        onMouseDown={(e) => {
+          if (e.button !== 0) return;
+          if ((e.target as HTMLElement).closest("button, input, a, nav, [role='button']")) return;
+          s.send({ type: "windowControl", action: "drag" });
+        }}
+        onDoubleClick={(e) => {
+          if ((e.target as HTMLElement).closest("button, input, a, nav, [role='button']")) return;
+          s.send({ type: "windowControl", action: "maximize" });
+        }}
+      >
         <div className="brand">
           <img src={LOGO} alt="" width={24} height={24} />
           <span>YuaExtract</span>
@@ -131,6 +156,35 @@ export function App() {
           <button className="icon-btn" aria-label={t.settings} onClick={() => s.openOverlay("settings")}>
             <Settings size={16} />
           </button>
+          <div className="win-ctrls">
+            <button
+              type="button"
+              className="win-btn"
+              aria-label={s.locale === "zh" ? "最小化" : "Minimize"}
+              title={s.locale === "zh" ? "最小化" : "Minimize"}
+              onClick={() => s.send({ type: "windowControl", action: "minimize" })}
+            >
+              <Minus size={14} />
+            </button>
+            <button
+              type="button"
+              className="win-btn"
+              aria-label={s.locale === "zh" ? "最大化 / 还原" : "Maximize"}
+              title={s.locale === "zh" ? "最大化 / 还原" : "Maximize"}
+              onClick={() => s.send({ type: "windowControl", action: "maximize" })}
+            >
+              <Square size={12} />
+            </button>
+            <button
+              type="button"
+              className="win-btn win-close"
+              aria-label={s.locale === "zh" ? "关闭" : "Close"}
+              title={s.locale === "zh" ? "关闭" : "Close"}
+              onClick={() => s.send({ type: "windowControl", action: "close" })}
+            >
+              <X size={15} />
+            </button>
+          </div>
         </div>
       </header>
       <div className="greet">

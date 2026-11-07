@@ -289,3 +289,11 @@ Merged the R3 self-review with DC’s 2026-11-07 critique (deduped). Direction k
 - `home-loaded-min.png`: steps 1–3 visible at 1100×700.
 - `restore-after-extract.png`: footer is「停止还原」even after extract’s precheck completed.
 - Palette trap in code; panels light-glass; `#FFFFFF`/`#000000` policy unchanged (tinted tokens).
+
+## R4 (Native frameless client-area integration & protocol fix)
+
+Resolved real-hardware integration defects identified on `feat/hibiscus-native-ui`:
+
+1. **Eliminated double JSON encoding on WebView2 bridge (`bridge.ts` + `YuaWebViewBridge.inl`).** `createHostBridge` previously called `wv.postMessage(JSON.stringify({ protocolVersion, ...msg }))`, causing WebView2’s `postMessage` to serialize the string a second time (`get_WebMessageAsJson` received `Kind::String` and rejected every request with `拒绝 WebView2 消息：消息不是合法 JSON 对象`). Fixed `bridge.ts` to pass a plain object to `wv.postMessage(...)` and added string-unwrapping fallback in `MessageHandler::Invoke`.
+2. **Removed system titlebar & outer decorative desk inset (`hibiscus.css` + `app.tsx` + `YuaExtractMainWindow.cpp`).** Suppressed native `WS_CAPTION` via `WM_NCCALCSIZE` + 1px DWM shadow in WebView2 mode, set `.window` to `inset: 0; border-radius: 0; border: 0;`, hid outer `.desk-bg` / `.blob-*` / `.grain` / `.peek`, and added `.win-ctrls` (Minimize, Maximize/Restore, Close), titlebar drag / double-click maximize, and 8-direction `.win-resize-*` handles backed by `windowControl`. Preserved standard `WS_OVERLAPPEDWINDOW` when running with `--legacy-win32` / `YUA_LEGACY_WIN32=1` or when `FailClosed` falls back to Win32.
+3. **Connected in-shell `RestoreOverlay` to the real C++ restore engine (`YuaRestoreWindow.cpp` + `YuaWebViewBridge.inl`).** Added hidden mode (`options.Hidden = true`), `StartRestoreWithOptions`, `StopRestoreRun`, and `QueryRestoreSnapshot` so Step 3 and `RestoreOverlay` enumerate real packages, stream live per-package/mining progress, and execute Pass 1 + Supplement Mining + Pass 2 without opening a duplicate Win32 popup window.

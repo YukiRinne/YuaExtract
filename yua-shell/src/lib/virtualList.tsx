@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type ReactNode, type UIEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode, type UIEvent } from "react";
 
 export function VirtualList<T>({
   items,
@@ -18,6 +18,12 @@ export function VirtualList<T>({
   const ref = useRef<HTMLDivElement>(null);
   const [scroll, setScroll] = useState(0);
   const [h, setH] = useState(320);
+
+  useEffect(() => {
+    if (ref.current && ref.current.clientHeight > 0) {
+      setH(ref.current.clientHeight);
+    }
+  }, [items.length]);
 
   const onScroll = (e: UIEvent<HTMLDivElement>) => {
     setScroll(e.currentTarget.scrollTop);

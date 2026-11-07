@@ -60,11 +60,16 @@ export function ModeSeg({ value, onChange }: { value: ExtractMode; onChange: (m:
   const btnRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [ind, setInd] = useState({ x: 0, w: 86 });
   useLayoutEffect(() => {
-    const i = modes.findIndex((m) => m.id === value);
-    const el = btnRefs.current[i];
-    const root = wrap.current;
-    if (!el || !root) return;
-    setInd({ x: el.offsetLeft - 4, w: el.offsetWidth });
+    const sync = () => {
+      const i = modes.findIndex((m) => m.id === value);
+      const el = btnRefs.current[i];
+      const root = wrap.current;
+      if (!el || !root) return;
+      setInd({ x: el.offsetLeft - 4, w: el.offsetWidth });
+    };
+    sync();
+    window.addEventListener("resize", sync);
+    return () => window.removeEventListener("resize", sync);
   }, [value, s.locale]);
   return (
     <div className="mode-seg" ref={wrap} role="radiogroup" aria-label={s.t.mode}>
