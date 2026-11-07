@@ -173,13 +173,15 @@ type HostRequestMessage =
   | { id: string; type: "enqueueXp3"; names: string[] }
   | { id: string; type: "startBatch"; outputDir: string; threads: number }
   | { id: string; type: "stopBatch" }
-  | { id: string; type: "openLegacy"; action: string }
+  | { id: string; type: "openLegacy"; action: string; confirmed?: boolean }
+  | { id: string; type: "confirmReply"; action: string; accepted: boolean }
   | { id: string; type: "failDemo" }
   | {
       id: string;
       type: "windowControl";
       action: "minimize" | "maximize" | "close" | "drag" | "resize";
       edge?: "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se";
+      force?: boolean;
     };
 
 /** Distributes over the request union so every message keeps its own discriminant. */
@@ -211,6 +213,15 @@ export type HostEvent =
   | { type: "notes"; text: string }
   | { type: "picked"; kind: "exe" | "source" | "test" | "output"; path: string }
   | { type: "overlayHint"; overlay: OverlayId; open: boolean }
+  | {
+      type: "hostConfirm";
+      action: string;
+      title: string;
+      body: string;
+      ok: string;
+      cancel: string;
+      danger?: boolean;
+    }
   | {
       type: "uiSync";
       patch: Partial<{

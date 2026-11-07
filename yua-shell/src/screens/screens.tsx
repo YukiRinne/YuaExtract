@@ -593,7 +593,19 @@ export function SettingsScreen() {
       <p className="note">{s.t.settingsLead}</p>
       <div>
         <div className="note" style={{ marginBottom: 8 }}>{s.t.theme}</div>
-        <NeoToggle checked={s.theme === "dark"} onChange={(on) => s.set({ theme: on ? "dark" : "light" })} label={s.t.darkMode} />
+        <NeoToggle checked={s.theme === "dark"} onChange={(on) => {
+          const theme = on ? "dark" : "light";
+          const stock = s.ink === "#2a2440" || s.ink === "#ece6f2";
+          s.set({ theme, ink: stock ? (theme === "dark" ? "#ece6f2" : "#2a2440") : s.ink });
+        }} label={s.t.darkMode} />
+        <label className="row" style={{ marginTop: 12, alignItems: "center", gap: 10 }}>
+          <input type="color" aria-label={s.locale === "zh" ? "强调色" : "Accent"} value={s.accent} onChange={(e) => s.set({ accent: e.target.value })} />
+          <span className="note">{s.locale === "zh" ? "强调色（背景跟着变）" : "Accent (background follows)"}</span>
+        </label>
+        <label className="row" style={{ marginTop: 12, alignItems: "center", gap: 10 }}>
+          <input type="color" aria-label={s.locale === "zh" ? "正文颜色" : "Text"} value={s.ink} onChange={(e) => s.set({ ink: e.target.value })} />
+          <span className="note">{s.locale === "zh" ? "正文颜色" : "Text"}</span>
+        </label>
       </div>
       <div>
         <div className="note" style={{ marginBottom: 8 }}>{s.t.lang}</div>

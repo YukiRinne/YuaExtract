@@ -33,6 +33,8 @@ export interface ToastItem {
 export interface UiState {
   locale: Locale;
   theme: Theme;
+  accent: string;
+  ink: string;
   tab: TabId;
   mode: ExtractMode;
   info: HostInfo | null;
@@ -110,6 +112,8 @@ const emptyWs: WorkspaceSnapshot = {
 const initial: UiState = {
   locale: "zh",
   theme: "light",
+  accent: "#d4537e",
+  ink: "#2a2440",
   tab: "home",
   mode: "classic",
   info: null,
@@ -237,6 +241,21 @@ function reducer(state: UiState, action: Action): UiState {
       return state;
     case "overlayHint":
       return { ...state, overlays: { ...state.overlays, [ev.overlay]: ev.open } };
+    case "hostConfirm":
+      return {
+        ...state,
+        confirm: {
+          title: ev.title,
+          body: ev.body,
+          ok: ev.ok,
+          cancel: ev.cancel,
+          danger: ev.danger,
+          resolve: (ok) => {
+            if (!bridgeRef) bridgeRef = createHostBridge();
+            bridgeRef.post({ id: nextReqId(), type: "confirmReply", action: ev.action, accepted: ok });
+          },
+        },
+      };
     case "uiSync":
       return { ...state, ...ev.patch };
     default:
@@ -254,6 +273,19 @@ interface Store extends UiState {
   notify: (title: string, body?: string, level?: ToastItem["level"]) => void;
 }
 
+function rgbOf(hex: string): [number, number, number] {
+  const raw = hex.trim().replace("#", "");
+  const full = raw.length === 3 ? raw.split("").map((c) => c + c).join("") : raw;
+  const n = Number.parseInt(full, 16);
+  if (!Number.isFinite(n) || full.length !== 6) return [212, 83, 126];
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function mix(a: [number, number, number], b: [number, number, number], towardB: number) {
+  const c = (i: number) => Math.round(a[i] + (b[i] - a[i]) * towardB);
+  return `rgb(${c(0)} ${c(1)} ${c(2)})`;
+}
+
 const Ctx = createContext<Store | null>(null);
 let bridgeRef: HostBridge | null = null;
 
@@ -263,21 +295,34 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     document.documentElement.dataset.theme = state.theme;
     document.documentElement.lang = state.locale === "en" ? "en" : "zh-CN";
-  }, [state.theme, state.locale]);
+    const accent = rgbOf(state.accent);
+    const ink = rgbOf(state.ink);
+    const ground = state.theme === "dark" ? rgbOf("#141018") : rgbOf("#f7f2f5");
+    const wash = state.theme === "dark" ? 0.86 : 0.9;
+    const root = document.documentElement.style;
+    root.setProperty("--hibiscus", state.accent);
+    root.setProperty("--accent", state.accent);
+    root.setProperty("--ink", state.ink);
+    root.setProperty("--paper", mix(accent, ground, wash));
+    root.setProperty("--surface", mix(accent, ground, wash - 0.08));
+    root.setProperty("--blush", mix(accent, ground, wash - 0.16));
+    root.setProperty("--line", mix(accent, ground, 0.55));
+    root.setProperty("--dim", mix(ink, ground, 0.42));
+  }, [state.theme, state.locale, state.accent, state.ink]);
 
   useEffect(() => {
     const saved = localStorage.getItem("yua-shell-prefs");
     if (saved) {
       try {
         const p = JSON.parse(saved);
-        dispatch({ type: "patch", patch: { theme: p.theme ?? "light", locale: p.locale ?? "zh" } });
+        dispatch({ type: "patch", patch: { theme: p.theme ?? "light", locale: p.locale ?? "zh", accent: typeof p.accent === "string" ? p.accent : "#d4537e", ink: typeof p.ink === "string" ? p.ink : "#2a2440" } });
       } catch { /* ignore */ }
     }
   }, []);
 
   useEffect(() => {
-    localStorage.setItem("yua-shell-prefs", JSON.stringify({ theme: state.theme, locale: state.locale }));
-  }, [state.theme, state.locale]);
+    localStorage.setItem("yua-shell-prefs", JSON.stringify({ theme: state.theme, locale: state.locale, accent: state.accent, ink: state.ink }));
+  }, [state.theme, state.locale, state.accent, state.ink]);
 
   useEffect(() => {
     if (!bridgeRef) bridgeRef = createHostBridge();

@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <commctrl.h>
 #include <detours.h>
 #include "detour_section.h"
@@ -51,6 +51,7 @@ static bool g_LegacyDialogOwnsApp = false;
 static HWND g_LegacyWindow = nullptr;
 // WebView2 桥的日志镜像。默认空 = 只写文件，行为与以前完全一致。
 static Yua::Host::LogSink g_LogSink = nullptr;
+static Yua::Host::NoticeSink g_NoticeSink = nullptr;
 
 namespace
 {
@@ -1624,7 +1625,7 @@ namespace
         std::wstring loadError;
         if (LoadRepackerApi(loadError) == nullptr)
         {
-            ::MessageBoxW(owner, loadError.c_str(), L"Cxdec 封包", MB_OK | MB_ICONERROR);
+            Yua::Host::ShowError(owner, loadError);
             return;
         }
 
@@ -1762,11 +1763,11 @@ namespace
     // 静态 Key 提取会加载游戏内嵌的 bootstrap DLL 并在本进程里执行其中的原生函数。
     // 这不是沙箱：必须逐次、显式地取得用户同意，默认路径绝不执行。
     void LoaderLog(const wchar_t* text); // 定义在下方日志初始化之后
-    bool RunStaticKeyExtraction(HWND hwnd)
+    bool RunStaticKeyExtraction(HWND hwnd, bool alreadyConfirmed = false)
     {
         if (g_KrkrExeFullPath.empty())
         {
-            ::MessageBoxW(hwnd, L"未指定游戏 EXE。请先在 YuaExtract 主界面里选择目标游戏主程序。", L"YuaExtract", MB_OK | MB_ICONERROR);
+            Yua::Host::ShowError(hwnd, L"未指定游戏 EXE。请先在 YuaExtract 主界面里选择目标游戏主程序。");
             return false;
         }
 
@@ -1781,7 +1782,8 @@ namespace
             L"· 请只在你合法拥有、且信任来源的游戏副本上执行。\r\n"
             L"· 这不是沙箱：工具无法隔离这段原生代码。\r\n\r\n"
             L"点「是」= 确认并执行；点「否」= 什么都不做（不会创建输出或临时 DLL）。";
-        if (::MessageBoxW(hwnd, warning.c_str(), L"确认执行游戏内嵌原生代码",
+        if (!alreadyConfirmed &&
+            ::MessageBoxW(hwnd, warning.c_str(), L"确认执行游戏内嵌原生代码",
                           MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
         {
             LoaderLog(L"[Loader] Static key extraction cancelled by user (native code not executed)");
@@ -1791,7 +1793,7 @@ namespace
         HMODULE hKeyStatic = ::LoadLibraryW(keyStaticDll.c_str());
         if (!hKeyStatic)
         {
-            ::MessageBoxW(hwnd, FormatString(L"无法加载静态提取模块：\r\n%s", keyStaticDll.c_str()).c_str(), L"YuaExtract", MB_OK | MB_ICONERROR);
+            Yua::Host::ShowError(hwnd, FormatString(L"无法加载静态提取模块：\r\n%s", keyStaticDll.c_str()));
             return false;
         }
 
@@ -1801,8 +1803,7 @@ namespace
         {
             // 旧 ABI 的 ExtractKey 默认拒绝原生执行，不能在这里隐式回退。
             ::FreeLibrary(hKeyStatic);
-            ::MessageBoxW(hwnd, L"静态提取模块版本过旧（缺少 ExtractKeyEx）。请使用与本程序配套的模块。",
-                          L"YuaExtract", MB_OK | MB_ICONERROR);
+            Yua::Host::ShowError(hwnd, L"静态提取模块版本过旧（缺少 ExtractKeyEx）。请使用与本程序配套的模块。");
             return false;
         }
 
@@ -1813,10 +1814,16 @@ namespace
 
         if (ok)
         {
-            ::MessageBoxW(hwnd, FormatString(L"静态提取完成。\r\n输出目录：%s", staticOutput.c_str()).c_str(), L"YuaExtract", MB_OK | MB_ICONINFORMATION);
+            Yua::Host::ShowInfo(hwnd, FormatString(L"静态提取完成。\r\n输出目录：%s", staticOutput.c_str()));
             return true;
         }
-        ::MessageBoxA(hwnd, errorBuf[0] ? errorBuf : "Unknown error", "YuaExtract", MB_OK | MB_ICONERROR);
+        int wideLen = ::MultiByteToWideChar(CP_ACP, 0, errorBuf[0] ? errorBuf : "Unknown error", -1, nullptr, 0);
+        std::wstring wideErr(wideLen > 1 ? static_cast<size_t>(wideLen - 1) : 0u, L'\0');
+        if (wideLen > 1)
+        {
+            ::MultiByteToWideChar(CP_ACP, 0, errorBuf[0] ? errorBuf : "Unknown error", -1, &wideErr[0], wideLen);
+        }
+        Yua::Host::ShowError(hwnd, wideErr.empty() ? std::wstring(L"静态提取失败。") : wideErr);
         return false;
     }
 
@@ -2437,22 +2444,19 @@ namespace
         DWORD attributes = ::GetFileAttributesW(path.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))
         {
-            ::MessageBoxW(owner, FormatString(L"无法读取该文件：\r\n%s", path.c_str()).c_str(),
-                          L"YuaExtract", MB_OK | MB_ICONERROR);
+            Yua::Host::ShowError(owner, FormatString(L"无法读取该文件：\r\n%s", path.c_str()));
             return false;
         }
 
         if (_wcsicmp(Path::GetExtension(path).c_str(), L".exe") != 0)
         {
-            ::MessageBoxW(owner, L"请拖入游戏主程序（.exe 文件）。",
-                          L"YuaExtract", MB_OK | MB_ICONWARNING);
+            Yua::Host::ShowError(owner, L"请拖入游戏主程序（.exe 文件）。");
             return false;
         }
 
         if (!g_LoaderFullPath.empty() && _wcsicmp(path.c_str(), g_LoaderFullPath.c_str()) == 0)
         {
-            ::MessageBoxW(owner, L"这是启动器自身，请选择游戏主程序。",
-                          L"YuaExtract", MB_OK | MB_ICONWARNING);
+            Yua::Host::ShowError(owner, L"这是启动器自身，请选择游戏主程序。");
             return false;
         }
 
@@ -2978,14 +2982,39 @@ namespace Host
 
     bool RunLegacyAction(HWND owner, const std::wstring& action, std::wstring& errorOut)
     {
+        if (action == L"repack")
+        {
+            ShowRepackDialog(owner);
+            return true;
+        }
+        if (action == L"dumper")
+        {
+            if (g_KrkrExeFullPath.empty())
+            {
+                errorOut = L"还没有选择目标游戏主程序。";
+                return false;
+            }
+            const std::wstring dllPath = GetModuleDllPath(L"CxdecStringDumper.dll");
+            if (!FileExistsLocal(dllPath))
+            {
+                errorOut = ModuleMissingHint(L"CxdecStringDumper.dll");
+                return false;
+            }
+            const std::wstring runtimeHashTargetDirectory = BrowseFolder(owner, L"选择需要恢复的纯Hash目录");
+            if (runtimeHashTargetDirectory.empty())
+            {
+                return true;
+            }
+            ::SetEnvironmentVariableW(RuntimeHashTargetDirectoryEnvName, runtimeHashTargetDirectory.c_str());
+            const bool injected = StartGameAndInjectDll(owner, dllPath, errorOut);
+            ::SetEnvironmentVariableW(RuntimeHashTargetDirectoryEnvName, nullptr);
+            return injected;
+        }
+
         int command = 0;
         if (action == L"extractor")
         {
             command = IDC_Extractor;
-        }
-        else if (action == L"dumper")
-        {
-            command = IDC_StringDumper;
         }
         else if (action == L"hashRestore")
         {
@@ -2995,13 +3024,15 @@ namespace Host
         {
             command = IDC_KeyStatic;
         }
-        else if (action == L"repack")
-        {
-            command = IDC_Repack;
-        }
         else
         {
             errorOut = L"未知的原版功能：" + action;
+            return false;
+        }
+
+        if (g_KrkrExeFullPath.empty())
+        {
+            errorOut = L"还没有选择目标游戏主程序。";
             return false;
         }
 
@@ -3024,9 +3055,9 @@ namespace Host
         return true;
     }
 
-    bool RunStaticKeyExtractionForTarget(HWND owner)
+    bool RunStaticKeyExtractionForTarget(HWND owner, bool alreadyConfirmed)
     {
-        return RunStaticKeyExtraction(owner);
+        return RunStaticKeyExtraction(owner, alreadyConfirmed);
     }
 
     void EnableDropOnWindow(HWND hwnd)
@@ -3047,6 +3078,11 @@ namespace Host
     void SetLogSink(LogSink sink)
     {
         g_LogSink = sink;
+    }
+
+    void SetNoticeSink(NoticeSink sink)
+    {
+        g_NoticeSink = sink;
     }
 
     std::wstring Format(const wchar_t* format, ...)
@@ -3070,11 +3106,21 @@ namespace Host
 
     void ShowInfo(HWND owner, const std::wstring& text)
     {
+        if (g_NoticeSink != nullptr)
+        {
+            g_NoticeSink(false, text.c_str());
+            return;
+        }
         ::MessageBoxW(owner, text.c_str(), kProductName, MB_OK | MB_ICONINFORMATION);
     }
 
     void ShowError(HWND owner, const std::wstring& text)
     {
+        if (g_NoticeSink != nullptr)
+        {
+            g_NoticeSink(true, text.c_str());
+            return;
+        }
         ::MessageBoxW(owner, text.c_str(), kProductName, MB_OK | MB_ICONERROR);
     }
 

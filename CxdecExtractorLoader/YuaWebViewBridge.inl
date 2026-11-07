@@ -584,6 +584,7 @@ namespace Bridge
         volatile LONG onlineCancel = 0;
         volatile LONG onlineActive = 0;
         bool pushPosted = false;
+        bool closeConfirmed = false;
     };
 
     State& S()
@@ -595,6 +596,16 @@ namespace Bridge
     bool UsingWebView()
     {
         return S().hostCreated && !S().forcedLegacy;
+    }
+
+    HWND HostWindow()
+    {
+        return S().host;
+    }
+
+    bool CloseConfirmed()
+    {
+        return S().closeConfirmed;
     }
 
     int LayoutOffsetX()
@@ -1252,6 +1263,52 @@ namespace Bridge
         }));
     }
 
+    void RequestConfirm(const wchar_t* action, const wchar_t* title, const std::wstring& body,
+                        const wchar_t* okLabel, const wchar_t* cancelLabel, bool danger)
+    {
+        if (!UsingWebView())
+        {
+            return;
+        }
+        Emit(JsonObject({
+            { "type", JsonString(L"hostConfirm") },
+            { "action", JsonString(action ? action : L"") },
+            { "title", JsonString(title ? title : L"确认") },
+            { "body", JsonString(body) },
+            { "ok", JsonString(okLabel ? okLabel : L"确认") },
+            { "cancel", JsonString(cancelLabel ? cancelLabel : L"取消") },
+            { "danger", JsonBool(danger) },
+        }));
+    }
+
+    BOOL CALLBACK CancelChildCaptureProc(HWND child, LPARAM)
+    {
+        ::SendMessageTimeoutW(child, WM_LBUTTONUP, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, nullptr);
+        ::SendMessageTimeoutW(child, WM_CANCELMODE, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, nullptr);
+        const DWORD tidChild = ::GetWindowThreadProcessId(child, nullptr);
+        const DWORD tidSelf = ::GetCurrentThreadId();
+        if (tidChild != 0 && tidChild != tidSelf)
+        {
+            if (::AttachThreadInput(tidSelf, tidChild, TRUE))
+            {
+                ::ReleaseCapture();
+                ::AttachThreadInput(tidSelf, tidChild, FALSE);
+            }
+        }
+        return TRUE;
+    }
+
+    void ReleaseWebViewCapture()
+    {
+        ::ReleaseCapture();
+        State& state = S();
+        if (state.host != nullptr && ::IsWindow(state.host))
+        {
+            ::SendMessageTimeoutW(state.host, WM_CANCELMODE, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, nullptr);
+            ::EnumChildWindows(state.host, CancelChildCaptureProc, 0);
+        }
+    }
+
     // ---------- 请求类型白名单 ----------
 
     bool IsKnownRequest(const std::wstring& type)
@@ -1266,7 +1323,7 @@ namespace Bridge
             L"fetchIndex",      L"downloadRemote", L"startRestore",   L"stopRestore",
             L"startCollectDemo", L"stopGame",      L"clearCollectFiles", L"openCollectDir",
             L"enqueueXp3",      L"startBatch",     L"stopBatch",      L"openLegacy",
-            L"failDemo",        L"windowControl",
+            L"failDemo",        L"windowControl",  L"confirmReply",
         };
         for (const wchar_t* known : kTypes)
         {
@@ -2166,6 +2223,43 @@ namespace Bridge
                 Host::ShowLegacyFunctionsWindow(context.Window);
                 return;
             }
+            if (action == L"keyStatic")
+            {
+                const std::wstring exe = RequireTarget(context);
+                if (exe.empty())
+                {
+                    return;
+                }
+                const bool confirmed = document.MemberBool("confirmed", false);
+                if (!confirmed)
+                {
+                    const std::wstring staticOutput = JoinPath(context.Paths.GameDir, L"ExtractKey_Output\\Static");
+                    const std::wstring warning =
+                        L"即将从目标游戏内嵌资源中提取静态 Key。\r\n\r\n"
+                        L"目标 EXE：\r\n" + exe + L"\r\n\r\n"
+                        L"输出目录：\r\n" + staticOutput + L"\r\n\r\n"
+                        L"这一步会加载游戏内嵌的 bootstrap DLL，并在本工具进程里执行其中的原生代码。\r\n"
+                        L"· 工具进程拥有当前用户权限；原生代码出错可能使工具崩溃。\r\n"
+                        L"· 请只在你合法拥有、且信任来源的游戏副本上执行。\r\n"
+                        L"· 这不是沙箱：工具无法隔离这段原生代码。";
+                    RequestConfirm(L"legacy-key-static", L"确认执行游戏内嵌原生代码", warning,
+                                   L"确认并执行", L"取消", true);
+                    return;
+                }
+                Host::RunStaticKeyExtractionForTarget(context.Window, true);
+                RefreshProbes(context, true);
+                context.RenderedOverview.clear();
+                UpdateOverview(context);
+                NotifyWorkspace(context);
+                return;
+            }
+            if (action == L"extractor")
+            {
+                OnStep1(context);
+                NotifyWorkspace(context);
+                NotifyJob(context);
+                return;
+            }
             std::wstring error;
             if (!Host::RunLegacyAction(context.Window, action, error))
             {
@@ -2174,6 +2268,94 @@ namespace Bridge
                 return;
             }
             Host::LogLine(Log::Level::Info, L"[YuaExtract] 已打开原版功能：" + action);
+            return;
+        }
+        if (type == L"confirmReply")
+        {
+            const std::wstring action = document.MemberText("action");
+            const bool accepted = document.MemberBool("accepted", false);
+            if (action == L"close-app")
+            {
+                if (accepted && context.Window != nullptr && ::IsWindow(context.Window))
+                {
+                    S().closeConfirmed = true;
+                    ::PostMessageW(context.Window, WM_CLOSE, 0, 0);
+                }
+                return;
+            }
+            if (action == L"legacy-key-static")
+            {
+                if (accepted)
+                {
+                    Host::RunStaticKeyExtractionForTarget(context.Window, true);
+                    RefreshProbes(context, true);
+                    context.RenderedOverview.clear();
+                    UpdateOverview(context);
+                    NotifyWorkspace(context);
+                }
+                return;
+            }
+            if (action == L"static-unverified-extract")
+            {
+                if (accepted)
+                {
+                    Host::LogLine(Log::Level::Info, L"[YuaExtract] 模式1 步骤1：先做静态 Key 提取，再重试加载扩展集");
+                    context.StageNote = L"正在提取静态 Key，随后自动重试加载扩展集……";
+                    context.RenderedOverview.clear();
+                    UpdateOverview(context);
+                    if (!Host::RunStaticKeyExtractionForTarget(context.Window, true))
+                    {
+                        context.StageNote = L"静态 Key 提取未执行或失败，已停止本次步骤1。";
+                        context.RenderedOverview.clear();
+                        UpdateOverview(context);
+                        NotifyWorkspace(context);
+                        return;
+                    }
+                    BeginStaticHashJob(context, false);
+                    NotifyWorkspace(context);
+                    NotifyJob(context);
+                    return;
+                }
+                RequestConfirm(
+                    L"static-unverified-force",
+                    L"强行使用扩展集（未校验）",
+                    L"不校验归属、强行使用这份扩展集？\r\n\r\n"
+                    L"强行使用不会报错，但展开出的静态 Hash 表可能一条都不中"
+                    L"（看起来有数据、实际静默失效）。\r\n\r\n"
+                    L"点「强行使用」= 跳过校验直接展开（allowUnverified=true）；点「放弃」= 停止本次步骤1。",
+                    L"强行使用",
+                    L"放弃",
+                    true);
+                return;
+            }
+            if (action == L"static-unverified-force")
+            {
+                if (accepted)
+                {
+                    Host::LogLine(Log::Level::Warn, L"[YuaExtract] 模式1 步骤1：用户选择强行使用未校验的扩展集");
+                    context.StageNote = L"扩展集未能校验归属（用户已确认强行使用）";
+                    BeginStaticHashJob(context, true);
+                    NotifyWorkspace(context);
+                    NotifyJob(context);
+                }
+                return;
+            }
+            if (action == L"static-structure-open-lib")
+            {
+                if (accepted)
+                {
+                    Host::OpenInExplorer(context.Window, context.LibraryRoot);
+                }
+                return;
+            }
+            if (action == L"static-salt-open-log")
+            {
+                if (accepted)
+                {
+                    Host::OpenInExplorer(context.Window, Host::LogDirectory());
+                }
+                return;
+            }
             return;
         }
         if (type == L"windowControl")
@@ -2202,6 +2384,10 @@ namespace Bridge
             }
             if (action == L"close")
             {
+                if (document.MemberBool("force", false))
+                {
+                    S().closeConfirmed = true;
+                }
                 ::PostMessageW(context.Window, WM_CLOSE, 0, 0);
                 return;
             }
@@ -2209,7 +2395,7 @@ namespace Bridge
             {
                 if (!::IsZoomed(context.Window))
                 {
-                    ::ReleaseCapture();
+                    ReleaseWebViewCapture();
                     ::PostMessageW(context.Window, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0);
                 }
                 return;
@@ -2232,7 +2418,7 @@ namespace Bridge
                 else if (edge == L"se") wmsz = WMSZ_BOTTOMRIGHT;
                 if (wmsz != 0)
                 {
-                    ::ReleaseCapture();
+                    ReleaseWebViewCapture();
                     ::PostMessageW(context.Window, WM_SYSCOMMAND, SC_SIZE | wmsz, 0);
                 }
                 return;
@@ -2383,10 +2569,55 @@ namespace Bridge
         ::GetClientRect(state.main, &client);
         ::SetWindowPos(state.host, HWND_TOP, 0, 0, client.right, client.bottom,
                        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        for (HWND child = ::GetWindow(state.host, GW_CHILD); child != nullptr; child = ::GetWindow(child, GW_HWNDNEXT))
+        {
+            if (!::IsWindowVisible(child))
+            {
+                ::ShowWindow(child, SW_SHOWNOACTIVATE);
+            }
+        }
         if (state.controller != nullptr)
         {
-            state.controller->put_Bounds(client);
+            RECT hostClient{};
+            ::GetClientRect(state.host, &hostClient);
+            state.controller->put_IsVisible(TRUE);
+            state.controller->put_Bounds(hostClient);
+            state.controller->NotifyParentWindowPositionChanged();
+            UINT dpi = 96u;
+            using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+            const auto dpiFn = reinterpret_cast<GetDpiForWindowFn>(
+                ::GetProcAddress(::GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+            if (dpiFn != nullptr && state.main != nullptr)
+            {
+                dpi = dpiFn(state.main);
+                if (dpi == 0u)
+                {
+                    dpi = 96u;
+                }
+            }
+            ICoreWebView2Controller3* controller3 = nullptr;
+            if (SUCCEEDED(state.controller->QueryInterface(IID_PPV_ARGS(&controller3))) && controller3 != nullptr)
+            {
+                controller3->put_ShouldDetectMonitorScaleChanges(TRUE);
+                controller3->put_RasterizationScale(static_cast<double>(dpi) / 96.0);
+                controller3->Release();
+            }
         }
+    }
+
+    void SyncPosition()
+    {
+        State& state = S();
+        if (state.controller == nullptr)
+        {
+            return;
+        }
+        state.controller->NotifyParentWindowPositionChanged();
+    }
+
+    void NoticeToShell(bool error, const wchar_t* text)
+    {
+        NotifyToast(error ? L"error" : L"info", error ? L"出错" : L"提示", text != nullptr ? text : L"");
     }
 
     void ApplyDwmFramelessShadow(HWND hwnd, bool frameless)
@@ -2430,6 +2661,7 @@ namespace Bridge
     {
         State& state = S();
         Host::SetLogSink(nullptr);
+        Host::SetNoticeSink(nullptr);
         if (state.host != nullptr && ::IsWindow(state.host))
         {
             ::DestroyWindow(state.host);
@@ -2825,6 +3057,7 @@ namespace Bridge
         state.attached = true;
         state.hostCreated = true;
         Host::SetLogSink(&NotifyLog);
+        Host::SetNoticeSink(&NoticeToShell);
         ApplyDwmFramelessShadow(context.Window, true);
         ResizeHostWindow();
 
@@ -2840,6 +3073,7 @@ namespace Bridge
             state.host = nullptr;
             state.hostCreated = false;
             Host::SetLogSink(nullptr);
+        Host::SetNoticeSink(nullptr);
             FailClosed(L"无法初始化 WebView2 运行时。",
                        L"请确认已安装 Microsoft Edge WebView2 Runtime（x86 版本）。\r\n"
                        L"在此之前界面会保持原生的 Win32 版本。");
@@ -2857,6 +3091,7 @@ namespace Bridge
         State& state = S();
         ::InterlockedExchange(&state.onlineCancel, 1);
         Host::SetLogSink(nullptr);
+        Host::SetNoticeSink(nullptr);
         state.ready = false;
         if (state.webview != nullptr)
         {

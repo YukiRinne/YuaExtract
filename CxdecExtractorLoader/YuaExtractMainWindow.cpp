@@ -493,10 +493,13 @@ namespace
     namespace Bridge
     {
         bool UsingWebView();
+        HWND HostWindow();
+        bool CloseConfirmed();
         int LayoutOffsetX();
         void Attach(UiContext& context);
         void Detach();
         void Resize(UiContext& context);
+        void SyncPosition();
         void HandlePush(UiContext& context);
         void HandleWork(UiContext& context, LPARAM parameter);
         void SetForcedLegacy(bool enabled);
@@ -511,6 +514,8 @@ namespace
         void NotifySelfCheck(UiContext& context);
         void NotifyNotes(UiContext& context);
         void NotifyOverlay(const wchar_t* overlay, bool open);
+        void RequestConfirm(const wchar_t* action, const wchar_t* title, const std::wstring& body,
+                            const wchar_t* okLabel, const wchar_t* cancelLabel, bool danger);
     }
 
     void ShowUiInfo(UiContext& context, const wchar_t* title, const std::wstring& body)
@@ -518,6 +523,7 @@ namespace
         if (Bridge::UsingWebView())
         {
             Bridge::NotifyToast(L"info", title ? title : L"提示", body.c_str());
+            return;
         }
         if (context.InWebViewRequest)
         {
@@ -531,6 +537,7 @@ namespace
         if (Bridge::UsingWebView())
         {
             Bridge::NotifyToast(L"error", title ? title : L"错误", body.c_str());
+            return;
         }
         if (context.InWebViewRequest)
         {
@@ -2798,8 +2805,17 @@ namespace
     //（它不属于任何一个页签控件组），改窗口大小后按钮旧位置的像素就印进了它下面的
     //「辅助操作」分组框里。全量枚举之后，以后再加控件也不会漏 —— 前提是 LayoutWindow
     // 会把每个控件都摆到（本文件本来就是这么设计的），所以藏了的都会按布局重新显示。
-    BOOL CALLBACK HideChildForErase(HWND child, LPARAM)
+    BOOL CALLBACK HideChildForErase(HWND child, LPARAM lParam)
     {
+        const HWND main = reinterpret_cast<HWND>(lParam);
+        if (child == Bridge::HostWindow())
+        {
+            return TRUE;
+        }
+        if (main != nullptr && ::GetParent(child) != main)
+        {
+            return TRUE;
+        }
         ::ShowWindow(child, SW_HIDE);
         return TRUE;
     }
@@ -2807,7 +2823,11 @@ namespace
     // 把控件占的地方先擦成背景色。
     void EraseBehindTabControls(UiContext& context)
     {
-        ::EnumChildWindows(context.Window, HideChildForErase, 0);
+        if (Bridge::UsingWebView())
+        {
+            return;
+        }
+        ::EnumChildWindows(context.Window, HideChildForErase, reinterpret_cast<LPARAM>(context.Window));
         // RDW_UPDATENOW 必须当场把这次擦除画完：等消息返回再擦，分组框已经显示出来，
         // 父窗口的擦除会被它们裁掉，等于没擦。
         ::RedrawWindow(context.Window, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
@@ -2819,6 +2839,10 @@ namespace
     // 被隐藏的控件腾出来的矩形就留在那儿了。RDW_ALLCHILDREN 才是关键。
     void RedrawAllControls(const UiContext& context)
     {
+        if (Bridge::UsingWebView())
+        {
+            return;
+        }
         ::RedrawWindow(context.Window, nullptr, nullptr,
                        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
     }
@@ -3771,6 +3795,19 @@ namespace
                     {
                         case ExtensionSet::LoadFailure::Unverified:
                         {
+                            if (Bridge::UsingWebView())
+                            {
+                                Bridge::RequestConfirm(
+                                    L"static-unverified-extract",
+                                    L"扩展集未能校验归属",
+                                    L"这份扩展集无法在当前游戏上校验归属：\r\n" + error +
+                                        L"\r\n\r\n推荐出路：先做一次「静态 Key 提取」（离线，会加载游戏内嵌 bootstrap DLL），"
+                                        L"拿到本作的盐之后再自动重试。",
+                                    L"提取静态Key并重试",
+                                    L"不提取（询问强行使用）",
+                                    false);
+                                break;
+                            }
                             const bool extractFirst = Host::Confirm(
                                 context.Window,
                                 L"这份扩展集无法在当前游戏上校验归属：\r\n" + error +
@@ -3819,6 +3856,22 @@ namespace
                             // 结构缺失 / 损坏 / 读不到（magic、版本、截断、CRC、缺 META、缺 IDENTITY…）：
                             // 出路只有"换一份能用的档案"，**绝不能**引导用户去折腾 Universal.log
                             //（那是"盐不同"那条路的做法，对坏档案毫无用处 —— 验证 P-3）。
+                            if (Bridge::UsingWebView())
+                            {
+                                Bridge::RequestConfirm(
+                                    L"static-structure-open-lib",
+                                    L"扩展集档案结构缺失或已损坏",
+                                    L"这份扩展集档案结构缺失或已损坏（读不出来 / 版本不符 / 截断 / CRC 错 / "
+                                    L"缺 META 或 IDENTITY）：\r\n" +
+                                        error +
+                                        L"\r\n\r\n出路：用当前游戏重新执行一次「生成当前游戏扩展集」，"
+                                        L"再「安装到扩展集库」覆盖掉库里这份档案；"
+                                        L"如果这份档案是从别处拿来的，换一份重新导出的。",
+                                    L"打开扩展集库目录",
+                                    L"关闭",
+                                    true);
+                                break;
+                            }
                             const bool openLibrary = Host::Confirm(
                                 context.Window,
                                 L"这份扩展集档案结构缺失或已损坏（读不出来 / 版本不符 / 截断 / CRC 错 / "
@@ -3840,6 +3893,24 @@ namespace
                             const ExtensionSet::SaltResult currentSalt = ExtensionSet::ResolveSalt(
                                 Host::LogDirectory(),
                                 ExtensionSet::DefaultStaticKeyDirectory(context.Paths.GameDir));
+                            if (Bridge::UsingWebView())
+                            {
+                                Bridge::RequestConfirm(
+                                    L"static-salt-open-log",
+                                    L"扩展集与当前游戏盐不同",
+                                    L"这份扩展集属于别的游戏，与当前游戏的盐不同，已拒绝加载：\r\n" + error +
+                                        L"\r\n\r\n当前游戏的盐来源：" + ExtensionSet::DescribeSalt(currentSalt) +
+                                        L"\r\n\r\n工具目录只有一份会话日志（Log\\Universal.log）。它现在装着别的游戏"
+                                        L"跑步骤2 时留下的盐，所以必须换回本作的盐：\r\n"
+                                        L"· 对当前游戏执行一次「步骤2：加载动态Hash收集模块」，让收集模块覆写这份日志；"
+                                        L"或\r\n"
+                                        L"· 把那份 Universal.log 移开/改名，让工具改用静态派生"
+                                        L"（ExtractKey_Output\\Static，可用「静态 Key 提取」生成）。",
+                                    L"打开日志目录",
+                                    L"关闭",
+                                    false);
+                                break;
+                            }
                             const bool openLog = Host::Confirm(
                                 context.Window,
                                 L"这份扩展集属于别的游戏，与当前游戏的盐不同，已拒绝加载：\r\n" + error +
@@ -7013,6 +7084,28 @@ namespace
         }
         if (context.RestoreWindow && ::IsWindow(context.RestoreWindow))
         {
+            if (Bridge::UsingWebView())
+            {
+                if (Restore::IsRestoreRunning(context.RestoreWindow))
+                {
+                    if (!Bridge::CloseConfirmed())
+                    {
+                        Bridge::RequestConfirm(
+                            L"close-app",
+                            L"确认关闭",
+                            L"资源名还原正在运行。关闭主程序会中止它（已复制出去的文件保留）。\r\n\r\n确认关闭？",
+                            L"确认关闭",
+                            L"取消",
+                            true);
+                        return false;
+                    }
+                    Restore::StopRestoreRun(context.RestoreWindow);
+                }
+                ::DestroyWindow(context.RestoreWindow);
+                context.RestoreWindow = nullptr;
+                ::DestroyWindow(context.Window);
+                return true;
+            }
             if (!Host::Confirm(context.Window,
                                L"资源名还原窗口还开着。关闭主程序会一并关掉它，"
                                L"正在进行的还原会被中止（已复制出去的文件保留）。\r\n\r\n确认关闭？",
@@ -7091,6 +7184,10 @@ namespace
 
             case WM_ERASEBKGND:
             {
+                if (Bridge::UsingWebView())
+                {
+                    return 1;
+                }
                 PaintMainWindowCanvas(reinterpret_cast<HDC>(wParam), *context);
                 return 1;
             }
@@ -7099,16 +7196,81 @@ namespace
             {
                 PAINTSTRUCT ps{};
                 HDC dc = ::BeginPaint(hwnd, &ps);
-                PaintMainWindowCanvas(dc, *context);
+                if (!Bridge::UsingWebView())
+                {
+                    PaintMainWindowCanvas(dc, *context);
+                }
                 ::EndPaint(hwnd, &ps);
                 return 0;
             }
 
-            case WM_SIZE:
+            case WM_MOVE:
+            case WM_WINDOWPOSCHANGED:
             {
+                const LRESULT handled = ::DefWindowProcW(hwnd, msg, wParam, lParam);
+                Bridge::SyncPosition();
+                if (msg == WM_WINDOWPOSCHANGED)
+                {
+                    const auto* pos = reinterpret_cast<const WINDOWPOS*>(lParam);
+                    if (pos == nullptr || (pos->flags & SWP_NOSIZE) == 0)
+                    {
+                        LayoutWindow(*context);
+                        Bridge::Resize(*context);
+                    }
+                }
+                return handled;
+            }
+
+            case WM_EXITSIZEMOVE:
+            {
+                const LRESULT handled = ::DefWindowProcW(hwnd, msg, wParam, lParam);
+                Bridge::SyncPosition();
+                Bridge::Resize(*context);
+                return handled;
+            }
+
+            case WM_SIZE:
+            case WM_DPICHANGED:
+            {
+                if (msg == WM_DPICHANGED)
+                {
+                    const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+                    if (suggested != nullptr)
+                    {
+                        ::SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                                       suggested->right - suggested->left, suggested->bottom - suggested->top,
+                                       SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
                 LayoutWindow(*context);
                 Bridge::Resize(*context);
                 return 0;
+            }
+
+            case WM_NCHITTEST:
+            {
+                if (!Bridge::UsingWebView() || ::IsZoomed(hwnd))
+                {
+                    break;
+                }
+                POINT point{ static_cast<LONG>(static_cast<short>(LOWORD(lParam))),
+                             static_cast<LONG>(static_cast<short>(HIWORD(lParam))) };
+                RECT windowRect{};
+                ::GetWindowRect(hwnd, &windowRect);
+                const int edge = 8;
+                const bool onLeft = point.x < windowRect.left + edge;
+                const bool onRight = point.x >= windowRect.right - edge;
+                const bool onTop = point.y < windowRect.top + edge;
+                const bool onBottom = point.y >= windowRect.bottom - edge;
+                if (onTop && onLeft) return HTTOPLEFT;
+                if (onTop && onRight) return HTTOPRIGHT;
+                if (onBottom && onLeft) return HTBOTTOMLEFT;
+                if (onBottom && onRight) return HTBOTTOMRIGHT;
+                if (onLeft) return HTLEFT;
+                if (onRight) return HTRIGHT;
+                if (onTop) return HTTOP;
+                if (onBottom) return HTBOTTOM;
+                break;
             }
 
             case WM_NCCALCSIZE:
@@ -7536,8 +7698,22 @@ namespace
                 context->Closing = true;
                 if (context->JobActive)
                 {
+                    if (Bridge::UsingWebView() && !Bridge::CloseConfirmed())
+                    {
+                        context->Closing = false;
+                        Bridge::RequestConfirm(
+                            L"close-app",
+                            L"确认关闭",
+                            L"后台任务还在跑（生成扩展集 / 生成静态 Hash 表 / 干跑测试）。"
+                            L"关闭主程序会中止它（已经写出的文件保留）。\r\n\r\n确认关闭？",
+                            L"确认关闭",
+                            L"取消",
+                            true);
+                        return 0;
+                    }
                     // 生成 / 静态 Hash 表 / 干跑都跑在自己的线程里，关窗前必须问一句。
-                    if (!Host::Confirm(hwnd,
+                    if (!Bridge::CloseConfirmed() &&
+                        !Host::Confirm(hwnd,
                                        L"后台任务还在跑（生成扩展集 / 生成静态 Hash 表 / 干跑测试）。"
                                        L"关闭主程序会中止它（已经写出的文件保留）。\r\n\r\n确认关闭？",
                                        L"确认关闭"))

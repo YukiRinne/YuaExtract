@@ -165,7 +165,7 @@ namespace Detail
     bool RunLegacyAction(HWND owner, const std::wstring& action, std::wstring& errorOut);
     // 静态 Key 提取（等价于原版窗口里的「提取Key」）。
     // 会在执行前明确确认"将运行游戏内嵌原生代码"；返回 true = 用户确认且提取成功。
-    bool RunStaticKeyExtractionForTarget(HWND owner);
+    bool RunStaticKeyExtractionForTarget(HWND owner, bool alreadyConfirmed = false);
 
     void EnableDropOnWindow(HWND hwnd);
 
@@ -176,6 +176,11 @@ namespace Detail
     // 接收方必须自己保证线程安全（桥内部只做加锁入队 + PostMessage）。
     using LogSink = void (*)(Log::Level level, const std::wstring& text);
     void SetLogSink(LogSink sink);
+
+    // WebView 壳启用时，提示和报错进壳，不再弹 MessageBox。传 nullptr 恢复弹窗。
+    // error=true 表示错误。回调在调用线程执行。
+    using NoticeSink = void (*)(bool error, const wchar_t* text);
+    void SetNoticeSink(NoticeSink sink);
 
     std::wstring Format(const wchar_t* format, ...);
 

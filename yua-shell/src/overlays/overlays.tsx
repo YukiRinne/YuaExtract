@@ -563,6 +563,10 @@ function ConfirmDialog() {
   const s = useStore();
   const c = s.confirm!;
   const ref = useFocusTrap(true);
+  const pick = (ok: boolean) => {
+    s.set({ confirm: null });
+    c.resolve(ok);
+  };
   return (
     <div className="scrim">
       <div ref={ref} className="dialog narrow" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
@@ -571,8 +575,8 @@ function ConfirmDialog() {
         <footer>
           <span />
           <div className="row">
-            <button className="btn" onClick={() => c.resolve(false)}>{c.cancel}</button>
-            <button className={c.danger ? "btn-danger" : "btn-primary"} style={{ width: "auto" }} onClick={() => c.resolve(true)}>{c.ok}</button>
+            <button className="btn" onClick={() => pick(false)}>{c.cancel}</button>
+            <button className={c.danger ? "btn-danger" : "btn-primary"} style={{ width: "auto" }} onClick={() => pick(true)}>{c.ok}</button>
           </div>
         </footer>
       </div>

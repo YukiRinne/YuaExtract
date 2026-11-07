@@ -280,7 +280,7 @@ button { cursor: pointer; }
 
 .btn-primary {
   width: 100%; border: 0; color: var(--hibiscus-ink);
-  background: linear-gradient(180deg, #ee6e9c 0%, var(--hibiscus) 52%, #d43d76 100%);
+  background: var(--hibiscus);
   font-weight: 700; font-size: 16px; padding: 16px 24px; border-radius: 6px;
   box-shadow: 0 8px 18px rgba(233,75,134,0.28), inset 0 1px 0 rgba(248,238,243,0.38);
   display: flex; align-items: center; justify-content: space-between;
@@ -476,11 +476,13 @@ label.check { display: flex; gap: 8px; align-items: flex-start; }
   position: relative;
   overflow: hidden;
   background: var(--paper);
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
 }
 html[data-theme="dark"] .desk { background: var(--paper); }
 .desk-bg { display: none; }
 .blob {
-  position: absolute; border-radius: 50%; filter: blur(64px);
+  position: absolute; border-radius: 50%; filter: none;
   transition: transform 700ms linear;
 }
 .blob-a { width: 420px; height: 420px; left: -80px; top: -60px; background: #e3d4f6; }

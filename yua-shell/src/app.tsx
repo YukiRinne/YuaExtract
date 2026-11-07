@@ -25,7 +25,7 @@ export function App() {
       }
       if (e.key === "Escape") {
         if (cur.palette) { cur.set({ palette: false }); return; }
-        if (cur.confirm) { cur.confirm.resolve(false); return; }
+        if (cur.confirm) { const fn = cur.confirm.resolve; cur.set({ confirm: null }); fn(false); return; }
         const order: Array<keyof typeof cur.overlays> = ["settings", "notes", "meta", "online", "legacy", "batch", "collect", "restore"];
         const open = order.find((id) => cur.overlays[id]);
         if (open) cur.openOverlay(open, false);
