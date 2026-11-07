@@ -4109,7 +4109,8 @@ namespace Yua
         bool InstallBytesToLibrary(const std::wstring& libraryRoot,
                                    const std::vector<unsigned char>& blob,
                                    std::wstring& error,
-                                   const std::wstring& sourceLabel)
+                                   const std::wstring& sourceLabel,
+                                   const LibraryInstallPolicy& policy)
         {
             error.clear();
             error.reserve(4096u);
@@ -4121,6 +4122,22 @@ namespace Yua
             // 三个目标文件全部 Commit 成功后置 true：此后任何清理异常都**绝不能**回滚
             // （某些 backup 可能已经被 Finalize 删掉，再 Rollback 会误伤/误报）。
             bool transactionCommitted = false;
+
+            const auto cancellationRequested = [&]() -> bool
+            {
+                if (!policy.cancelRequested)
+                {
+                    return false;
+                }
+                try
+                {
+                    return policy.cancelRequested();
+                }
+                catch (...)
+                {
+                    return true;
+                }
+            };
 
             const auto discardAll = [&]()
             {
@@ -4191,6 +4208,32 @@ namespace Yua
                     return false;
                 }
             };
+            const auto abortCancelled = [&](size_t committedCount) -> bool
+            {
+                std::wstring rollbackReport;
+                bool rollbackOk = true;
+                if (committedCount > 0u)
+                {
+                    rollbackOk = rollbackPrefix(committedCount, rollbackReport);
+                }
+                discardAll();
+                const std::wstring blocked = RemoveCreatedDirectories(createdDirectories);
+                error = L"扩展集安装已取消。";
+                if (rollbackOk)
+                {
+                    error += L"\r\n本地库未改动。";
+                }
+                else
+                {
+                    error += L"\r\n取消后的回滚没有全部成功，旧数据仍在备份里（请勿删除）：\r\n"
+                             + rollbackReport;
+                }
+                if (!blocked.empty())
+                {
+                    error += L"\r\n注意：本次新建的目录没能全部收回：" + blocked;
+                }
+                return false;
+            };
             try
             {
             if (libraryRoot.empty())
@@ -4215,6 +4258,11 @@ namespace Yua
             {
                 return false;
             }
+            if (cancellationRequested())
+            {
+                error = L"扩展集安装已取消，尚未改动本地库。";
+                return false;
+            }
 
             // ---------- 1) 所有"读 + 解码 + 编码 + 路径检查"都在任何目标覆盖之前完成 ----------
             Archive archive;
@@ -4222,6 +4270,7 @@ namespace Yua
             {
                 return false;
             }
+
             if (!ValidateMeta(archive.meta, error))
             {
                 return false;
@@ -4272,6 +4321,31 @@ namespace Yua
                 }
             }
 
+            // Protection must use the list read under the library write lock. The UI-side
+            // snapshot may already be stale by the time the download finishes.
+            const unsigned long long incomingEntryCount =
+                static_cast<unsigned long long>(archive.stats.directories) + archive.stats.files;
+            if (policy.protectMoreComplete && !policy.forceReplaceMoreComplete)
+            {
+                for (const LibraryEntry& existing : existingEntries)
+                {
+                    const bool sameExe = !existing.exeDigest.empty()
+                        && !archive.identity.targetExe.sha256.empty()
+                        && SameHash(existing.exeDigest, archive.identity.targetExe.sha256);
+                    const bool sameSlot =
+                        LibrarySlotKey(existing.publisher, existing.title) == slotKey;
+                    if ((sameExe || sameSlot) &&
+                        static_cast<unsigned long long>(existing.entryCount) > incomingEntryCount)
+                    {
+                        error = L"安装已拒绝：本地同槽位或同目标程序的档案包含更多条目（本地 "
+                                + FormatUInt(existing.entryCount) + L"，远端 "
+                                + FormatUInt(incomingEntryCount)
+                                + L"），且没有明确要求覆盖。\r\n\r\n本地库未改动。";
+                        return false;
+                    }
+                }
+            }
+
             std::wstring why;
             std::wstring targetDirectory;
             if (!ValidateInstallSlot(normalizedRoot, publisher, title, targetDirectory, why))
@@ -4300,6 +4374,12 @@ namespace Yua
 
             const std::wstring archiveDigest = Sha256HexBytes(blob.data(), blob.size());
             const std::wstring saltDigest = Sha256HexText(archive.identity.salt);
+
+            if (cancellationRequested())
+            {
+                error = L"扩展集安装已取消，尚未改动本地库。";
+                return false;
+            }
 
             SYSTEMTIME now{};
             ::GetLocalTime(&now);
@@ -4437,9 +4517,18 @@ namespace Yua
                 return false;
             }
 
+            if (cancellationRequested())
+            {
+                return abortCancelled(0u);
+            }
+
             // ---------- 4) 依次提交；任一步失败按相反顺序回滚（**含失败的那一项**） ----------
             for (size_t i = 0u; i < pending.size(); ++i)
             {
+                if (cancellationRequested())
+                {
+                    return abortCancelled(i);
+                }
                 std::wstring commitError;
                 commitError.reserve(1024u);
                 if (!Common::AtomicFile::Commit(pending[i], commitError))

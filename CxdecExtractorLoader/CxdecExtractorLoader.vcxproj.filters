@@ -179,6 +179,9 @@
     <ClInclude Include="OnlineUpdate.h">
       <Filter>源文件</Filter>
     </ClInclude>
+    <ClInclude Include="RestoreReportStats.h">
+      <Filter>源文件</Filter>
+    </ClInclude>
     <ClInclude Include="..\Common\directory.h">
       <Filter>Common</Filter>
     </ClInclude>

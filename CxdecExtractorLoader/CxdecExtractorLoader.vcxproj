@@ -73,7 +73,7 @@
       <BufferSecurityCheck>true</BufferSecurityCheck>
       <ExceptionHandling>Sync</ExceptionHandling>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
-      <AdditionalIncludeDirectories>$(SolutionDir)Detours;$(SolutionDir)Common;$(SolutionDir)CxdecRepacker;$(SolutionDir)CxdecRepacker\third_party\zlib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)Detours;$(SolutionDir)Common;$(SolutionDir)CxdecRepacker;$(SolutionDir)CxdecRepacker\third_party\zlib;$(SolutionDir)third_party\webview2\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <SDLCheck>false</SDLCheck>
       <GuardEHContMetadata>false</GuardEHContMetadata>
@@ -104,7 +104,12 @@
       <CETCompat>false</CETCompat>
       <EnableUAC>false</EnableUAC>
       <LargeAddressAware>false</LargeAddressAware>
+      <AdditionalDependencies>$(SolutionDir)third_party\webview2\x86\WebView2LoaderStatic.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <PostBuildEvent>
+      <Command>if exist "$(SolutionDir)yua-shell\dist\index.html" xcopy /E /I /Y "$(SolutionDir)yua-shell\dist\*" "$(OutDir)shell\"</Command>
+      <Message>复制 yua-shell 生产构建到 $(OutDir)shell\</Message>
+    </PostBuildEvent>
     <Manifest>
       <VerboseOutput>false</VerboseOutput>
     </Manifest>
@@ -120,7 +125,7 @@
       <BufferSecurityCheck>true</BufferSecurityCheck>
       <ExceptionHandling>Sync</ExceptionHandling>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
-      <AdditionalIncludeDirectories>$(SolutionDir)Detours;$(SolutionDir)Common;$(SolutionDir)CxdecRepacker;$(SolutionDir)CxdecRepacker\third_party\zlib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)Detours;$(SolutionDir)Common;$(SolutionDir)CxdecRepacker;$(SolutionDir)CxdecRepacker\third_party\zlib;$(SolutionDir)third_party\webview2\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <CompileAsManaged>false</CompileAsManaged>
@@ -159,7 +164,13 @@
       <EnableUAC>false</EnableUAC>
       <ImportLibrary>$(IntDir)$(TargetName).lib</ImportLibrary>
       <ProgramDatabaseFile>$(IntDir)$(TargetName).pdb</ProgramDatabaseFile>
+      <!-- WebView2 静态加载器（x86）：不引入 Win10 专有导入，Win7 SP1 也能加载。 -->
+      <AdditionalDependencies>$(SolutionDir)third_party\webview2\x86\WebView2LoaderStatic.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <PostBuildEvent>
+      <Command>if exist "$(SolutionDir)yua-shell\dist\index.html" xcopy /E /I /Y "$(SolutionDir)yua-shell\dist\*" "$(OutDir)shell\"</Command>
+      <Message>复制 yua-shell 生产构建到 $(OutDir)shell\</Message>
+    </PostBuildEvent>
     <Manifest>
       <VerboseOutput>false</VerboseOutput>
     </Manifest>
@@ -205,6 +216,7 @@
     <ClCompile Include="YuaRestoreWindow.cpp" />
     <!-- 扩展集「在线更新」：WinHTTP 拉取 + 信任链校验（§14）。winhttp.lib 在 .cpp 里用
          #pragma comment(lib, ...) 带上，链接项不动。 -->
+    <ClCompile Include="OnlineHostPolicy.cpp" />
     <ClCompile Include="OnlineUpdate.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -240,6 +252,8 @@
     <ClInclude Include="YuaExtractMainWindow.h" />
     <ClInclude Include="YuaRestoreWindow.h" />
     <ClInclude Include="OnlineUpdate.h" />
+    <ClInclude Include="YuaWebViewBridge.inl" />
+    <ClInclude Include="RestoreReportStats.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="CxdecExtractorLoader.rc" />

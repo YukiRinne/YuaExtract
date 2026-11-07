@@ -159,13 +159,29 @@ namespace Detail
 
     // 上游原版功能窗口（解包 / 运行时恢复 / Hook 撞库 / 提取Key / 封包）。
     void ShowLegacyFunctionsWindow(HWND owner);
+    // 直接触发某一项原版功能（等价于在那个窗口里点对应按钮），不关闭主窗口。
+    // action：extractor / dumper / hashRestore / keyStatic / repack。
+    // 返回 true = 已经派发（对话框自己的流程接管后续）；false = action 未知或窗口没建起来。
+    bool RunLegacyAction(HWND owner, const std::wstring& action, std::wstring& errorOut);
     // 静态 Key 提取（等价于原版窗口里的「提取Key」）。
     // 会在执行前明确确认"将运行游戏内嵌原生代码"；返回 true = 用户确认且提取成功。
-    bool RunStaticKeyExtractionForTarget(HWND owner);
+    bool RunStaticKeyExtractionForTarget(HWND owner, bool alreadyConfirmed = false);
 
     void EnableDropOnWindow(HWND hwnd);
 
     void LogLine(Log::Level level, const std::wstring& text);
+
+    // 日志镜像：每写一行日志就额外回调一次（WebView2 桥用它把 log 事件推给界面）。
+    // 只允许一个接收者；传 nullptr 摘掉。回调可能在**任意线程**被调用，
+    // 接收方必须自己保证线程安全（桥内部只做加锁入队 + PostMessage）。
+    using LogSink = void (*)(Log::Level level, const std::wstring& text);
+    void SetLogSink(LogSink sink);
+
+    // WebView 壳启用时，提示和报错进壳，不再弹 MessageBox。传 nullptr 恢复弹窗。
+    // error=true 表示错误。回调在调用线程执行。
+    using NoticeSink = void (*)(bool error, const wchar_t* text);
+    void SetNoticeSink(NoticeSink sink);
+
     std::wstring Format(const wchar_t* format, ...);
 
     bool Confirm(HWND owner, const std::wstring& text, const std::wstring& caption);

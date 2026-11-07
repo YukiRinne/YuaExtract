@@ -385,7 +385,10 @@ README_add.txt
 _verify/
 docs/
 refs/
-src/
+/src/
+yua-shell/node_modules/
+yua-shell/dist/
+yua-shell/shots/
 upstream-release/
 *.zip
 *_scratch.vcxproj

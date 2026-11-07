@@ -17,6 +17,7 @@
 
 #include "AtomicFile.h"
 #include "PathSafety.h"
+#include "OnlineHostPolicy.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1163,6 +1164,19 @@ namespace Online
             {
                 return false;
             }
+
+            // 主机策略（OnlineHostPolicy.h）：本机 / 内网 / 保留段地址一律不连。字符串层
+            // 先挡一遍；名字型主机还要真的解析一遍，解析出的任何地址落在保留段里同样拒绝
+            // —— 这一步挡的是 DNS 重绑定（域名看着无害，解析出来却是 127.0.0.1 / 内网）。
+            // 数字字面量不用解析（HostIsBlocked 已判过），省一次 DNS。
+            if (HostIsBlocked(parts.host, error)
+                || (!HostIsNumericAddress(parts.host) && ResolveBlocked(parts.host, error)))
+            {
+                error = L"拒绝连接 \"" + parts.host + L"\"：" + error
+                      + L"本工具只访问公网 https 地址，不访问本机 / 内网 / 保留段。";
+                return false;
+            }
+
             if (request.cancel && request.cancel())
             {
                 error = L"已取消。";
@@ -1672,6 +1686,27 @@ namespace Online
         if (!ResolveUsableBase(base, normalized, error))
         {
             return false;
+        }
+
+        // 主机策略与联网入口（HttpGet）同一套：本机 / 内网 / 保留段的主机不许保存为仓库
+        // 基址 —— 存进 ini 之后，每次在线更新都会往那边发请求。必须在动 ini **之前**挡掉，
+        // 拒绝时一个字节都不落盘（不读不改不写）。
+        {
+            UrlParts parts;
+            if (!ParseHttpsUrl(normalized, parts, error))
+            {
+                // ResolveUsableBase 已经保证 normalized 是带主机的 https 地址，走到这里
+                // 说明两边对"能用的地址"认知不一致，宁可拒绝也不往下写。
+                return false;
+            }
+            if (HostIsBlocked(parts.host, error)
+                || (!HostIsNumericAddress(parts.host) && ResolveBlocked(parts.host, error)))
+            {
+                error = L"仓库地址被拒：主机 \"" + parts.host + L"\" " + error
+                      + L"配置没有保存。本工具只访问公网 https 地址，"
+                        L"不访问本机 / 内网 / 保留段。";
+                return false;
+            }
         }
 
         const std::wstring path = ConfigFilePath();
