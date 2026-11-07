@@ -443,10 +443,21 @@ namespace Yua
         //
         // 返回 false 时 error 必非空并写明本地库状态；成功时 error 一般为空，
         // 极端情况下可能带"备份文件删不掉"的非致命提示。
+        struct LibraryInstallPolicy
+        {
+            // 默认保持历史语义：手工安装仍可替换同槽位 / 同 exe 的旧档案。
+            bool protectMoreComplete = false;
+            // 只由调用方传入的显式 force 打开，不能由保护逻辑自行放宽。
+            bool forceReplaceMoreComplete = false;
+            // 在写锁内和每个库文件提交前检查；true 时回滚未完成事务并保留原库。
+            std::function<bool()> cancelRequested;
+        };
+
         bool InstallBytesToLibrary(const std::wstring& libraryRoot,
                                    const std::vector<unsigned char>& blob,
                                    std::wstring& error,
-                                   const std::wstring& sourceLabel = std::wstring());
+                                   const std::wstring& sourceLabel = std::wstring(),
+                                   const LibraryInstallPolicy& policy = LibraryInstallPolicy());
 
         // 解析一份「清单 / 索引」文本：TSV，10 列（表头与 WriteManifest 一致），'#' 开头是注释行。
         // **本地库清单（EnumerateLibrary）与在线索引（Online::FetchIndex）共用这一份实现**，

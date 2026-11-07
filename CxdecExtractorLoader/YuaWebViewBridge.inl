@@ -577,10 +577,8 @@ namespace Bridge
         std::wstring lastWorkspace;
         std::wstring lastLibrary;
         // 最近一次**成功**拉取的远端索引（仅 UI 线程读写，不加新锁；失败不清空旧值）。
-        // remoteCatalogSnapshot 是拉索引那一刻的本地库快照，供 downloadRemote 里的
-        // Online::Classify 使用，保证「列表显示的状态」和「下载时判定的状态」同一口径。
+        // 覆盖保护必须使用下载/安装时刻的本地库，不能缓存拉索引时的状态。
         std::vector<ExtensionSet::LibraryEntry> remoteEntries;
-        ExtensionSet::LibraryCatalog remoteCatalogSnapshot;
         volatile LONG onlineCancel = 0;
         volatile LONG onlineActive = 0;
         bool pushPosted = false;
@@ -596,6 +594,11 @@ namespace Bridge
     bool UsingWebView()
     {
         return S().hostCreated && !S().forcedLegacy;
+    }
+
+    bool OnlineWorkActive()
+    {
+        return ::InterlockedCompareExchange(&S().onlineActive, 0, 0) != 0;
     }
 
     HWND HostWindow()
@@ -1350,6 +1353,7 @@ namespace Bridge
         std::wstring base;
         std::wstring endpoint;
         bool force = false;
+        bool cancelled = false;
         ExtensionSet::LibraryEntry entry;
         ExtensionSet::LibraryCatalog catalog;
         bool ok = false;
@@ -1373,10 +1377,12 @@ namespace Bridge
     DWORD WINAPI OnlineThreadProc(LPVOID parameter)
     {
         OnlineWork* work = static_cast<OnlineWork*>(parameter);
-        Online::Request req;
-        req.cancel = []() -> bool {
+        const auto cancellationRequested = []() -> bool
+        {
             return ::InterlockedCompareExchange(&S().onlineCancel, 0, 0) != 0 || !S().attached;
         };
+        Online::Request req;
+        req.cancel = cancellationRequested;
         if (work->kind == OnlineWork::Kind::Index)
         {
             Online::IndexResult info;
@@ -1391,18 +1397,51 @@ namespace Bridge
         {
             Online::DownloadResult download;
             std::wstring error;
+            struct StagingCleanup
+            {
+                std::wstring directory;
+                ~StagingCleanup()
+                {
+                    if (directory.empty())
+                    {
+                        return;
+                    }
+                    try
+                    {
+                        Online::CleanupStaging(directory);
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+            } stagingCleanup;
             if (!Online::DownloadArchive(work->base, work->entry, std::wstring(), download, error, req))
             {
                 work->ok = false;
                 work->error = error;
+                work->cancelled = cancellationRequested();
+            }
+            else if (cancellationRequested())
+            {
+                stagingCleanup.directory = download.stagingDirectory;
+                work->ok = false;
+                work->cancelled = true;
+                work->error = L"在线更新已取消，未校验或安装下载内容。";
             }
             else
             {
+                stagingCleanup.directory = download.stagingDirectory;
                 std::wstring detail;
                 if (!Online::VerifyArchiveBytes(download.blob, work->entry, detail, error))
                 {
                     work->ok = false;
                     work->error = error;
+                }
+                else if (cancellationRequested())
+                {
+                    work->ok = false;
+                    work->cancelled = true;
+                    work->error = L"在线更新已取消，未安装已校验的下载内容。";
                 }
                 else
                 {
@@ -1411,16 +1450,20 @@ namespace Bridge
                         Online::ArchiveUrl(work->base, work->entry.publisher, work->entry.title);
                     // 会社 / 作品由档案自己的 META 决定（已在上一步与索引交叉校验过），
                     // 所以这里只给库根、字节与来源标签。
+                    ExtensionSet::LibraryInstallPolicy installPolicy;
+                    installPolicy.protectMoreComplete = true;
+                    installPolicy.forceReplaceMoreComplete = work->force;
+                    installPolicy.cancelRequested = cancellationRequested;
                     work->ok = ExtensionSet::InstallBytesToLibrary(
-                        ExtensionSet::DefaultLibraryRoot(Host::LoaderDirectory()), download.blob, installError,
-                        source);
+                        ExtensionSet::DefaultLibraryRoot(Host::LoaderDirectory()), download.blob,
+                        installError, source, installPolicy);
                     if (!work->ok)
                     {
                         work->error = installError;
+                        work->cancelled = cancellationRequested();
                     }
                     work->detail = detail;
                 }
-                Online::CleanupStaging(download.stagingDirectory);
             }
         }
         ::InterlockedExchange(&S().onlineActive, 0);
@@ -1480,7 +1523,9 @@ namespace Bridge
                     { "error", JsonString(work->error) },
                 }));
             }
-            NotifyToast(L"error", index ? L"索引拉取失败" : L"下载失败", work->error.c_str());
+            NotifyToast(work->cancelled ? L"info" : L"error",
+                        work->cancelled ? L"已取消" : (index ? L"索引拉取失败" : L"下载失败"),
+                        work->error.c_str());
             delete work;
             return;
         }
@@ -1526,7 +1571,6 @@ namespace Bridge
             // 缓存落地（仅 UI 线程）：downloadRemote 只认这份远端索引；
             // 索引失败的提前 return 不经过这里，上一次成功的缓存得以保留。
             S().remoteEntries = work->entries;
-            S().remoteCatalogSnapshot = work->catalog;
         }
         else
         {
@@ -1709,6 +1753,12 @@ namespace Bridge
         }
         if (type == L"setTarget")
         {
+            if (RejectIfTargetChangeBusy(context, L"切换目标游戏"))
+            {
+                NotifyWorkspace(context);
+                NotifyUi(context, L"meta");
+                return;
+            }
             std::wstring path = TrimWhitespace(document.MemberText("path"));
             if (path.empty())
             {
@@ -2001,8 +2051,16 @@ namespace Bridge
                             L"（会社/作品需与索引完全一致）。");
                 return;
             }
-            // 与索引列表同一口径的状态判定：本地更全时默认不覆盖，除非显式 force。
-            const Online::EntryState remoteState = Online::Classify(entry, state.remoteCatalogSnapshot);
+            // UI 先按当前库决定是否启动下载；安装器还会在写锁内重新读取清单，
+            // 防止下载期间本地库变化后漏掉覆盖保护。
+            const ExtensionSet::LibraryCatalog liveCatalog =
+                ExtensionSet::EnumerateLibrary(context.LibraryRoot);
+            if (!liveCatalog.ok)
+            {
+                NotifyToast(L"error", L"无法读取本地扩展集库", liveCatalog.error.c_str());
+                return;
+            }
+            const Online::EntryState remoteState = Online::Classify(entry, liveCatalog);
             if (remoteState == Online::EntryState::LocalNewer && !document.MemberBool("force", false))
             {
                 NotifyToast(L"warn", L"本地更全，默认不覆盖", Online::DescribeState(remoteState));

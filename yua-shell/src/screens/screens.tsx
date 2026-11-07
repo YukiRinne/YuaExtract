@@ -6,6 +6,7 @@ import {
   Trash2, Upload, Wrench, X, CloudDownload, Pencil, FlaskConical, Download,
 } from "lucide-react";
 import { fmtInt, fmtPct, midTrunc } from "../lib/format";
+import { targetInteractionBusy } from "../lib/interaction";
 import { localizeText } from "../i18n";
 import { ChipFilter, Meter, ModeSeg, NeoToggle, PageFrame, PathLine, StatusWord, reduced } from "../ui/widgets";
 import { DropArt, Ring } from "../ui/desk";
@@ -108,6 +109,10 @@ export function HomeScreen() {
     : s.mode === "studio"
       ? t.studioSoon
       : t.helpClassic;
+  const interactionBusy = targetInteractionBusy({
+    jobStatus: s.job.status,
+    restoreTasks: s.restoreTasks,
+  });
 
   return (
     <>
@@ -115,20 +120,22 @@ export function HomeScreen() {
         <div
           className={`sketch drop-stage${w.exe ? "" : " empty"}`}
           data-hot={s.dropping}
-          onClick={() => { if (!w.exe) s.send({ type: "browseExe" }); }}
-          onDragOver={(e) => { e.preventDefault(); s.set({ dropping: true }); }}
+          onClick={() => { if (!w.exe && !interactionBusy) s.send({ type: "browseExe" }); }}
+          onDragOver={(e) => { e.preventDefault(); if (!interactionBusy) s.set({ dropping: true }); }}
           onDragLeave={() => s.set({ dropping: false })}
           onDrop={(e) => {
             e.preventDefault();
             s.set({ dropping: false });
+            if (interactionBusy) return;
             const file = [...e.dataTransfer.files][0];
             const path = (file as File & { path?: string })?.path || file?.name;
             if (path) s.send({ type: "setTarget", path: path.toLowerCase().endsWith(".exe") ? path : `${path}` });
           }}
           role="button"
-          tabIndex={0}
+          tabIndex={interactionBusy ? -1 : 0}
+          aria-disabled={interactionBusy}
           aria-label={w.exe ? t.target : t.dropStrong}
-          onKeyDown={(e) => { if (!w.exe && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); s.send({ type: "browseExe" }); } }}
+          onKeyDown={(e) => { if (!interactionBusy && !w.exe && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); s.send({ type: "browseExe" }); } }}
         >
           {!w.exe ? (
             <>
@@ -140,8 +147,8 @@ export function HomeScreen() {
           ) : (
             <>
               <div style={{ position: "absolute", top: 12, right: 12, display: "flex", gap: 6 }}>
-                <button className="icon-btn" aria-label={t.browse} onClick={(e) => { e.stopPropagation(); s.send({ type: "browseExe" }); }}><FolderOpen size={15} /></button>
-                <button className="icon-btn" aria-label={t.clearGame} onClick={(e) => { e.stopPropagation(); s.set({ workspace: { ...s.workspace, exe: null, title: null } }); s.send({ type: "setTarget", path: "" }); }}><X size={15} /></button>
+                <button className="icon-btn" aria-label={t.browse} disabled={interactionBusy} onClick={(e) => { e.stopPropagation(); s.send({ type: "browseExe" }); }}><FolderOpen size={15} /></button>
+                <button className="icon-btn" aria-label={t.clearGame} disabled={interactionBusy} onClick={(e) => { e.stopPropagation(); s.send({ type: "setTarget", path: "" }); }}><X size={15} /></button>
               </div>
               <div className="file-row">
                 <div className="file-ico"><FileTerminal size={22} /></div>

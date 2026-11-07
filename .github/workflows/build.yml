@@ -33,6 +33,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: yua-shell/package-lock.json
+
+      - name: Build frontend
+        working-directory: yua-shell
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE." }
+          npm run typecheck
+          if ($LASTEXITCODE -ne 0) { throw "npm run typecheck failed with exit code $LASTEXITCODE." }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit code $LASTEXITCODE." }
+
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
@@ -63,6 +81,23 @@ jobs:
         run: |
           Get-ChildItem Release -Recurse -Include *.pdb, *.lib, *.exp -File -ErrorAction SilentlyContinue |
             Remove-Item -Force -ErrorAction SilentlyContinue
+
+      - name: Verify release shell
+        shell: pwsh
+        run: |
+          $shell = 'Release/shell'
+          if (-not (Test-Path -LiteralPath "$shell/index.html" -PathType Leaf)) {
+            throw "Release shell is incomplete: $shell/index.html is missing."
+          }
+          foreach ($directory in @('assets', 'brand')) {
+            $path = Join-Path $shell $directory
+            if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+              throw "Release shell is incomplete: $path is missing."
+            }
+            if (@(Get-ChildItem -LiteralPath $path -Recurse -File).Count -eq 0) {
+              throw "Release shell is incomplete: $path contains no files."
+            }
+          }
 
       - name: List output
         shell: pwsh
@@ -103,6 +138,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: yua-shell/package-lock.json
+
+      - name: Build frontend
+        working-directory: yua-shell
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE." }
+          npm run typecheck
+          if ($LASTEXITCODE -ne 0) { throw "npm run typecheck failed with exit code $LASTEXITCODE." }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit code $LASTEXITCODE." }
+
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
@@ -126,6 +179,23 @@ jobs:
             $params += "/p:PlatformToolset=${{ inputs.toolset }}"
           }
           msbuild @params
+
+      - name: Verify debug shell
+        shell: pwsh
+        run: |
+          $shell = 'Debug/shell'
+          if (-not (Test-Path -LiteralPath "$shell/index.html" -PathType Leaf)) {
+            throw "Debug shell is incomplete: $shell/index.html is missing."
+          }
+          foreach ($directory in @('assets', 'brand')) {
+            $path = Join-Path $shell $directory
+            if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+              throw "Debug shell is incomplete: $path is missing."
+            }
+            if (@(Get-ChildItem -LiteralPath $path -Recurse -File).Count -eq 0) {
+              throw "Debug shell is incomplete: $path contains no files."
+            }
+          }
 
       - name: List output
         shell: pwsh

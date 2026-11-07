@@ -1,6 +1,7 @@
 import { useEffect, useRef, type DragEvent } from "react";
 import { BookOpen, Hammer, Home, Info, Minus, Search, Settings, Square, X } from "lucide-react";
 import { fmtInt } from "./lib/format";
+import { targetInteractionBusy } from "./lib/interaction";
 import { LogDrawer, OverlayRoot } from "./overlays/overlays";
 import { AboutScreen, HomeScreen, LibraryScreen, MakeScreen } from "./screens/screens";
 import { useStore } from "./store";
@@ -58,9 +59,15 @@ export function App() {
     { id: "about", label: t.tabs.about, icon: Info },
   ];
 
+  const interactionBusy = targetInteractionBusy({
+    jobStatus: s.job.status,
+    restoreTasks: s.restoreTasks,
+  });
+
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
     s.set({ dropping: false });
+    if (interactionBusy) return;
     const file = [...e.dataTransfer.files][0];
     const path = (file as File & { path?: string }).path || file?.name;
     if (!path) return;
@@ -101,7 +108,7 @@ export function App() {
     <div
       className="desk"
       data-dropping={s.dropping}
-      onDragOver={(e) => { e.preventDefault(); s.set({ dropping: true }); }}
+      onDragOver={(e) => { e.preventDefault(); if (!interactionBusy) s.set({ dropping: true }); }}
       onDragLeave={() => s.set({ dropping: false })}
       onDrop={onDrop}
     >

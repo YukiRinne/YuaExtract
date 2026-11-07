@@ -494,6 +494,7 @@ namespace
     {
         bool UsingWebView();
         HWND HostWindow();
+        bool OnlineWorkActive();
         bool CloseConfirmed();
         int LayoutOffsetX();
         void Attach(UiContext& context);
@@ -3079,6 +3080,31 @@ namespace
         return true;
     }
 
+    bool TargetChangeBusy(const UiContext& context)
+    {
+        return JobBusy(context) || context.JobDoneUi || context.PrepareBusy ||
+               context.Closing || Bridge::OnlineWorkActive() ||
+               (context.RestoreWindow && ::IsWindow(context.RestoreWindow) &&
+                Restore::IsRestoreRunning(context.RestoreWindow));
+    }
+
+    bool RejectIfTargetChangeBusy(UiContext& context, const wchar_t* action)
+    {
+        if (!TargetChangeBusy(context))
+        {
+            return false;
+        }
+
+        std::wstring body = std::wstring(L"当前操作仍在运行，暂时不能") + action +
+                            L"。请等任务结束（或点「取消」并等它真正退出）后再试。";
+        if (context.Closing)
+        {
+            body = L"窗口正在关闭，不能再切换目标游戏。";
+        }
+        ShowUiInfo(context, L"暂时不能切换目标", body);
+        return true;
+    }
+
     // 后台任务 / ClosePending / JobDoneUi 期间必须拒绝的控件与命令。
     // **锁定与命令门禁共用这一份**：以前两处各写一份，NOTE / OPEN_LIB / ADVANCED /
     // 打开工作区/还原目录/报告这些"只读但会弹模态框或碰磁盘"的 ID 漏了一边，
@@ -3212,7 +3238,7 @@ namespace
 
     void OnBrowseExe(UiContext& context)
     {
-        if (RejectIfBusy(context, L"切换目标游戏"))
+        if (RejectIfTargetChangeBusy(context, L"切换目标游戏"))
         {
             return;
         }
@@ -7474,8 +7500,7 @@ namespace
                     case IDC_YUA_EXE_EDIT:
                         if (HIWORD(wParam) == EN_KILLFOCUS)
                         {
-                            if (JobBusy(*context) || context->JobDoneUi || context->PrepareBusy ||
-                                context->Closing)
+                            if (RejectIfTargetChangeBusy(*context, L"切换目标游戏"))
                             {
                                 return 0;
                             }
@@ -7643,10 +7668,9 @@ namespace
                     ::DragFinish(drop);
                     return 0;
                 }
-                if (JobBusy(*context) || context->JobDoneUi || context->PrepareBusy)
+                if (RejectIfTargetChangeBusy(*context, L"切换目标游戏"))
                 {
                     ::DragFinish(drop);
-                    RejectIfBusy(*context, L"切换目标游戏");
                     return 0;
                 }
                 const UINT count = ::DragQueryFileW(drop, 0xFFFFFFFFu, nullptr, 0u);
