@@ -107,7 +107,7 @@
       <AdditionalDependencies>$(SolutionDir)third_party\webview2\x86\WebView2LoaderStatic.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /E /I /Y "$(SolutionDir)yua-shell\dist\*" "$(OutDir)shell\"</Command>
+      <Command>if exist "$(SolutionDir)yua-shell\dist\index.html" xcopy /E /I /Y "$(SolutionDir)yua-shell\dist\*" "$(OutDir)shell\"</Command>
       <Message>复制 yua-shell 生产构建到 $(OutDir)shell\</Message>
     </PostBuildEvent>
     <Manifest>
@@ -168,7 +168,7 @@
       <AdditionalDependencies>$(SolutionDir)third_party\webview2\x86\WebView2LoaderStatic.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /E /I /Y "$(SolutionDir)yua-shell\dist\*" "$(OutDir)shell\"</Command>
+      <Command>if exist "$(SolutionDir)yua-shell\dist\index.html" xcopy /E /I /Y "$(SolutionDir)yua-shell\dist\*" "$(OutDir)shell\"</Command>
       <Message>复制 yua-shell 生产构建到 $(OutDir)shell\</Message>
     </PostBuildEvent>
     <Manifest>

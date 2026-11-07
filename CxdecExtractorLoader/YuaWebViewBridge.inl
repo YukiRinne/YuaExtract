@@ -1426,7 +1426,12 @@ namespace Bridge
         ::InterlockedExchange(&S().onlineActive, 0);
         if (work->notify != nullptr && ::IsWindow(work->notify) && S().attached)
         {
-            ::PostMessageW(work->notify, kWorkMessage, 0, reinterpret_cast<LPARAM>(work));
+            // PostMessage 失败（FALSE）时消息永远不会到达 UI 线程，没人收尾，就地 delete 防泄漏；
+            // 成功（TRUE）则由 UI 线程处理消息后 delete。
+            if (::PostMessageW(work->notify, kWorkMessage, 0, reinterpret_cast<LPARAM>(work)) == FALSE)
+            {
+                delete work;
+            }
         }
         else
         {
@@ -1465,12 +1470,16 @@ namespace Bridge
                      work->ok ? std::wstring() : work->error));
         if (!work->ok)
         {
-            Emit(JsonObject({
-                { "type", JsonString(L"remoteIndex") },
-                { "items", "[]" },
-                { "base", JsonString(Online::ResolveRepositoryBase()) },
-                { "error", JsonString(work->error) },
-            }));
+            // 仅索引失败才清空远端列表；下载失败只报 job + toast，不动界面已有列表。
+            if (index)
+            {
+                Emit(JsonObject({
+                    { "type", JsonString(L"remoteIndex") },
+                    { "items", "[]" },
+                    { "base", JsonString(Online::ResolveRepositoryBase()) },
+                    { "error", JsonString(work->error) },
+                }));
+            }
             NotifyToast(L"error", index ? L"索引拉取失败" : L"下载失败", work->error.c_str());
             delete work;
             return;
@@ -2668,6 +2677,24 @@ namespace Bridge
         }
         state.host = nullptr;
         state.hostCreated = false;
+        // 参照 Detach 的释放顺序补齐 COM 引用释放；FailClosed 可能被多次触发，
+        // 全部判空、置空后才算释放完，重复调用安全。
+        if (state.webview != nullptr)
+        {
+            state.webview->Release();
+            state.webview = nullptr;
+        }
+        if (state.controller != nullptr)
+        {
+            state.controller->Close();
+            state.controller->Release();
+            state.controller = nullptr;
+        }
+        if (state.environment != nullptr)
+        {
+            state.environment->Release();
+            state.environment = nullptr;
+        }
         state.ready = false;
         if (state.main != nullptr && ::IsWindow(state.main))
         {
@@ -2740,6 +2767,24 @@ namespace Bridge
             }
             // 无论 URL 是什么都不开新窗口：本界面没有多窗口语义。
             args->put_Handled(TRUE);
+            return S_OK;
+        }
+    };
+
+    class DownloadHandler final
+        : public HandlerBase<ICoreWebView2DownloadStartingEventHandler, DownloadHandler>
+    {
+    public:
+        HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* args) override
+        {
+            if (args == nullptr)
+            {
+                return S_OK;
+            }
+            // 本界面没有任何下载语义：一律取消并吞掉默认下载 UI。
+            args->put_Cancel(TRUE);
+            args->put_Handled(TRUE);
+            Host::LogLine(Log::Level::Warn, L"[YuaExtract] 已阻止下载");
             return S_OK;
         }
     };
@@ -2968,6 +3013,14 @@ namespace Bridge
         ICoreWebView2WebResourceRequestedEventHandler* resources = new ResourceHandler();
         webview->add_WebResourceRequested(resources, &token);
         resources->Release();
+        ICoreWebView2_4* webview4 = nullptr;
+        if (SUCCEEDED(webview->QueryInterface(IID_PPV_ARGS(&webview4))) && webview4 != nullptr)
+        {
+            ICoreWebView2DownloadStartingEventHandler* download = new DownloadHandler();
+            webview4->add_DownloadStarting(download, &token);
+            download->Release();
+            webview4->Release();
+        }
 
         // 虚拟源：https://yua.local/ → <LoaderDir>/shell/
         ICoreWebView2_3* webview3 = nullptr;
@@ -3090,6 +3143,15 @@ namespace Bridge
     {
         State& state = S();
         ::InterlockedExchange(&state.onlineCancel, 1);
+        // 等在线线程退出（最多 3 秒）：COM 对象必须在无人使用后再释放。
+        for (int i = 0; i < 60; ++i)
+        {
+            if (::InterlockedCompareExchange(&state.onlineActive, 0, 0) == 0)
+            {
+                break;
+            }
+            ::Sleep(50);
+        }
         Host::SetLogSink(nullptr);
         Host::SetNoticeSink(nullptr);
         state.ready = false;

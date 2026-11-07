@@ -84,7 +84,8 @@ Types live in `src/types.ts` (`HostRequest`, `HostEvent`).
 | `notes` | text | Comment / contributor block |
 | `picked` | kind + path | Dialog results |
 | `overlayHint` | overlay id + open | Host asks the shell to show restore/collect/batch/legacy |
-| `ui` | reason + sourceDir/testDir/draftMeta/lastAction/dryRunNote + notes | Syncs MakeScreen overrides, draft metadata, dry-run summary, and note fields |
+| `hostConfirm` | `action` + `title` + `body` + `ok` + `cancel` + optional `danger` | Host asks the shell to show a confirm dialog; the shell replies with the `confirmReply` request (`action` + `accepted`) |
+| `uiSync` | reason + sourceDir/testDir/draftMeta/lastAction/dryRunNote + notes | Syncs MakeScreen overrides, draft metadata, dry-run summary, and note fields |
 
 ## Security notes (must stay on the C++ side)
 
