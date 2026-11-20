@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { FileArchive, FileQuestion, FolderOpen, HelpCircle, Sparkles, Square, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, FileArchive, FileQuestion, FolderOpen, HelpCircle, Plus, RotateCcw, Settings2, Sparkles, Square, Trash2, X } from "lucide-react";
 import { fmtDur, fmtInt, fmtPct, fmtTime, midTrunc } from "../lib/format";
 import { VirtualList } from "../lib/virtualList";
 import { Meter, PathLine, PetalBurst } from "../ui/widgets";
@@ -7,7 +7,7 @@ import { Ring } from "../ui/desk";
 import { SettingsScreen } from "../screens/screens";
 import { localizeText } from "../i18n";
 import { useStore } from "../store";
-import type { OverlayId, RestoreOptions } from "../types";
+import type { DownloadSource, OverlayId, RestoreOptions } from "../types";
 
 export function OverlayRoot() {
   const s = useStore();
@@ -346,65 +346,205 @@ function OnlineOverlay() {
   const s = useStore();
   const t = s.t;
   const [endpoint, setEndpoint] = useState(s.remoteBase || s.info?.onlineBase || "");
+  const endpointInitRef = useRef(Boolean(s.remoteBase || s.info?.onlineBase));
   const [sel, setSel] = useState<string | null>(null);
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [draftSources, setDraftSources] = useState<DownloadSource[]>(s.downloadSources);
+  const [newName, setNewName] = useState("");
+  const [newPrefix, setNewPrefix] = useState("");
+
   useEffect(() => {
-    if (!endpoint && (s.remoteBase || s.info?.onlineBase)) {
-      setEndpoint(s.remoteBase || s.info?.onlineBase || "");
+    const initial = s.remoteBase || s.info?.onlineBase || "";
+    if (!endpointInitRef.current && initial) {
+      endpointInitRef.current = true;
+      setEndpoint(initial);
     }
-  }, [s.remoteBase, s.info?.onlineBase, endpoint]);
+  }, [s.remoteBase, s.info?.onlineBase]);
   useEffect(() => {
-    if (s.remotes.length > 0 && (!sel || !s.remotes.some((r) => r.id === sel))) {
+    setDraftSources(s.downloadSources);
+  }, [s.downloadSources]);
+  useEffect(() => {
+    if (s.remotes.length === 0) {
+      if (sel !== null) setSel(null);
+      return;
+    }
+    if (!sel || !s.remotes.some((r) => r.id === sel)) {
       setSel(s.remotes[0].id);
     }
   }, [s.remotes, sel]);
+
   const selected = s.remotes.find((r) => r.id === sel);
-  const running = s.job.status === "running" && s.job.kind.startsWith("online");
+  const running = (s.job.status === "running" || s.job.status === "cancelling") && s.job.kind.startsWith("online");
+  const defaultEndpoint = s.info?.defaultOnlineBase || "";
+  const activeChain = s.downloadSources.filter((x) => x.enabled).map((x) => x.name).join(" → ") || "GitHub";
+
+  const moveSource = (idx: number, delta: number) => {
+    const nextIdx = idx + delta;
+    if (nextIdx < 0 || nextIdx >= draftSources.length) return;
+    const copy = [...draftSources];
+    const [picked] = copy.splice(idx, 1);
+    copy.splice(nextIdx, 0, picked);
+    setDraftSources(copy);
+  };
+
   return (
     <Frame
       id="online"
       title={t.onlineTitle}
       footer={
         <>
-          <span className="note">{running ? s.job.text : t.liveEndpoint.replace("{url}", s.remoteBase || endpoint)}</span>
+          <span className="note" title={s.remoteBase || endpoint}>
+            {running
+              ? localizeText(s.job.text, s.locale)
+              : t.liveEndpoint.replace(
+                  "{url}",
+                  (() => {
+                    const ep = s.remoteBase || endpoint;
+                    return ep.length > 56 ? `${ep.slice(0, 34)}…${ep.slice(-20)}` : ep;
+                  })(),
+                )}
+          </span>
           <div className="row">
             <button className="btn" disabled={running} onClick={() => s.send({ type: "fetchIndex", endpoint })}>{t.fetchIndex}</button>
-            <button className="btn-primary" style={{ width: "auto" }} disabled={!sel || running} onClick={async () => {
-              if (selected?.status === "local-richer") {
+            <button className="btn-primary" style={{ width: "auto" }} disabled={!selected || running} onClick={async () => {
+              if (!selected) return;
+              if (selected.status === "local-richer") {
+                const localCount = selected.localEntryCount ?? selected.fileCount;
+                const remoteCount = selected.remoteEntryCount ?? selected.remoteFileCount;
                 const ok = await s.ask({
                   title: t.overwriteTitle,
-                  body: t.overwriteBody.replace("{local}", String(selected.fileCount)).replace("{remote}", String(selected.remoteFileCount)),
+                  body: t.overwriteBody.replace("{local}", fmtInt(localCount)).replace("{remote}", fmtInt(remoteCount)),
                   ok: t.overwriteOk,
                   cancel: t.cancel,
                   danger: true,
                 });
                 if (!ok) return;
-                s.send({ type: "downloadRemote", entryId: sel!, force: true });
-              } else if (sel) s.send({ type: "downloadRemote", entryId: sel });
+                s.send({ type: "downloadRemote", entryId: selected.id, force: true });
+              } else {
+                s.send({ type: "downloadRemote", entryId: selected.id });
+              }
             }}>{t.downloadSel}</button>
             <button className="btn" onClick={() => s.openOverlay("online", false)}>{t.close}</button>
           </div>
         </>
       }
     >
-      <label>{t.endpoint}<input className="field" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} /></label>
+      <div className="endpoint-row">
+        <label className="grow">{t.endpoint}<input className="field" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} /></label>
+        {defaultEndpoint && endpoint.trim() !== defaultEndpoint && (
+          <button
+            type="button"
+            className="btn compact-btn"
+            disabled={running}
+            onClick={() => setEndpoint(defaultEndpoint)}
+            title={defaultEndpoint}
+          >
+            <RotateCcw size={13} />{t.restoreDefaultUrl}
+          </button>
+        )}
+      </div>
       <p className="note" style={{ marginTop: 8 }}>{t.onlineNote}</p>
-      {s.remoteError && <p className="note" style={{ color: "var(--bad)" }}>{s.remoteError}</p>}
+
+      <div className="source-bar">
+        <div className="source-bar-head">
+          <span className="note source-summary" title={activeChain}>{t.sourceLabel} <b>{activeChain}</b></span>
+          <button type="button" className="btn compact-btn" onClick={() => setSourcesOpen((v) => !v)}>
+            <Settings2 size={13} />{sourcesOpen ? t.collapseSources : t.manageSources}
+          </button>
+        </div>
+        {sourcesOpen && (
+          <div className="source-editor">
+            <div className="source-list">
+              {draftSources.map((src, idx) => (
+                <div key={`${src.name}-${src.prefix}-${idx}`} className="source-item">
+                  <label className="row grow" style={{ cursor: "pointer", minWidth: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={src.enabled}
+                      onChange={(e) => {
+                        const copy = [...draftSources];
+                        copy[idx] = { ...src, enabled: e.target.checked };
+                        setDraftSources(copy);
+                      }}
+                    />
+                    <span className="source-name">{src.name}</span>
+                    <span className="note source-prefix" title={src.prefix || t.sourceDirectTag}>
+                      {src.prefix || t.sourceDirectTag}
+                    </span>
+                  </label>
+                  <div className="row" style={{ gap: 4 }}>
+                    <button type="button" className="btn icon-mini" disabled={idx === 0} onClick={() => moveSource(idx, -1)} aria-label="Up"><ArrowUp size={12} /></button>
+                    <button type="button" className="btn icon-mini" disabled={idx === draftSources.length - 1} onClick={() => moveSource(idx, 1)} aria-label="Down"><ArrowDown size={12} /></button>
+                    {src.prefix !== "" && draftSources.length > 1 && (
+                      <button
+                        type="button"
+                        className="btn icon-mini"
+                        onClick={() => setDraftSources(draftSources.filter((_, j) => j !== idx))}
+                        aria-label="Remove"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="source-add">
+              <input className="field" placeholder={t.sourceNamePh} value={newName} onChange={(e) => setNewName(e.target.value)} style={{ flex: "0 0 148px" }} />
+              <input className="field grow" placeholder={t.sourcePrefixPh} value={newPrefix} onChange={(e) => setNewPrefix(e.target.value)} />
+              <button
+                type="button"
+                className="btn compact-btn"
+                disabled={!newName.trim() || !newPrefix.trim()}
+                onClick={() => {
+                  const name = newName.trim();
+                  const prefix = newPrefix.trim();
+                  if (!name || !prefix) return;
+                  setDraftSources([...draftSources, { name, prefix, enabled: true }]);
+                  setNewName("");
+                  setNewPrefix("");
+                }}
+              >
+                <Plus size={13} />{t.sourceAdd}
+              </button>
+            </div>
+            <div className="row" style={{ justifyContent: "flex-end", marginTop: 8 }}>
+              <button type="button" className="btn compact-btn" onClick={() => s.send({ type: "resetDownloadSources" })}>
+                <RotateCcw size={13} />{t.sourceReset}
+              </button>
+              <button type="button" className="btn-primary compact-btn" style={{ width: "auto" }} onClick={() => s.send({ type: "saveDownloadSources", sources: draftSources })}>
+                {t.sourceSave}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {s.remoteError && <p className="note" style={{ color: "var(--bad)", marginTop: 8, whiteSpace: "pre-wrap" }}>{s.remoteError}</p>}
       {running && <div style={{ marginTop: 10 }}><Meter value={s.job.progress} /></div>}
       <table className="table" style={{ marginTop: 12 }}>
         <thead><tr><th>{t.publisher}</th><th>{t.title}</th><th>{t.remoteCount}</th><th>{t.st}</th></tr></thead>
         <tbody>
-          {s.remotes.map((r) => (
-            <tr key={r.id} onClick={() => setSel(r.id)} style={{ background: sel === r.id ? "var(--blush)" : undefined, cursor: "pointer" }}>
-              <td>{r.publisher}</td>
-              <td>{r.title}</td>
-              <td className="num">{fmtInt(r.remoteDirCount)} / {fmtInt(r.remoteFileCount)}</td>
-              <td>
-                <span className={`badge ${r.status === "new" ? "hi" : r.status === "update" ? "warn" : r.status === "local-richer" ? "bad" : "good"}`}>
-                  {r.status === "new" ? t.remoteNew : r.status === "update" ? t.remoteUpdate : r.status === "local-richer" ? t.remoteRicher : t.remoteSame}
-                </span>
-              </td>
-            </tr>
-          ))}
+          {s.remotes.map((r) => {
+            const count = r.remoteEntryCount ?? (r.remoteDirCount + r.remoteFileCount);
+            return (
+              <tr key={r.id} onClick={() => setSel(r.id)} style={{ background: sel === r.id ? "var(--blush)" : undefined, cursor: "pointer" }}>
+                <td>{r.publisher}</td>
+                <td>
+                  <span>{r.title}</span>
+                  {r.version && <small className="note" style={{ marginLeft: 6 }}>v{r.version.replace(/^v/i, "")}</small>}
+                </td>
+                <td className="num" title={r.remoteDirCount > 0 || r.remoteFileCount > 0 ? `${fmtInt(r.remoteDirCount)} / ${fmtInt(r.remoteFileCount)}` : undefined}>
+                  {count > 0 ? `${fmtInt(count)} ${t.entriesUnit}` : "0"}
+                </td>
+                <td>
+                  <span className={`badge ${r.status === "new" ? "hi" : r.status === "update" ? "warn" : r.status === "local-richer" ? "bad" : "good"}`}>
+                    {r.status === "new" ? t.remoteNew : r.status === "update" ? t.remoteUpdate : r.status === "local-richer" ? t.remoteRicher : t.remoteSame}
+                  </span>
+                </td>
+              </tr>
+            );
+          })}
           {!s.remotes.length && <tr><td colSpan={4} className="note">{t.fetchIndexFirst}</td></tr>}
         </tbody>
       </table>

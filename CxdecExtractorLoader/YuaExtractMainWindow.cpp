@@ -5987,6 +5987,10 @@ namespace
     // §8.5 驱动约定 5：驱动方就是靠 IDC_YUA_ONLINE_INSTALL 的 enable 状态判联网动作结束。
     void RefreshOnlineButtons(OnlineDialogState& state)
     {
+        if (!state.Window || !::IsWindow(state.Window))
+        {
+            return;
+        }
         const bool blocked = OnlineActionBlocked(state);
         ::EnableWindow(::GetDlgItem(state.Window, IDC_YUA_ONLINE_REFRESH), blocked ? FALSE : TRUE);
         ::EnableWindow(::GetDlgItem(state.Window, IDC_YUA_ONLINE_INSTALL),
@@ -6367,9 +6371,12 @@ namespace
         job.Error.clear();
         job.Stage = L"正在下载扩展集档案……";
 
+        const std::wstring downloadTarget = !entry.remoteUrl.empty()
+            ? entry.remoteUrl
+            : Online::ArchiveUrl(job.Base, entry.publisher, entry.title);
         SetOnlineStatus(state,
                         L"正在下载：" + entry.publisher + L" / " + entry.title + L"\r\n" +
-                            DescribeRequestUrl(Online::ArchiveUrl(job.Base, entry.publisher, entry.title)) +
+                            DescribeRequestUrl(downloadTarget) +
                             L"\r\n\r\n请求基址：" + DescribeBase(job.Base) + L"\r\n暂存目录：" +
                             job.StagingDirectory);
         if (StartOnlineJob(host.State))
@@ -6505,8 +6512,10 @@ namespace
         {
             return;
         }
-        if (!ExtensionSet::InstallBytesToLibrary(context.LibraryRoot, job.Download.blob, error,
-                                                 Online::ArchiveUrl(job.Base, remote.publisher, remote.title)))
+        const std::wstring sourceLabel = !remote.remoteUrl.empty()
+            ? remote.remoteUrl
+            : Online::ArchiveUrl(job.Base, remote.publisher, remote.title);
+        if (!ExtensionSet::InstallBytesToLibrary(context.LibraryRoot, job.Download.blob, error, sourceLabel))
         {
             Online::CleanupStaging(job.StagingDirectory);
             // 本地库状态以内核 error 里那句为准，UI 不再替它下"未被改动"的断言。
@@ -6611,6 +6620,9 @@ namespace
         const bool skipInstall = OnlineDownloadMustSkipInstall(state, kind, cancelled);
 
         // 结论可能有模态框；关闭轮询看到这个标志就不销毁窗口。
+        // 按钮的解禁刻意放在 ~DoneUiGuard() 中（JobDoneUi 复位为 false 之后）：
+        // 若只在 guard 存活期间调用 RefreshOnlineButtons，OnlineActionBlocked 仍会返回 true，
+        // 导致拉取索引结束后「拉取索引 / 下载并安装选中」保持灰掉（GitHub Issue #2）。
         struct DoneUiGuard
         {
             OnlineDialogState& State;
@@ -6637,7 +6649,6 @@ namespace
             Host::LogLine(Log::Level::Info,
                           L"[YuaExtract] 在线更新：任务已取消，跳过入库（" + job.Entry.publisher + L" / " +
                               job.Entry.title + L"）");
-            RefreshOnlineButtons(state);
             return;
         }
 
@@ -6646,7 +6657,6 @@ namespace
             state.Entries = ok ? job.Entries : std::vector<ExtensionSet::LibraryEntry>();
             const std::vector<Online::EntryState> states = ClassifyRemoteEntries(state);
             RefillOnlineList(state, states, 0);
-            RefreshOnlineButtons(state);
 
             if (ok)
             {
@@ -6664,11 +6674,15 @@ namespace
                         default: ++localNewer; break;
                     }
                 }
+                const std::wstring sourceTag = job.Index.usedSource.empty()
+                    ? std::wstring()
+                    : (L" · 下载源：" + job.Index.usedSource);
                 const std::wstring text =
                     L"索引拉取成功：共 " + FormatCount(job.Index.entryCount) + L" 条（实收 " +
-                    FormatSize(job.Index.bytes) + L"）。\r\n" + job.Index.url + L"\r\n\r\n本地状态：新增 " +
-                    FormatCount(fresh) + L" / 可更新 " + FormatCount(update) + L" / 已是同一份 " +
-                    FormatCount(same) + L" / 本地条数更多 " + FormatCount(localNewer) +
+                    FormatSize(job.Index.bytes) + sourceTag + L"）。\r\n" + job.Index.url +
+                    L"\r\n\r\n本地状态：新增 " + FormatCount(fresh) + L" / 可更新 " +
+                    FormatCount(update) + L" / 已是同一份 " + FormatCount(same) +
+                    L" / 本地条数更多 " + FormatCount(localNewer) +
                     L"\r\n\r\n选一条点「下载并安装选中」。档案摘要不同的覆盖前会再问一次。";
                 SetOnlineStatus(state, text);
                 Host::LogLine(Log::Level::Info,
@@ -6698,7 +6712,6 @@ namespace
                 // 失败**先清暂存**再报：§14.4 第 6 条要求本地一个字节都不改，
                 // 留一堆半截临时文件在暂存目录里同样是脏状态。
                 Online::CleanupStaging(job.StagingDirectory);
-                RefreshOnlineButtons(state);
                 const std::wstring reason = OnlineFailureText(error, cancelled);
                 SetOnlineStatus(state, L"下载 / 校验失败：\r\n" + reason +
                                            L"\r\n\r\n本地库未被改动（档案没写进库）。");
@@ -6707,11 +6720,8 @@ namespace
                 return;
             }
             InstallVerifiedArchive(state, job);
-            RefreshOnlineButtons(state);
             return;
         }
-
-        RefreshOnlineButtons(state);
     }
 
     void CloseOnlineDialog(OnlineDialogHost& host)

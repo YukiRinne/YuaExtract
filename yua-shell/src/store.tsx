@@ -4,6 +4,7 @@ import { messages, type Messages } from "./i18n";
 import type {
   BatchStats,
   ConfirmSpec,
+  DownloadSource,
   ExtractMode,
   ExtractTask,
   ExtensionEntry,
@@ -67,6 +68,7 @@ export interface UiState {
   remotes: RemoteExtension[];
   remoteBase: string;
   remoteError?: string;
+  downloadSources: DownloadSource[];
   selfCheck: SelfCheckItem[];
   notes: string;
   sourceOverride: string;
@@ -142,6 +144,11 @@ const initial: UiState = {
   batchStats: { total: 0, batch: 0, batchTotal: 0, running: 0, done: 0, failed: 0 },
   remotes: [],
   remoteBase: "",
+  downloadSources: [
+    { name: "gh-proxy.com", prefix: "https://gh-proxy.com/", enabled: true },
+    { name: "ghproxy.vip", prefix: "https://ghproxy.vip/", enabled: true },
+    { name: "GitHub 官方", prefix: "", enabled: true },
+  ],
   selfCheck: [],
   notes: "",
   sourceOverride: "",
@@ -185,7 +192,12 @@ function reducer(state: UiState, action: Action): UiState {
   const ev = action.ev;
   switch (ev.type) {
     case "hello":
-      return { ...state, info: ev.info, remoteBase: ev.info.onlineBase };
+      return {
+        ...state,
+        info: ev.info,
+        remoteBase: ev.info.onlineBase,
+        downloadSources: ev.info.downloadSources?.length ? ev.info.downloadSources : state.downloadSources,
+      };
     case "workspace":
       return { ...state, workspace: ev.workspace };
     case "library": {
@@ -206,6 +218,8 @@ function reducer(state: UiState, action: Action): UiState {
     }
     case "remoteIndex":
       return { ...state, remotes: ev.items, remoteBase: ev.base, remoteError: ev.error, lastAction: ev.error ? `索引失败：${ev.error}` : `索引拉取成功：共 ${ev.items.length} 条` };
+    case "downloadSources":
+      return { ...state, downloadSources: ev.sources };
     case "job":
       return {
         ...state,

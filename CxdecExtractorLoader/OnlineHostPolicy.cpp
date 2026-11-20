@@ -93,8 +93,10 @@ namespace Yua { namespace Online
         }
 
         // ---- IPv4 保留段（任务书列的全集，含 /10 /12 /15 这种非整字节掩码）----
-        // 传入网络序的 4 个字节。返回 nullptr = 不在保留段。
-        const wchar_t* Ipv4BlockedReason(const unsigned char b[4])
+        // 传入网络序的 4 个字节。allowFakeIpBenchmarkRange = true 时放行 198.18.0.0/15（用于
+        // 域名 DNS 解析出的 TUN Fake-IP 代理地址，直接写字面量时仍传入 false 拒绝）。
+        // 返回 nullptr = 允许 / 不在拒绝段。
+        const wchar_t* Ipv4BlockedReason(const unsigned char b[4], bool allowFakeIpBenchmarkRange)
         {
             if (b[0] == 0u)                                   return L"0.0.0.0/8（本网络）";               // 0.0.0.0/8
             if (b[0] == 10u)                                  return L"10.0.0.0/8（内网）";                // 10.0.0.0/8
@@ -105,7 +107,7 @@ namespace Yua { namespace Online
             if (b[0] == 192u && b[1] == 0u && b[2] == 0u)     return L"192.0.0.0/24（IETF 协议分配）";     // 192.0.0.0/24
             if (b[0] == 192u && b[1] == 0u && b[2] == 2u)     return L"192.0.2.0/24（文档专用段）";        // 192.0.2.0/24
             if (b[0] == 192u && b[1] == 168u)                 return L"192.168.0.0/16（内网）";            // 192.168.0.0/16
-            if (b[0] == 198u && (b[1] & 0xFEu) == 18u)        return L"198.18.0.0/15（基准测试段）";       // 198.18.0.0/15
+            if (b[0] == 198u && (b[1] & 0xFEu) == 18u)        return allowFakeIpBenchmarkRange ? nullptr : L"198.18.0.0/15（基准测试段）"; // 198.18.0.0/15
             if (b[0] == 198u && b[1] == 51u && b[2] == 100u)  return L"198.51.100.0/24（文档专用段）";     // 198.51.100.0/24
             if (b[0] == 203u && b[1] == 0u && b[2] == 113u)   return L"203.0.113.0/24（文档专用段）";      // 203.0.113.0/24
             if ((b[0] & 0xF0u) == 0xE0u)                      return L"224.0.0.0/4（组播）";               // 224.0.0.0/4
@@ -128,14 +130,14 @@ namespace Yua { namespace Online
 
         // ---- IPv6 保留段 ----
         // 传入 16 字节地址。返回 nullptr = 不在保留段。
-        const wchar_t* Ipv6BlockedReason(const unsigned char b[16])
+        const wchar_t* Ipv6BlockedReason(const unsigned char b[16], bool allowFakeIpBenchmarkRange)
         {
             // IPv4 映射（::ffff:0:0/96）：剥掉前缀，按里面的 IPv4 再判一遍。
             static const unsigned char kV4MappedPrefix[12] =
                 { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0xFFu, 0xFFu };
             if (std::memcmp(b, kV4MappedPrefix, sizeof(kV4MappedPrefix)) == 0)
             {
-                return Ipv4BlockedReason(b + 12);
+                return Ipv4BlockedReason(b + 12, allowFakeIpBenchmarkRange);
             }
 
             bool allZero = true;
@@ -149,6 +151,20 @@ namespace Yua { namespace Online
             }
             if (allZero)                                             return L"::（未指定地址）";      // ::
             if (AllZeroExceptLast(b, 1u))                            return L"::1（本机回环）";       // ::1
+            if (allowFakeIpBenchmarkRange)
+            {
+                // sing-box / v2rayN 默认 IPv6 Fake-IP 池：fc00::/18（RFC 4193 L=0 未分配段）
+                const bool isSingBoxFakeIp6 = (b[0] == 0xFCu && b[1] == 0x00u && (b[2] & 0xC0u) == 0x00u);
+                // Mihomo / Clash Verge 默认 IPv6 Fake-IP 池：fdfe:dcba:9876::/64
+                static const unsigned char kMihomoFakeIp6Prefix[8] =
+                    { 0xFDu, 0xFEu, 0xDCu, 0xBAu, 0x98u, 0x76u, 0x00u, 0x00u };
+                const bool isMihomoFakeIp6 =
+                    (std::memcmp(b, kMihomoFakeIp6Prefix, sizeof(kMihomoFakeIp6Prefix)) == 0);
+                if (isSingBoxFakeIp6 || isMihomoFakeIp6)
+                {
+                    return nullptr;
+                }
+            }
             if ((b[0] & 0xFEu) == 0xFCu)                             return L"fc00::/7（内网唯一本地）"; // fc00::/7
             if (b[0] == 0xFEu && (b[1] & 0xC0u) == 0x80u)            return L"fe80::/10（链路本地）"; // fe80::/10
             if (b[0] == 0xFFu)                                       return L"ff00::/8（组播）";      // ff00::/8
@@ -158,17 +174,19 @@ namespace Yua { namespace Online
         }
 
         // 数字字面量落在保留段里吗？不是字面量返回 nullptr（交给 DNS 那条路）。
-        const wchar_t* NumericBlockedReason(const std::wstring& literal)
+        const wchar_t* NumericBlockedReason(const std::wstring& literal, bool allowFakeIpBenchmarkRange)
         {
             IN_ADDR v4 = {};
             if (::InetPtonW(AF_INET, literal.c_str(), &v4) == 1)
             {
-                return Ipv4BlockedReason(reinterpret_cast<const unsigned char*>(&v4));
+                return Ipv4BlockedReason(reinterpret_cast<const unsigned char*>(&v4),
+                                         allowFakeIpBenchmarkRange);
             }
             IN6_ADDR v6 = {};
             if (::InetPtonW(AF_INET6, literal.c_str(), &v6) == 1)
             {
-                return Ipv6BlockedReason(reinterpret_cast<const unsigned char*>(&v6));
+                return Ipv6BlockedReason(reinterpret_cast<const unsigned char*>(&v6),
+                                         allowFakeIpBenchmarkRange);
             }
             return nullptr;
         }
@@ -225,10 +243,29 @@ namespace Yua { namespace Online
         }
 
         const std::wstring literal = StripBrackets(host);
-        const wchar_t* reason = NumericBlockedReason(literal);
+        const wchar_t* reason = NumericBlockedReason(literal, false);
         if (reason != nullptr)
         {
             error = std::wstring(L"这是保留段地址（") + reason + L"），不允许访问。";
+            return true;
+        }
+        return false;
+    }
+
+    bool ResolvedAddressIsBlocked(const std::wstring& addressLiteral, std::wstring& error)
+    {
+        error.clear();
+
+        const std::wstring literal = StripBrackets(addressLiteral);
+        if (!HostIsNumericAddress(literal))
+        {
+            error = L"解析结果不是合法的 IP 地址";
+            return true;
+        }
+        const wchar_t* reason = NumericBlockedReason(literal, true);
+        if (reason != nullptr)
+        {
+            error = std::wstring(L"保留段地址：") + reason;
             return true;
         }
         return false;
@@ -296,7 +333,7 @@ namespace Yua { namespace Online
 
             ++addressCount;
             std::wstring checkError;
-            if (HostIsBlocked(text, checkError))
+            if (ResolvedAddressIsBlocked(text, checkError))
             {
                 blockedDetail = std::wstring(L"解析到 ") + text + L"（" + checkError + L"）";
                 break;

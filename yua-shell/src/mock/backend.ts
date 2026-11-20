@@ -1,5 +1,6 @@
 import { emitHostEvent } from "../bridge";
 import type {
+  DownloadSource,
   ExtensionEntry,
   ExtractTask,
   HostInfo,
@@ -24,7 +25,13 @@ const info: HostInfo = {
     modified: "2026-10-15 21:06:11",
     sha256: "a7c31e90b4f6d218c9e01a55d0b8e447c1f23aa09e11b77c",
   },
-  onlineBase: "https://raw.githubusercontent.com/YukiRinne/Yua-Extensions/main/",
+  onlineBase: "https://github.com/YukiRinne/Yua-Extensions/releases/latest/download/catalog.json",
+  defaultOnlineBase: "https://github.com/YukiRinne/Yua-Extensions/releases/latest/download/catalog.json",
+  downloadSources: [
+    { name: "gh-proxy.com", prefix: "https://gh-proxy.com/", enabled: true },
+    { name: "ghproxy.vip", prefix: "https://ghproxy.vip/", enabled: true },
+    { name: "GitHub 官方", prefix: "", enabled: true },
+  ],
 };
 
 const seedLibrary: ExtensionEntry[] = [
@@ -120,6 +127,7 @@ export function attachMockBackend() {
   let selected = { publisher: "Wamsoft", title: "星夜回廊" };
   let sourceOverride = "";
   let testOverride = "";
+  let downloadSources: DownloadSource[] = [...(info.downloadSources ?? [])];
   let meta: Partial<ExtensionEntry> = {
     publisher: "Wamsoft",
     title: "星夜回廊",
@@ -322,6 +330,16 @@ export function attachMockBackend() {
           log("info", "Online", "索引拉取成功：共 4 条");
         });
         break;
+      case "saveDownloadSources":
+        downloadSources = req.sources.map((x) => ({ ...x }));
+        emitHostEvent({ type: "downloadSources", sources: downloadSources });
+        toast("info", "下载源已保存", "将在拉取索引和下载扩展集时按顺序自动回退。");
+        break;
+      case "resetDownloadSources":
+        downloadSources = [...(info.downloadSources ?? [])];
+        emitHostEvent({ type: "downloadSources", sources: downloadSources });
+        toast("info", "已恢复默认下载源", "gh-proxy.com → ghproxy.vip → GitHub 官方。");
+        break;
       case "downloadRemote": {
         const items = mockRemote(library);
         const item = items.find((e) => e.id === req.entryId);
@@ -334,11 +352,12 @@ export function attachMockBackend() {
           break;
         }
         simulateProgress("online-download", `正在下载：${item.publisher} / ${item.title}`, 10, () => {
-          if (item.status === "new" || item.status === "update") {
+          if (item.status === "new" || item.status === "update" || (item.status === "local-richer" && req.force)) {
             const installed: ExtensionEntry = { ...item, installedAt: "2026-11-06 23:50:00", source: "在线更新" };
             library = [installed, ...library.filter((e) => e.id !== installed.id)];
             pushLib();
           }
+          emitHostEvent({ type: "remoteIndex", items: mockRemote(library), base: info.onlineBase });
           toast("info", item.status === "new" ? "已新增" : "已更新", `${item.publisher} / ${item.title}`);
         });
         break;

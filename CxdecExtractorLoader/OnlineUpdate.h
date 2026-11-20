@@ -37,17 +37,43 @@ namespace Online
     constexpr const wchar_t* kIndexFileName = L"index.txt";
     constexpr const wchar_t* kRemoteArchiveFileName = L"rules.int";
 
-    // 默认基址。仓库：https://github.com/YukiRinne/Yua-Extensions（index.txt + <会社>/<作品>/rules.int）。
-    // raw 主；国内可达性通常更好的 jsDelivr 镜像见仓库 README，可在「在线更新」弹窗里填一次（走 ini）。
+    // 默认入口。仓库：https://github.com/YukiRinne/Yua-Extensions
+    // 新版默认使用 GitHub Releases 原子发布的 catalog.json，并支持内置下载源自动回退（gh-proxy / 官方）；
+    // 若仓库尚未发布首个 Release（catalog.json 404），FetchIndex 会自动兼容回退到旧版 raw main/index.txt。
     constexpr const wchar_t* kDefaultRepositoryBase =
+        L"https://github.com/YukiRinne/Yua-Extensions/releases/latest/download/catalog.json";
+    constexpr const wchar_t* kLegacyFallbackRepositoryBase =
         L"https://raw.githubusercontent.com/YukiRinne/Yua-Extensions/main/";
 
     // 网络约束（§14.4 第 1 条）。超时是**每一段**的超时（连接 / 发送 / 接收各算）。
     constexpr int kConnectTimeoutMs = 10000;
     constexpr int kSendTimeoutMs = 15000;
     constexpr int kReceiveTimeoutMs = 30000;
-    constexpr unsigned long long kMaxIndexBytes = 4ull * 1024ull * 1024ull;    // 4 MB
+    constexpr int kMaxRedirects = 5;
+    constexpr unsigned long long kMaxIndexBytes = 8ull * 1024ull * 1024ull;    // 8 MB（catalog.json 含描述信息）
     constexpr unsigned long long kMaxArchiveBytes = 64ull * 1024ull * 1024ull; // 64 MB（真实档案约 0.25 MB）
+
+    // ---------------- 有序下载源（镜像自动回退） ----------------
+
+    struct DownloadSource
+    {
+        std::wstring name;
+        std::wstring prefix; // 空串 = 直连 GitHub 官方；非空 = https://.../ 加速前缀
+        bool enabled = true;
+    };
+
+    struct DownloadCandidate
+    {
+        std::wstring name;
+        std::wstring url;
+    };
+
+    std::vector<DownloadSource> DefaultDownloadSources();
+    bool ValidateDownloadSources(const std::vector<DownloadSource>& sources, std::wstring& error);
+    std::vector<DownloadSource> LoadDownloadSources();
+    bool SaveDownloadSources(const std::vector<DownloadSource>& sources, std::wstring& error);
+    std::vector<DownloadCandidate> BuildDownloadCandidates(const std::wstring& url,
+                                                           const std::vector<DownloadSource>& sources);
 
     // ---------------- 基址 ----------------
 
@@ -79,11 +105,17 @@ namespace Online
     {
         int httpStatus = 0;
         std::wstring url;
+        std::wstring usedSource;
+        std::wstring format; // "catalog-v1" 或 "index-tsv"
         unsigned long long bytes = 0;
         unsigned int entryCount = 0;
     };
 
-    // GET <base>index.txt → 按 §14.3 解析成 LibraryEntry 列表（**复用 ExtensionSet::ParseManifestText**）。
+    // 解析 Registry v1 的 catalog.json（仅标准 HTTPS 项，自动跳过已撤回 yanked=true 条目）。
+    bool ParseCatalogJson(const std::string& jsonUtf8, const std::wstring& sourceUrl,
+                          std::vector<ExtensionSet::LibraryEntry>& out, std::wstring& error);
+
+    // GET <base>catalog.json 或 <base>index.txt → 解析成 LibraryEntry 列表。
     // 端点不可达 / DNS 失败 / 超时 / 非 200 / 超体积 / 格式错，各有各的 error 措辞，不许合并成一句。
     bool FetchIndex(const std::wstring& base, std::vector<ExtensionSet::LibraryEntry>& out,
                     IndexResult& info, std::wstring& error, const Request& request = Request());

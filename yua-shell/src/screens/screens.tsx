@@ -7,11 +7,18 @@ import {
 } from "lucide-react";
 import { fmtInt, fmtPct, midTrunc } from "../lib/format";
 import { targetInteractionBusy } from "../lib/interaction";
-import { localizeText } from "../i18n";
+import { localizeText, type Messages } from "../i18n";
 import { ChipFilter, Meter, ModeSeg, NeoToggle, PageFrame, PathLine, StatusWord, reduced } from "../ui/widgets";
 import { DropArt, Ring } from "../ui/desk";
 import { useStore } from "../store";
-import type { ExtractMode } from "../types";
+import type { ExtensionEntry, ExtractMode } from "../types";
+
+function formatExtensionCount(entry: ExtensionEntry, t: Messages) {
+  if (entry.dirCount === 0 && entry.fileCount === 0 && (entry.entryCount ?? 0) > 0) {
+    return `${fmtInt(entry.entryCount!)} ${t.entriesUnit}`;
+  }
+  return `${fmtInt(entry.fileCount)} ${t.filesUnit}`;
+}
 
 export function nextAction(s: ReturnType<typeof useStore>) {
   const t = s.t;
@@ -199,7 +206,7 @@ export function HomeScreen() {
                         <b>{e.title}</b>
                         <small>{e.publisher}</small>
                       </span>
-                      <span className="num">{fmtInt(e.fileCount)} {t.filesUnit}</span>
+                      <span className="num">{formatExtensionCount(e, t)}</span>
                     </button>
                   </motion.li>
                 ))}
@@ -308,12 +315,12 @@ export function HomeScreen() {
                   >
                     <span className="idx">{it.n}</span>
                     <span>
-                      <b>{it.label}</b>
+                      <b title={it.label}>{it.label}</b>
                       <small>{it.hint}</small>
-                      {expanded && it.stat !== it.hint && <small style={{ marginTop: 6, display: "block" }}>{it.stat}</small>}
+                      {expanded && it.stat !== it.hint && <small className="stat-extra" title={it.stat}>{it.stat}</small>}
                     </span>
                     <span className="spark" aria-hidden>
-                      {it.ready ? <Check size={18} /> : i === ni ? <Clock size={18} /> : <Lock size={18} />}
+                      {it.ready ? <Check size={16} /> : i === ni ? <Clock size={16} /> : <Lock size={16} />}
                     </span>
                   </button>
                 </div>
@@ -502,7 +509,7 @@ export function LibraryScreen() {
                       <b>{e.title} {remote?.status === "update" && <span className="badge warn">{t.remoteUpdate}</span>}</b>
                       <small>{e.publisher}</small>
                     </span>
-                    <span className="num">{fmtInt(e.fileCount)} {t.filesUnit}</span>
+                    <span className="num">{formatExtensionCount(e, t)}</span>
                   </button>
                 </li>
               );
@@ -516,7 +523,12 @@ export function LibraryScreen() {
             <dl>
               <dt>{t.publisher}</dt><dd>{current.publisher}</dd>
               <dt>{t.title}</dt><dd>{current.title}</dd>
-              <dt>{t.labelEntries}</dt><dd className="num">{t.labelDir} {fmtInt(current.dirCount)} / {t.labelFile} {fmtInt(current.fileCount)} / {t.labelExceptions} {current.exceptions}</dd>
+              <dt>{t.labelEntries}</dt>
+              <dd className="num">
+                {current.dirCount === 0 && current.fileCount === 0 && (current.entryCount ?? 0) > 0
+                  ? `${fmtInt(current.entryCount!)} ${t.entriesUnit}`
+                  : `${t.labelDir} ${fmtInt(current.dirCount)} / ${t.labelFile} ${fmtInt(current.fileCount)} / ${t.labelExceptions} ${current.exceptions}`}
+              </dd>
               <dt>{t.labelArchiveSha}</dt><dd className="path" title={current.archiveSha}>{current.archiveSha}</dd>
               <dt>{t.labelTargetExe}</dt><dd className="path" title={current.targetSha}>{current.targetSha}</dd>
               <dt>{t.labelSaltSha}</dt><dd className="path" title={current.saltSha}>{current.saltSha}</dd>

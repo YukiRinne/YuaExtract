@@ -628,6 +628,97 @@ namespace Online
             return out;
         }
 
+        bool IsSourceIniKey(const std::wstring& trimmedLine)
+        {
+            const size_t equals = trimmedLine.find(L'=');
+            if (equals == std::wstring::npos)
+            {
+                return false;
+            }
+            const std::wstring key = ToLowerString(TrimSpaces(trimmedLine.substr(0u, equals)));
+            if (key == L"source_count")
+            {
+                return true;
+            }
+            if (key.compare(0u, 7u, L"source_") != 0)
+            {
+                return false;
+            }
+            size_t pos = 7u;
+            bool digits = false;
+            while (pos < key.size() && key[pos] >= L'0' && key[pos] <= L'9')
+            {
+                digits = true;
+                ++pos;
+            }
+            if (!digits || pos >= key.size() || key[pos] != L'_')
+            {
+                return false;
+            }
+            const std::wstring field = key.substr(pos + 1u);
+            return field == L"name" || field == L"prefix" || field == L"enabled";
+        }
+
+        std::vector<std::wstring> ReplaceIniOnlineSources(const std::vector<std::wstring>& lines,
+                                                          const std::vector<DownloadSource>& sources)
+        {
+            std::vector<std::wstring> sourceLines;
+            sourceLines.push_back(L"source_count=" + FormatUInt(sources.size()));
+            for (size_t i = 0u; i < sources.size(); ++i)
+            {
+                const std::wstring idx = L"source_" + FormatUInt(i) + L"_";
+                sourceLines.push_back(idx + L"name=" + sources[i].name);
+                sourceLines.push_back(idx + L"prefix=" + sources[i].prefix);
+                sourceLines.push_back(idx + L"enabled=" + (sources[i].enabled ? L"1" : L"0"));
+            }
+
+            std::vector<std::wstring> out;
+            out.reserve(lines.size() + sourceLines.size() + 3u);
+            bool inOnline = false;
+            bool sawOnline = false;
+            bool wrote = false;
+            for (const std::wstring& raw : lines)
+            {
+                const std::wstring line = TrimSpaces(raw);
+                if (line.size() >= 2u && line.front() == L'[' && line.back() == L']')
+                {
+                    if (inOnline && !wrote)
+                    {
+                        out.insert(out.end(), sourceLines.begin(), sourceLines.end());
+                        wrote = true;
+                    }
+                    inOnline = (ToLowerString(line) == L"[online]");
+                    sawOnline = sawOnline || inOnline;
+                    out.push_back(raw);
+                    continue;
+                }
+                if (inOnline && IsSourceIniKey(line))
+                {
+                    continue; // 移除旧 source_* 键，保持其余配置（如 base=）不变
+                }
+                out.push_back(raw);
+            }
+            if (inOnline && !wrote)
+            {
+                out.insert(out.end(), sourceLines.begin(), sourceLines.end());
+                wrote = true;
+            }
+            if (!sawOnline)
+            {
+                while (!out.empty() && TrimSpaces(out.back()).empty())
+                {
+                    out.pop_back();
+                }
+                if (!out.empty())
+                {
+                    out.push_back(std::wstring());
+                }
+                out.push_back(L"[online]");
+                out.insert(out.end(), sourceLines.begin(), sourceLines.end());
+            }
+            return out;
+        }
+
         // =====================================================================
         // 4) HTTP（WinHTTP）
         // =====================================================================
@@ -705,10 +796,8 @@ namespace Online
 
         // 路径部分的百分号转义：日文会社 / 作品名与空格**必须**转义后再发出去，
         // 否则请求行里会出现非 ASCII 字节，很多服务器直接 400。
-        //   · '/' 保持原样（它是路径分隔符）；
-        //   · '%' 也保持原样 —— 用户配的镜像基址可能本来就带 %20 这种转义，再转一次会把地址弄坏；
-        //     代价是会社名里真出现 '%' 时会被当成转义开头（现实中不存在，MakeSafePathComponent 也
-        //     不会去掉它，但两害相权取"基址不会被弄坏"）。
+        //   · '/' 与 ':' 保持原样（'/' 是路径分隔符；':' 允许镜像代理如 /https://github.com/...）；
+        //   · '%' 也保持原样 —— 用户配的镜像基址可能本来就带 %20 这种转义，再转一次会把地址弄坏。
         std::wstring EscapeUrlPath(const std::wstring& path)
         {
             const std::string utf8 = WideToUtf8(path);
@@ -718,8 +807,8 @@ namespace Online
             for (unsigned char ch : utf8)
             {
                 const bool safe = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
-                    || (ch >= '0' && ch <= '9') || ch == L'-' || ch == L'.' || ch == L'_'
-                    || ch == L'~' || ch == L'/' || ch == L'%';
+                    || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.' || ch == '_'
+                    || ch == '~' || ch == '/' || ch == '%' || ch == ':';
                 if (safe)
                 {
                     out.push_back(static_cast<char>(ch));
@@ -734,16 +823,28 @@ namespace Online
             return Utf8ToWide(out);
         }
 
+        bool EndsWithJsonSuffix(const std::wstring& url)
+        {
+            const std::wstring lower = ToLowerString(TrimSpaces(url));
+            return lower.size() > 13u && lower.compare(lower.size() - 5u, 5u, L".json") == 0;
+        }
+
+        std::wstring RedactUrlForError(const std::wstring& url)
+        {
+            const size_t cut = url.find_first_of(L"?#");
+            return cut == std::wstring::npos ? url : (url.substr(0u, cut) + L"?...");
+        }
+
         struct UrlParts
         {
             std::wstring host;
             INTERNET_PORT port = INTERNET_DEFAULT_HTTPS_PORT;
-            std::wstring path;   // 已转义，以 '/' 开头
+            std::wstring path;   // 已转义，以 '/' 开头（preserveQuery=true 时可带原样 ?query）
         };
 
         // 自己拆 URL（而不是 WinHttpCrackUrl）：一是要在拆的时候就断掉非 https，
         // 二是只对**路径**做转义、主机与端口一个字节不改。主机名支持 [IPv6] 字面量。
-        bool ParseHttpsUrl(const std::wstring& url, UrlParts& out, std::wstring& error)
+        bool ParseHttpsUrl(const std::wstring& url, UrlParts& out, bool preserveQuery, std::wstring& error)
         {
             if (url.empty())
             {
@@ -752,8 +853,16 @@ namespace Online
             }
             if (!StartsWithHttps(url))
             {
-                error = L"只允许 https 地址：\"" + url + L"\" 不是 https:// 开头的。";
+                error = L"只允许 https 地址：\"" + RedactUrlForError(url) + L"\" 不是 https:// 开头的。";
                 return false;
+            }
+            for (wchar_t ch : url)
+            {
+                if (ch <= L' ')
+                {
+                    error = L"地址里包含空白或控制字符。";
+                    return false;
+                }
             }
 
             size_t slash = url.find(L'/', 8u);
@@ -764,12 +873,20 @@ namespace Online
             const std::wstring authority = url.substr(8u, slash - 8u);
             std::wstring path = slash < url.size() ? url.substr(slash) : std::wstring(L"/");
 
-            // 本层只 GET 静态文件：地址里带了 ?query 或 #fragment 就是拼错了，丢掉，
-            // 免得把查询串当成文件名的一部分去请求。
-            const size_t cut = path.find_first_of(L"?#");
-            if (cut != std::wstring::npos)
+            const size_t hashCut = path.find(L'#');
+            if (hashCut != std::wstring::npos)
             {
-                path.erase(cut);
+                path.erase(hashCut);
+            }
+            std::wstring query;
+            const size_t queryCut = path.find(L'?');
+            if (queryCut != std::wstring::npos)
+            {
+                if (preserveQuery)
+                {
+                    query = path.substr(queryCut);
+                }
+                path.erase(queryCut);
             }
 
             out = UrlParts();
@@ -779,7 +896,7 @@ namespace Online
                 const size_t close = authority.find(L']');
                 if (close == std::wstring::npos)
                 {
-                    error = L"地址里的 IPv6 字面量没有收尾的 ']'：\"" + url + L"\"。";
+                    error = L"地址里的 IPv6 字面量没有收尾的 ']'。";
                     return false;
                 }
                 out.host = authority.substr(0u, close + 1u);
@@ -807,14 +924,14 @@ namespace Online
                 unsigned long long port = 0ull;
                 if (!ParseUInt(authority.substr(portStart), port) || port == 0ull || port > 65535ull)
                 {
-                    error = L"地址里的端口不合法：\"" + url + L"\"。";
+                    error = L"地址里的端口不合法。";
                     return false;
                 }
                 out.port = static_cast<INTERNET_PORT>(port);
             }
             if (out.host.empty())
             {
-                error = L"地址里没有主机名：\"" + url + L"\"。";
+                error = L"地址里没有主机名。";
                 return false;
             }
 
@@ -823,7 +940,16 @@ namespace Online
             {
                 out.path.insert(out.path.begin(), L'/');
             }
+            if (!query.empty())
+            {
+                out.path += query;
+            }
             return true;
+        }
+
+        bool ParseHttpsUrl(const std::wstring& url, UrlParts& out, std::wstring& error)
+        {
+            return ParseHttpsUrl(url, out, false, error);
         }
 
         // 基址的来路。诊断措辞里要说清"这个地址是从哪来的" —— "改了 ini 却没生效"这类问题
@@ -1144,50 +1270,86 @@ namespace Online
             return false;
         }
 
+        // 允许安全的受限 HTTPS→HTTPS 重定向（用于 GitHub Releases 302 跳转到 objects.githubusercontent.com / CDN），
+        // 但始终关闭 WinHTTP 自动重定向，每一跳都重新校 https:// + 公网主机策略，绝不降级到 http 或跳到私网。
+        std::wstring QueryRedirectLocation(HINTERNET handle)
+        {
+            DWORD size = 0u;
+            ::WinHttpQueryHeaders(handle, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, nullptr,
+                                  &size, WINHTTP_NO_HEADER_INDEX);
+            if (size == 0u || size > 16384u)
+            {
+                return std::wstring();
+            }
+            std::wstring value(static_cast<size_t>(size) / sizeof(wchar_t), L'\0');
+            if (!::WinHttpQueryHeaders(handle, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX,
+                                       &value[0], &size, WINHTTP_NO_HEADER_INDEX))
+            {
+                return std::wstring();
+            }
+            value.resize(static_cast<size_t>(size) / sizeof(wchar_t));
+            while (!value.empty() && value.back() == L'\0')
+            {
+                value.pop_back();
+            }
+            return TrimSpaces(value);
+        }
+
+        bool ResolveRedirectTarget(const UrlParts& current, const std::wstring& location,
+                                   std::wstring& nextUrl, std::wstring& error)
+        {
+            nextUrl.clear();
+            const std::wstring loc = TrimSpaces(location);
+            if (loc.empty())
+            {
+                error = L"服务器返回重定向但未给出 Location 头。";
+                return false;
+            }
+            if (loc.size() >= 7u && ToLowerString(loc.substr(0u, 7u)) == L"http://")
+            {
+                error = L"重定向试图降级到明文 http://，出于安全已中止。";
+                return false;
+            }
+            if (loc.size() >= 2u && loc[0] == L'/' && loc[1] != L'/')
+            {
+                nextUrl = L"https://" + current.host;
+                if (current.port != INTERNET_DEFAULT_HTTPS_PORT)
+                {
+                    nextUrl += L":" + FormatUInt(current.port);
+                }
+                nextUrl += loc;
+                return true;
+            }
+            if (loc.size() >= 2u && loc[0] == L'/' && loc[1] == L'/')
+            {
+                nextUrl = L"https:" + loc;
+                return true;
+            }
+            if (!StartsWithHttps(loc))
+            {
+                error = L"不支持非 https 或相对路径重定向。";
+                return false;
+            }
+            nextUrl = loc;
+            return true;
+        }
+
         struct HttpResponse
         {
             DWORD status = 0u;   // 无论成败都填：调用方要能区分"没连上"和"连上了但不是 200"
             std::vector<unsigned char> body;
         };
 
-        // 一次只读 GET 的全部约束都在这里：仅 https、不跟随重定向、三段超时、
-        // **边收边算**的体积上限。远端是不可信输入，任一条不满足就整次作废；
-        // 本函数不落盘、不报错给用户看，把字节与原因交回调用方处置。
         bool HttpGet(const std::wstring& url, unsigned long long maxBytes, const std::wstring& stage,
                      const Request& request, HttpResponse& response, std::wstring& error)
         {
             error.clear();
             response = HttpResponse();
 
-            UrlParts parts;
-            if (!ParseHttpsUrl(url, parts, error))
-            {
-                return false;
-            }
-
-            // 主机策略（OnlineHostPolicy.h）：本机 / 内网 / 保留段地址一律不连。字符串层
-            // 先挡一遍；名字型主机还要真的解析一遍，解析出的任何地址落在保留段里同样拒绝
-            // —— 这一步挡的是 DNS 重绑定（域名看着无害，解析出来却是 127.0.0.1 / 内网）。
-            // 数字字面量不用解析（HostIsBlocked 已判过），省一次 DNS。
-            if (HostIsBlocked(parts.host, error)
-                || (!HostIsNumericAddress(parts.host) && ResolveBlocked(parts.host, error)))
-            {
-                error = L"拒绝连接 \"" + parts.host + L"\"：" + error
-                      + L"本工具只访问公网 https 地址，不访问本机 / 内网 / 保留段。";
-                return false;
-            }
-
-            if (request.cancel && request.cancel())
-            {
-                error = L"已取消。";
-                return false;
-            }
-
             InternetHandle session(::WinHttpOpen(UserAgent().c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
             if (!session)
             {
-                // AUTOMATIC_PROXY 要 Win8.1 起；更老的系统上退一步用默认代理策略再试一次。
                 session = InternetHandle(::WinHttpOpen(UserAgent().c_str(),
                                                        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                                        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
@@ -1195,121 +1357,232 @@ namespace Online
             }
             if (!session)
             {
-                error = DescribeWinHttpFailure(stage, url, ::GetLastError());
+                error = DescribeWinHttpFailure(stage, RedactUrlForError(url), ::GetLastError());
                 return false;
             }
 
-            // 超时是**每一段**各算（§14.4 第 1 条）。DNS 解析没有单独的常量，
-            // 按"连接"那一段算 —— 解析不出来和连不上都是同一类"到不了对方"。
             ::WinHttpSetTimeouts(session.get(), kConnectTimeoutMs, kConnectTimeoutMs, kSendTimeoutMs,
                                  kReceiveTimeoutMs);
-
             DWORD optionError = 0u;
-            DisableRedirects(session.get(), optionError);   // 会话上先设一次；失败也无所谓（请求上还会设）
+            DisableRedirects(session.get(), optionError);
 
-            InternetHandle connection(::WinHttpConnect(session.get(), parts.host.c_str(), parts.port, 0));
-            if (!connection)
+            std::wstring currentUrl = url;
+            for (int hop = 0; hop <= kMaxRedirects; ++hop)
             {
-                error = DescribeWinHttpFailure(stage, url, ::GetLastError());
-                return false;
-            }
+                const std::wstring safeDisplayUrl = RedactUrlForError(currentUrl);
+                UrlParts parts;
+                if (!ParseHttpsUrl(currentUrl, parts, hop > 0, error))
+                {
+                    return false;
+                }
 
-            InternetHandle httpRequest(::WinHttpOpenRequest(connection.get(), L"GET", parts.path.c_str(),
-                                                            nullptr, WINHTTP_NO_REFERER,
-                                                            WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                                            WINHTTP_FLAG_SECURE));
-            if (!httpRequest)
-            {
-                error = DescribeWinHttpFailure(stage, url, ::GetLastError());
-                return false;
-            }
+                // 每一跳都要校验主机策略，防止 302 跳转把连接引向 localhost / 私网。
+                if (HostIsBlocked(parts.host, error)
+                    || (!HostIsNumericAddress(parts.host) && ResolveBlocked(parts.host, error)))
+                {
+                    error = L"拒绝连接 \"" + parts.host + L"\"：" + error
+                          + L"本工具只访问公网 https 地址，不访问本机 / 内网 / 保留段。";
+                    return false;
+                }
 
-            // 设不上就整次作废，不退而求其次（宁可不下载，也不接受"可能跟着跳到 http"）。
-            if (!DisableRedirects(httpRequest.get(), optionError))
-            {
-                error = stage + L"失败：关不掉 HTTP 重定向（Win32 错误码 " + FormatUInt(optionError)
-                      + L"）。本工具只走 https 且不跟随重定向，宁可不下载。地址：" + url;
-                return false;
-            }
-
-            if (!::WinHttpSendRequest(httpRequest.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                      WINHTTP_NO_REQUEST_DATA, 0, 0, 0))
-            {
-                error = DescribeWinHttpFailure(stage, url, ::GetLastError());
-                return false;
-            }
-            if (!::WinHttpReceiveResponse(httpRequest.get(), nullptr))
-            {
-                error = DescribeWinHttpFailure(stage, url, ::GetLastError());
-                return false;
-            }
-
-            DWORD status = 0u;
-            DWORD statusSize = sizeof(status);
-            if (!::WinHttpQueryHeaders(httpRequest.get(),
-                                       WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                       WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
-                                       WINHTTP_NO_HEADER_INDEX))
-            {
-                error = DescribeWinHttpFailure(stage, url, ::GetLastError());
-                return false;
-            }
-            response.status = status;
-
-            if (status != 200u)
-            {
-                // 状态码已经拿到，这时说的话比"操作失败"有用得多，不再往下收字节。
-                error = DescribeHttpStatus(stage, url, httpRequest.get(), status);
-                return false;
-            }
-
-            // 体积上限**边收边算**：声明的上限只是上限，真正的把关是"下一块越界就立刻停"。
-            // 收完再判 = 对方能给多少，就能把内存吃掉多少。
-            std::vector<unsigned char> body;
-            for (;;)
-            {
                 if (request.cancel && request.cancel())
                 {
                     error = L"已取消。";
-                    return false;   // 调用方负责删临时文件
-                }
-
-                DWORD available = 0u;
-                if (!::WinHttpQueryDataAvailable(httpRequest.get(), &available))
-                {
-                    error = DescribeWinHttpFailure(stage + L"（读响应体）", url, ::GetLastError());
-                    return false;
-                }
-                if (available == 0u)
-                {
-                    break;   // 收完了
-                }
-
-                const size_t already = body.size();
-                if (static_cast<unsigned long long>(already) + available > maxBytes)
-                {
-                    error = stage + L"失败：对方给的内容超过上限（" + FormatUInt(maxBytes)
-                          + L" 字节），已中止下载。地址：" + url
-                          + L"\r\n正常的扩展集只有几百 KB，这么大的东西不是你想要的。";
                     return false;
                 }
 
-                body.resize(already + available);
-                DWORD received = 0u;
-                if (!::WinHttpReadData(httpRequest.get(), body.data() + already, available, &received))
+                InternetHandle connection(::WinHttpConnect(session.get(), parts.host.c_str(), parts.port, 0));
+                if (!connection)
                 {
-                    error = DescribeWinHttpFailure(stage + L"（读响应体）", url, ::GetLastError());
+                    error = DescribeWinHttpFailure(stage, safeDisplayUrl, ::GetLastError());
                     return false;
                 }
-                body.resize(already + received);
-                if (received == 0u)
+
+                InternetHandle httpRequest(::WinHttpOpenRequest(connection.get(), L"GET", parts.path.c_str(),
+                                                                nullptr, WINHTTP_NO_REFERER,
+                                                                WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                                WINHTTP_FLAG_SECURE));
+                if (!httpRequest)
                 {
-                    break;   // 防死循环：要过一次还是 0 就不再要了
+                    error = DescribeWinHttpFailure(stage, safeDisplayUrl, ::GetLastError());
+                    return false;
                 }
+
+                if (!DisableRedirects(httpRequest.get(), optionError))
+                {
+                    error = stage + L"失败：关不掉 HTTP 重定向（Win32 错误码 " + FormatUInt(optionError)
+                          + L"）。本工具只走 https，宁可不下载。地址：" + safeDisplayUrl;
+                    return false;
+                }
+
+                if (!::WinHttpSendRequest(httpRequest.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                          WINHTTP_NO_REQUEST_DATA, 0, 0, 0))
+                {
+                    error = DescribeWinHttpFailure(stage, safeDisplayUrl, ::GetLastError());
+                    return false;
+                }
+                if (!::WinHttpReceiveResponse(httpRequest.get(), nullptr))
+                {
+                    error = DescribeWinHttpFailure(stage, safeDisplayUrl, ::GetLastError());
+                    return false;
+                }
+
+                DWORD status = 0u;
+                DWORD statusSize = sizeof(status);
+                if (!::WinHttpQueryHeaders(httpRequest.get(),
+                                           WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                           WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+                                           WINHTTP_NO_HEADER_INDEX))
+                {
+                    error = DescribeWinHttpFailure(stage, safeDisplayUrl, ::GetLastError());
+                    return false;
+                }
+                response.status = status;
+
+                if (status == 301u || status == 302u || status == 303u || status == 307u || status == 308u)
+                {
+                    if (hop >= kMaxRedirects)
+                    {
+                        error = stage + L"失败：HTTPS 重定向次数超过上限（" + FormatUInt(kMaxRedirects)
+                              + L" 跳）。地址：" + safeDisplayUrl;
+                        return false;
+                    }
+                    const std::wstring location = QueryRedirectLocation(httpRequest.get());
+                    std::wstring nextUrl;
+                    if (!ResolveRedirectTarget(parts, location, nextUrl, error))
+                    {
+                        error = stage + L"失败：" + error + L" 原地址：" + safeDisplayUrl;
+                        return false;
+                    }
+                    currentUrl = std::move(nextUrl);
+                    continue;
+                }
+
+                if (status != 200u)
+                {
+                    error = DescribeHttpStatus(stage, safeDisplayUrl, httpRequest.get(), status);
+                    return false;
+                }
+
+                std::vector<unsigned char> body;
+                for (;;)
+                {
+                    if (request.cancel && request.cancel())
+                    {
+                        error = L"已取消。";
+                        return false;
+                    }
+
+                    DWORD available = 0u;
+                    if (!::WinHttpQueryDataAvailable(httpRequest.get(), &available))
+                    {
+                        error = DescribeWinHttpFailure(stage + L"（读响应体）", safeDisplayUrl, ::GetLastError());
+                        return false;
+                    }
+                    if (available == 0u)
+                    {
+                        break;
+                    }
+
+                    const size_t already = body.size();
+                    if (static_cast<unsigned long long>(already) + available > maxBytes)
+                    {
+                        error = stage + L"失败：对方给的内容超过上限（" + FormatUInt(maxBytes)
+                              + L" 字节），已中止下载。地址：" + safeDisplayUrl
+                              + L"\r\n正常的扩展集只有几百 KB，这么大的东西不是你想要的。";
+                        return false;
+                    }
+
+                    body.resize(already + available);
+                    DWORD received = 0u;
+                    if (!::WinHttpReadData(httpRequest.get(), body.data() + already, available, &received))
+                    {
+                        error = DescribeWinHttpFailure(stage + L"（读响应体）", safeDisplayUrl, ::GetLastError());
+                        return false;
+                    }
+                    body.resize(already + received);
+                    if (received == 0u)
+                    {
+                        break;
+                    }
+                }
+
+                response.body.swap(body);
+                return true;
+            }
+            return false;
+        }
+
+        bool HttpGetWithSources(const std::wstring& url, const std::vector<DownloadSource>& sources,
+                                unsigned long long maxBytes, const std::wstring& stage,
+                                const Request& request, HttpResponse& response,
+                                std::wstring& usedSource, bool& sawHttp404, std::wstring& error)
+        {
+            error.clear();
+            usedSource.clear();
+            sawHttp404 = false;
+
+            const std::vector<DownloadCandidate> candidates = BuildDownloadCandidates(url, sources);
+            if (candidates.empty())
+            {
+                error = stage + L"失败：没有可用的下载源。";
+                return false;
             }
 
-            response.body.swap(body);
-            return true;
+            std::vector<std::wstring> failures;
+            for (size_t i = 0u; i < candidates.size(); ++i)
+            {
+                const DownloadCandidate& candidate = candidates[i];
+                if (request.cancel && request.cancel())
+                {
+                    error = L"已取消。";
+                    return false;
+                }
+                if (request.progress)
+                {
+                    const int basePct = static_cast<int>(5 + (i * 40 / candidates.size()));
+                    request.progress(basePct, stage + L"（" + candidate.name + L"）…");
+                }
+
+                HttpResponse attemptResponse;
+                std::wstring attemptError;
+                if (HttpGet(candidate.url, maxBytes, stage, request, attemptResponse, attemptError))
+                {
+                    response = std::move(attemptResponse);
+                    usedSource = candidate.name;
+                    return true;
+                }
+                if (request.cancel && request.cancel())
+                {
+                    error = L"已取消。";
+                    return false;
+                }
+                // 体积超限不属于源临时故障，不重试其它镜像，直接终止。
+                if (attemptError.find(L"超过上限") != std::wstring::npos)
+                {
+                    error = attemptError;
+                    return false;
+                }
+                if (attemptResponse.status == 404u)
+                {
+                    sawHttp404 = true;
+                }
+                failures.push_back(candidate.name + L"：" + attemptError);
+            }
+
+            if (failures.size() == 1u)
+            {
+                error = failures.front();
+            }
+            else
+            {
+                error = stage + L"失败，已尝试全部 " + FormatUInt(failures.size()) + L" 个下载源：";
+                for (const std::wstring& item : failures)
+                {
+                    error += L"\r\n- " + item;
+                }
+            }
+            return false;
         }
 
         // 本进程创建并**登记过的** private staging 目录（规范化 + casefold）。
@@ -1599,6 +1872,730 @@ namespace Online
             }
             return ok;
         }
+
+        // ---- 极简严格 JSON 解析（仅供 ParseCatalogJson 使用，零外部依赖） ----
+
+        void AppendCatalogUtf8CodePoint(std::string& out, unsigned int code)
+        {
+            if (code <= 0x7Fu)
+            {
+                out.push_back(static_cast<char>(code));
+            }
+            else if (code <= 0x7FFu)
+            {
+                out.push_back(static_cast<char>(0xC0u | (code >> 6)));
+                out.push_back(static_cast<char>(0x80u | (code & 0x3Fu)));
+            }
+            else if (code <= 0xFFFFu)
+            {
+                out.push_back(static_cast<char>(0xE0u | (code >> 12)));
+                out.push_back(static_cast<char>(0x80u | ((code >> 6) & 0x3Fu)));
+                out.push_back(static_cast<char>(0x80u | (code & 0x3Fu)));
+            }
+            else if (code <= 0x10FFFFu)
+            {
+                out.push_back(static_cast<char>(0xF0u | (code >> 18)));
+                out.push_back(static_cast<char>(0x80u | ((code >> 12) & 0x3Fu)));
+                out.push_back(static_cast<char>(0x80u | ((code >> 6) & 0x3Fu)));
+                out.push_back(static_cast<char>(0x80u | (code & 0x3Fu)));
+            }
+        }
+
+        struct CatalogJsonValue
+        {
+            enum class Kind { Null, Bool, Number, String, Array, Object };
+            Kind kind = Kind::Null;
+            bool boolean = false;
+            double number = 0.0;
+            bool isInteger = false;
+            long long integer = 0;
+            std::string text;
+            std::vector<CatalogJsonValue> items;
+            std::vector<std::string> keys;
+            std::vector<CatalogJsonValue> values;
+
+            const CatalogJsonValue* Member(const char* key) const
+            {
+                for (size_t i = 0u; i < keys.size() && i < values.size(); ++i)
+                {
+                    if (keys[i] == key)
+                    {
+                        return &values[i];
+                    }
+                }
+                return nullptr;
+            }
+
+            std::wstring MemberText(const char* key) const
+            {
+                const CatalogJsonValue* v = Member(key);
+                return (v != nullptr && v->kind == Kind::String) ? Utf8ToWide(v->text) : std::wstring();
+            }
+
+            bool MemberBool(const char* key, bool fallback) const
+            {
+                const CatalogJsonValue* v = Member(key);
+                return (v != nullptr && v->kind == Kind::Bool) ? v->boolean : fallback;
+            }
+
+            bool MemberUInt64(const char* key, unsigned long long& out) const
+            {
+                const CatalogJsonValue* v = Member(key);
+                if (v == nullptr || v->kind != Kind::Number || !v->isInteger || v->integer < 0)
+                {
+                    return false;
+                }
+                out = static_cast<unsigned long long>(v->integer);
+                return true;
+            }
+        };
+
+        struct CatalogJsonParser
+        {
+            const std::string& Text;
+            size_t Pos = 0u;
+            int Depth = 0;
+
+            explicit CatalogJsonParser(const std::string& text) : Text(text) {}
+
+            void SkipSpace()
+            {
+                while (Pos < Text.size())
+                {
+                    const char ch = Text[Pos];
+                    if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')
+                    {
+                        ++Pos;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+
+            bool Literal(const char* word)
+            {
+                const size_t len = std::strlen(word);
+                if (Text.compare(Pos, len, word) != 0)
+                {
+                    return false;
+                }
+                Pos += len;
+                return true;
+            }
+
+            bool ParseHex4(unsigned int& out)
+            {
+                if (Pos + 4u > Text.size())
+                {
+                    return false;
+                }
+                unsigned int code = 0u;
+                for (int i = 0; i < 4; ++i)
+                {
+                    const char d = Text[Pos++];
+                    code <<= 4u;
+                    if (d >= '0' && d <= '9') code |= static_cast<unsigned int>(d - '0');
+                    else if (d >= 'a' && d <= 'f') code |= static_cast<unsigned int>(d - 'a' + 10);
+                    else if (d >= 'A' && d <= 'F') code |= static_cast<unsigned int>(d - 'A' + 10);
+                    else return false;
+                }
+                out = code;
+                return true;
+            }
+
+            bool ParseString(std::string& out)
+            {
+                if (Pos >= Text.size() || Text[Pos] != '"')
+                {
+                    return false;
+                }
+                ++Pos;
+                out.clear();
+                while (Pos < Text.size())
+                {
+                    const char ch = Text[Pos++];
+                    if (ch == '"')
+                    {
+                        return true;
+                    }
+                    if (ch != '\\')
+                    {
+                        out.push_back(ch);
+                        continue;
+                    }
+                    if (Pos >= Text.size())
+                    {
+                        return false;
+                    }
+                    const char esc = Text[Pos++];
+                    switch (esc)
+                    {
+                        case '"': out.push_back('"'); break;
+                        case '\\': out.push_back('\\'); break;
+                        case '/': out.push_back('/'); break;
+                        case 'b': out.push_back('\b'); break;
+                        case 'f': out.push_back('\f'); break;
+                        case 'n': out.push_back('\n'); break;
+                        case 'r': out.push_back('\r'); break;
+                        case 't': out.push_back('\t'); break;
+                        case 'u':
+                        {
+                            unsigned int code = 0u;
+                            if (!ParseHex4(code))
+                            {
+                                return false;
+                            }
+                            if (code >= 0xD800u && code <= 0xDBFFu && Pos + 2u <= Text.size()
+                                && Text[Pos] == '\\' && Text[Pos + 1u] == 'u')
+                            {
+                                Pos += 2u;
+                                unsigned int low = 0u;
+                                if (!ParseHex4(low))
+                                {
+                                    return false;
+                                }
+                                if (low >= 0xDC00u && low <= 0xDFFFu)
+                                {
+                                    code = 0x10000u + ((code - 0xD800u) << 10u) + (low - 0xDC00u);
+                                }
+                            }
+                            AppendCatalogUtf8CodePoint(out, code);
+                            break;
+                        }
+                        default:
+                            return false;
+                    }
+                }
+                return false;
+            }
+
+            bool ParseValue(CatalogJsonValue& out)
+            {
+                if (Depth > 24)
+                {
+                    return false;
+                }
+                SkipSpace();
+                if (Pos >= Text.size())
+                {
+                    return false;
+                }
+                const char ch = Text[Pos];
+                if (ch == '{')
+                {
+                    ++Pos;
+                    ++Depth;
+                    out.kind = CatalogJsonValue::Kind::Object;
+                    SkipSpace();
+                    if (Pos < Text.size() && Text[Pos] == '}')
+                    {
+                        ++Pos;
+                        --Depth;
+                        return true;
+                    }
+                    for (;;)
+                    {
+                        SkipSpace();
+                        std::string key;
+                        if (!ParseString(key))
+                        {
+                            return false;
+                        }
+                        SkipSpace();
+                        if (Pos >= Text.size() || Text[Pos] != ':')
+                        {
+                            return false;
+                        }
+                        ++Pos;
+                        CatalogJsonValue value;
+                        if (!ParseValue(value))
+                        {
+                            return false;
+                        }
+                        out.keys.push_back(std::move(key));
+                        out.values.push_back(std::move(value));
+                        SkipSpace();
+                        if (Pos < Text.size() && Text[Pos] == ',')
+                        {
+                            ++Pos;
+                            continue;
+                        }
+                        if (Pos < Text.size() && Text[Pos] == '}')
+                        {
+                            ++Pos;
+                            --Depth;
+                            return true;
+                        }
+                        return false;
+                    }
+                }
+                if (ch == '[')
+                {
+                    ++Pos;
+                    ++Depth;
+                    out.kind = CatalogJsonValue::Kind::Array;
+                    SkipSpace();
+                    if (Pos < Text.size() && Text[Pos] == ']')
+                    {
+                        ++Pos;
+                        --Depth;
+                        return true;
+                    }
+                    for (;;)
+                    {
+                        CatalogJsonValue value;
+                        if (!ParseValue(value))
+                        {
+                            return false;
+                        }
+                        out.items.push_back(std::move(value));
+                        SkipSpace();
+                        if (Pos < Text.size() && Text[Pos] == ',')
+                        {
+                            ++Pos;
+                            continue;
+                        }
+                        if (Pos < Text.size() && Text[Pos] == ']')
+                        {
+                            ++Pos;
+                            --Depth;
+                            return true;
+                        }
+                        return false;
+                    }
+                }
+                if (ch == '"')
+                {
+                    out.kind = CatalogJsonValue::Kind::String;
+                    return ParseString(out.text);
+                }
+                if (ch == 't')
+                {
+                    out.kind = CatalogJsonValue::Kind::Bool;
+                    out.boolean = true;
+                    return Literal("true");
+                }
+                if (ch == 'f')
+                {
+                    out.kind = CatalogJsonValue::Kind::Bool;
+                    out.boolean = false;
+                    return Literal("false");
+                }
+                if (ch == 'n')
+                {
+                    out.kind = CatalogJsonValue::Kind::Null;
+                    return Literal("null");
+                }
+
+                const size_t start = Pos;
+                if (ch == '-')
+                {
+                    ++Pos;
+                }
+                bool digits = false;
+                while (Pos < Text.size() && Text[Pos] >= '0' && Text[Pos] <= '9')
+                {
+                    ++Pos;
+                    digits = true;
+                }
+                bool hasFraction = false;
+                if (Pos < Text.size() && Text[Pos] == '.')
+                {
+                    hasFraction = true;
+                    ++Pos;
+                    bool fracDigits = false;
+                    while (Pos < Text.size() && Text[Pos] >= '0' && Text[Pos] <= '9')
+                    {
+                        ++Pos;
+                        fracDigits = true;
+                    }
+                    if (!fracDigits)
+                    {
+                        return false;
+                    }
+                }
+                if (Pos < Text.size() && (Text[Pos] == 'e' || Text[Pos] == 'E'))
+                {
+                    hasFraction = true;
+                    ++Pos;
+                    if (Pos < Text.size() && (Text[Pos] == '+' || Text[Pos] == '-'))
+                    {
+                        ++Pos;
+                    }
+                    bool expDigits = false;
+                    while (Pos < Text.size() && Text[Pos] >= '0' && Text[Pos] <= '9')
+                    {
+                        ++Pos;
+                        expDigits = true;
+                    }
+                    if (!expDigits)
+                    {
+                        return false;
+                    }
+                }
+                if (!digits)
+                {
+                    Pos = start;
+                    return false;
+                }
+                const std::string slice = Text.substr(start, Pos - start);
+                out.kind = CatalogJsonValue::Kind::Number;
+                out.number = ::strtod(slice.c_str(), nullptr);
+                if (!hasFraction)
+                {
+                    char* endPtr = nullptr;
+                    const long long parsedInt = ::_strtoi64(slice.c_str(), &endPtr, 10);
+                    if (endPtr != nullptr && *endPtr == '\0')
+                    {
+                        out.isInteger = true;
+                        out.integer = parsedInt;
+                    }
+                }
+                return true;
+            }
+        };
+
+        bool ParseCatalogJsonDocument(const std::string& rawText, CatalogJsonValue& root)
+        {
+            std::string clean = rawText;
+            if (clean.size() >= 3u
+                && static_cast<unsigned char>(clean[0]) == 0xEFu
+                && static_cast<unsigned char>(clean[1]) == 0xBBu
+                && static_cast<unsigned char>(clean[2]) == 0xBFu)
+            {
+                clean.erase(0u, 3u);
+            }
+            CatalogJsonParser parser(clean);
+            if (!parser.ParseValue(root))
+            {
+                return false;
+            }
+            parser.SkipSpace();
+            return parser.Pos == clean.size();
+        }
+
+        bool WriteIniLinesUtf8Bom(const std::wstring& path, const std::vector<std::wstring>& lines,
+                                  std::wstring& error)
+        {
+            std::wstring rebuilt;
+            for (const std::wstring& line : lines)
+            {
+                rebuilt += line;
+                rebuilt += L"\r\n";
+            }
+
+            DWORD createError = 0u;
+            const std::wstring directory = ParentDirectory(path);
+            if (!directory.empty() && !EnsureDirectoryTree(directory, createError))
+            {
+                error = L"建不出配置目录：" + directory + L"（Win32 错误码 " + FormatUInt(createError)
+                      + L"）";
+                return false;
+            }
+
+            const std::string utf8 = WideToUtf8(rebuilt);
+            std::vector<unsigned char> bytes;
+            bytes.reserve(utf8.size() + 3u);
+            bytes.push_back(0xEFu);
+            bytes.push_back(0xBBu);
+            bytes.push_back(0xBFu);
+            bytes.insert(bytes.end(), utf8.begin(), utf8.end());
+
+            if (!WriteAllBytes(path, bytes.data(), bytes.size(), createError))
+            {
+                error = L"写配置文件失败：" + path + L"（Win32 错误码 " + FormatUInt(createError) + L"）";
+                return false;
+            }
+            return true;
+        }
+    }
+
+    // =====================================================================
+    // 有序下载源（镜像自动回退）
+    // =====================================================================
+
+    std::vector<DownloadSource> DefaultDownloadSources()
+    {
+        return {
+            { L"gh-proxy.com", L"https://gh-proxy.com/", true },
+            { L"ghproxy.vip", L"https://ghproxy.vip/", true },
+            { L"GitHub 官方", L"", true },
+        };
+    }
+
+    bool ValidateDownloadSources(const std::vector<DownloadSource>& sources, std::wstring& error)
+    {
+        error.clear();
+        if (sources.empty())
+        {
+            error = L"下载源列表不能为空。";
+            return false;
+        }
+        if (sources.size() > 16u)
+        {
+            error = L"下载源数量过多（最多 16 个）。";
+            return false;
+        }
+
+        size_t enabledCount = 0u;
+        for (size_t i = 0u; i < sources.size(); ++i)
+        {
+            const std::wstring name = TrimSpaces(sources[i].name);
+            if (name.empty())
+            {
+                error = L"第 " + FormatUInt(i + 1u) + L" 个下载源缺少名称。";
+                return false;
+            }
+            for (wchar_t ch : name)
+            {
+                if (ch == L'\r' || ch == L'\n')
+                {
+                    error = L"下载源名称不能包含换行符。";
+                    return false;
+                }
+            }
+
+            const std::wstring prefix = TrimSpaces(sources[i].prefix);
+            if (!prefix.empty())
+            {
+                for (wchar_t ch : prefix)
+                {
+                    if (ch == L'\r' || ch == L'\n')
+                    {
+                        error = L"下载源 \"" + name + L"\" 前缀不能包含换行符。";
+                        return false;
+                    }
+                }
+                if (prefix.find(L'@') != std::wstring::npos || prefix.find(L'#') != std::wstring::npos
+                    || prefix.find(L'?') != std::wstring::npos)
+                {
+                    error = L"下载源 \"" + name + L"\" 前缀不能包含 @ / ? / #。";
+                    return false;
+                }
+                UrlParts parts;
+                if (!ParseHttpsUrl(prefix, parts, false, error))
+                {
+                    error = L"下载源 \"" + name + L"\" 地址无效：" + error;
+                    return false;
+                }
+                std::wstring policyErr;
+                if (HostIsBlocked(parts.host, policyErr))
+                {
+                    error = L"下载源 \"" + name + L"\" 主机被拒：" + policyErr;
+                    return false;
+                }
+            }
+
+            if (sources[i].enabled)
+            {
+                ++enabledCount;
+            }
+        }
+        if (enabledCount == 0u)
+        {
+            error = L"至少要启用一个下载源。";
+            return false;
+        }
+        return true;
+    }
+
+    std::vector<DownloadSource> LoadDownloadSources()
+    {
+        const std::wstring path = ConfigFilePath();
+        if (path.empty() || !FileExists(path))
+        {
+            return DefaultDownloadSources();
+        }
+        std::vector<unsigned char> bytes;
+        DWORD readError = 0u;
+        if (!ReadAllBytes(path, bytes, readError))
+        {
+            return DefaultDownloadSources();
+        }
+
+        unsigned long long count = 0ull;
+        bool hasCount = false;
+        std::vector<std::wstring> names;
+        std::vector<std::wstring> prefixes;
+        std::vector<bool> enableds;
+        std::vector<std::wstring> keys;
+        std::vector<std::wstring> vals;
+
+        bool inOnline = false;
+        for (const std::wstring& raw : SplitLines(DecodeIniText(bytes)))
+        {
+            const std::wstring line = TrimSpaces(raw);
+            if (line.empty() || line.front() == L';' || line.front() == L'#')
+            {
+                continue;
+            }
+            if (line.size() >= 2u && line.front() == L'[' && line.back() == L']')
+            {
+                inOnline = (ToLowerString(line) == L"[online]");
+                continue;
+            }
+            if (!inOnline)
+            {
+                continue;
+            }
+            const size_t equals = line.find(L'=');
+            if (equals == std::wstring::npos)
+            {
+                continue;
+            }
+            const std::wstring key = ToLowerString(TrimSpaces(line.substr(0u, equals)));
+            const std::wstring val = TrimSpaces(line.substr(equals + 1u));
+            if (key == L"source_count")
+            {
+                if (ParseUInt(val, count) && count > 0ull && count <= 16ull)
+                {
+                    hasCount = true;
+                }
+                continue;
+            }
+            if (key.compare(0u, 7u, L"source_") == 0)
+            {
+                keys.push_back(key);
+                vals.push_back(val);
+            }
+        }
+
+        if (!hasCount)
+        {
+            return DefaultDownloadSources();
+        }
+
+        std::vector<DownloadSource> loaded(static_cast<size_t>(count));
+        for (size_t i = 0u; i < keys.size(); ++i)
+        {
+            const std::wstring& k = keys[i];
+            const size_t sep = k.find(L'_', 7u);
+            if (sep == std::wstring::npos)
+            {
+                continue;
+            }
+            unsigned long long idx = 0ull;
+            if (!ParseUInt(k.substr(7u, sep - 7u), idx) || idx >= count)
+            {
+                continue;
+            }
+            const std::wstring field = k.substr(sep + 1u);
+            DownloadSource& slot = loaded[static_cast<size_t>(idx)];
+            if (field == L"name")
+            {
+                slot.name = vals[i];
+            }
+            else if (field == L"prefix")
+            {
+                slot.prefix = vals[i];
+            }
+            else if (field == L"enabled")
+            {
+                slot.enabled = (vals[i] != L"0" && ToLowerString(vals[i]) != L"false");
+            }
+        }
+
+        std::wstring validationError;
+        if (!ValidateDownloadSources(loaded, validationError))
+        {
+            return DefaultDownloadSources();
+        }
+        return loaded;
+    }
+
+    bool SaveDownloadSources(const std::vector<DownloadSource>& sources, std::wstring& error)
+    {
+        std::vector<DownloadSource> normalized;
+        normalized.reserve(sources.size());
+        for (const DownloadSource& src : sources)
+        {
+            DownloadSource item;
+            item.name = TrimSpaces(src.name);
+            item.prefix = TrimSpaces(src.prefix);
+            if (!item.prefix.empty() && item.prefix.back() != L'/')
+            {
+                item.prefix.push_back(L'/');
+            }
+            item.enabled = src.enabled;
+            normalized.push_back(std::move(item));
+        }
+
+        if (!ValidateDownloadSources(normalized, error))
+        {
+            return false;
+        }
+
+        const std::wstring path = ConfigFilePath();
+        if (path.empty())
+        {
+            error = L"找不到可写的配置文件位置：工具目录与 %LOCALAPPDATA% 都写不了。";
+            return false;
+        }
+
+        std::wstring text;
+        if (FileExists(path))
+        {
+            std::vector<unsigned char> bytes;
+            DWORD readError = 0u;
+            if (ReadAllBytes(path, bytes, readError))
+            {
+                text = DecodeIniText(bytes);
+            }
+        }
+        const std::vector<std::wstring> lines = ReplaceIniOnlineSources(SplitLines(text), normalized);
+        return WriteIniLinesUtf8Bom(path, lines, error);
+    }
+
+    std::vector<DownloadCandidate> BuildDownloadCandidates(const std::wstring& url,
+                                                           const std::vector<DownloadSource>& sources)
+    {
+        UrlParts parts;
+        std::wstring parseErr;
+        if (!ParseHttpsUrl(url, parts, true, parseErr))
+        {
+            return {};
+        }
+
+        const std::wstring host = ToLowerString(parts.host);
+        const bool isGitHubHost = (host == L"github.com"
+                                   || host == L"raw.githubusercontent.com"
+                                   || host == L"codeload.github.com");
+        if (!isGitHubHost)
+        {
+            return { { parts.host, url } };
+        }
+
+        std::vector<DownloadCandidate> out;
+        for (const DownloadSource& src : sources)
+        {
+            if (!src.enabled)
+            {
+                continue;
+            }
+            const std::wstring prefix = TrimSpaces(src.prefix);
+            std::wstring candidateUrl;
+            if (prefix.empty())
+            {
+                candidateUrl = url;
+            }
+            else
+            {
+                std::wstring trimmedPrefix = prefix;
+                while (!trimmedPrefix.empty() && trimmedPrefix.back() == L'/')
+                {
+                    trimmedPrefix.pop_back();
+                }
+                candidateUrl = trimmedPrefix + L"/" + url;
+            }
+            out.push_back({ src.name.empty() ? L"GitHub" : src.name, candidateUrl });
+        }
+        if (out.empty())
+        {
+            out.push_back({ L"GitHub 官方", url });
+        }
+        return out;
     }
 
     // =====================================================================
@@ -1607,19 +2604,15 @@ namespace Online
 
     std::wstring NormalizeBase(const std::wstring& base)
     {
-        // 去首尾空白 + 末尾保证一个 '/'。
-        //
-        // **顺带把「仅 https」判在这里**（§14.4 第 1 条）：签名上没有 error 出参，
-        // 所以"不可用"只能用**返回空串**表示；调用入口拿到空串必须显式报错并说明原因，
-        // 不许拿空串去拼 URL（拼出来会变成相对地址，那才是真危险）。
-        //
-        // 这里**不再**顺带判"URL 里有没有非法字符"：那会让内置常量里的占位符
-        //（`.../<owner>/<repo>/...`）也被折成空串，界面就没法把"你还没配过仓库地址"显示出来。
-        // 非法字符改由 ResolveUsableBase 在**真正要联网 / 要落盘**的入口上判（措辞更准）。
+        // 去首尾空白；若为 .json 清单直链（如 catalog.json）则保持原样，否则末尾保证一个 '/'。
         const std::wstring trimmed = TrimSpaces(base);
         if (trimmed.empty() || !StartsWithHttps(trimmed))
         {
             return std::wstring();
+        }
+        if (EndsWithJsonSuffix(trimmed))
+        {
+            return trimmed;
         }
 
         std::wstring out = trimmed;
@@ -1702,7 +2695,7 @@ namespace Online
             if (HostIsBlocked(parts.host, error)
                 || (!HostIsNumericAddress(parts.host) && ResolveBlocked(parts.host, error)))
             {
-                error = L"仓库地址被拒：主机 \"" + parts.host + L"\" " + error
+                error = L"仓库地址被拒（" + parts.host + L"）：" + error
                       + L"配置没有保存。本工具只访问公网 https 地址，"
                         L"不访问本机 / 内网 / 保留段。";
                 return false;
@@ -1730,37 +2723,7 @@ namespace Online
         }
 
         std::vector<std::wstring> lines = ReplaceIniBase(SplitLines(text), normalized);
-        std::wstring rebuilt;
-        for (const std::wstring& line : lines)
-        {
-            rebuilt += line;
-            rebuilt += L"\r\n";
-        }
-
-        DWORD createError = 0u;
-        const std::wstring directory = ParentDirectory(path);
-        if (!directory.empty() && !EnsureDirectoryTree(directory, createError))
-        {
-            error = L"建不出配置目录：" + directory + L"（Win32 错误码 " + FormatUInt(createError)
-                  + L"）";
-            return false;
-        }
-
-        const std::string utf8 = WideToUtf8(rebuilt);
-        std::vector<unsigned char> bytes;
-        // 带 BOM：基址里可能有非 ASCII，记事本打开时才知道这是 UTF-8，别让用户看成乱码。
-        bytes.reserve(utf8.size() + 3u);
-        bytes.push_back(0xEFu);
-        bytes.push_back(0xBBu);
-        bytes.push_back(0xBFu);
-        bytes.insert(bytes.end(), utf8.begin(), utf8.end());
-
-        if (!WriteAllBytes(path, bytes.data(), bytes.size(), createError))
-        {
-            error = L"写配置文件失败：" + path + L"（Win32 错误码 " + FormatUInt(createError) + L"）";
-            return false;
-        }
-        return true;
+        return WriteIniLinesUtf8Bom(path, lines, error);
     }
 
     std::wstring IndexUrl(const std::wstring& base)
@@ -1770,19 +2733,26 @@ namespace Online
         {
             return std::wstring();   // 拼不出来就给空串，调用方必须据此报错
         }
+        if (EndsWithJsonSuffix(normalized))
+        {
+            return normalized;
+        }
         return normalized + kIndexFileName;
     }
 
     std::wstring ArchiveUrl(const std::wstring& base, const std::wstring& publisher,
                             const std::wstring& title)
     {
-        // §14.2：远端按 <会社>/<作品>/rules.int 放，与 InstallToLibrary 的落点规则同构。
-        // 会社 / 作品先过 MakeSafePathComponent（去掉 '/'、'\'、'..' 这类能跳出目录的东西）；
-        // 去完为空就返回空串，让调用方报错，别拿空目录名去拼一个必然 404 的地址。
+        // §14.2：传统目录仓库按 <会社>/<作品>/rules.int 放；
+        // catalog.json 模式由条目自带 remoteUrl，不从 catalog.json 路径后缀拼子路径。
         const std::wstring normalized = NormalizeBase(base);
+        if (normalized.empty() || EndsWithJsonSuffix(normalized))
+        {
+            return std::wstring();
+        }
         const std::wstring safePublisher = ExtensionSet::MakeSafePathComponent(publisher);
         const std::wstring safeTitle = ExtensionSet::MakeSafePathComponent(title);
-        if (normalized.empty() || safePublisher.empty() || safeTitle.empty())
+        if (safePublisher.empty() || safeTitle.empty())
         {
             return std::wstring();
         }
@@ -1790,8 +2760,186 @@ namespace Online
     }
 
     // =====================================================================
-    // 拉索引
+    // catalog.json v1 解析与拉索引
     // =====================================================================
+
+    bool ParseCatalogJson(const std::string& jsonUtf8, const std::wstring& sourceUrl,
+                          std::vector<ExtensionSet::LibraryEntry>& out, std::wstring& error)
+    {
+        out.clear();
+        error.clear();
+
+        CatalogJsonValue root;
+        if (!ParseCatalogJsonDocument(jsonUtf8, root) || root.kind != CatalogJsonValue::Kind::Object)
+        {
+            error = L"目录 JSON 格式无效（" + sourceUrl + L"）。";
+            return false;
+        }
+
+        unsigned long long schemaVersion = 0ull;
+        if (!root.MemberUInt64("schema_version", schemaVersion) || schemaVersion != 1ull)
+        {
+            error = L"不支持的目录 schema_version（需要 1）。地址：" + sourceUrl;
+            return false;
+        }
+
+        const CatalogJsonValue* entriesVal = root.Member("entries");
+        if (entriesVal == nullptr || entriesVal->kind != CatalogJsonValue::Kind::Array)
+        {
+            error = L"目录缺少 entries 数组。地址：" + sourceUrl;
+            return false;
+        }
+
+        std::vector<ExtensionSet::LibraryEntry> parsed;
+        parsed.reserve(entriesVal->items.size());
+        for (size_t i = 0u; i < entriesVal->items.size(); ++i)
+        {
+            const CatalogJsonValue& obj = entriesVal->items[i];
+            if (obj.kind != CatalogJsonValue::Kind::Object)
+            {
+                error = L"目录第 " + FormatUInt(i + 1u) + L" 项不是 JSON 对象。";
+                return false;
+            }
+            if (obj.MemberBool("yanked", false))
+            {
+                continue; // 已撤回条目不提供下载安装
+            }
+
+            ExtensionSet::LibraryEntry item;
+            item.publisher = TrimSpaces(obj.MemberText("publisher"));
+            item.title = TrimSpaces(obj.MemberText("title"));
+            if (item.publisher.empty() || item.title.empty())
+            {
+                error = L"目录第 " + FormatUInt(i + 1u) + L" 项缺少 publisher 或 title。";
+                return false;
+            }
+            item.contributor = obj.MemberText("contributor");
+            item.version = obj.MemberText("version");
+            item.date = obj.MemberText("date");
+            item.comment = obj.MemberText("comment");
+            item.generatedAt = obj.MemberText("generated_at");
+            item.exeDigest = obj.MemberText("exe_sha256");
+            item.siblingDigest = obj.MemberText("sibling_sha256");
+            item.saltDigest = obj.MemberText("salt_sha256");
+            item.archiveDigest = obj.MemberText("archive_sha256");
+
+            if (!ExtensionSet::IsHexLength(item.exeDigest, 64u))
+            {
+                error = L"目录条目「" + item.publisher + L" / " + item.title
+                      + L"」缺少有效的 64 位 exe_sha256。";
+                return false;
+            }
+            if (!ExtensionSet::IsHexLength(item.archiveDigest, 64u))
+            {
+                error = L"目录条目「" + item.publisher + L" / " + item.title
+                      + L"」缺少有效的 64 位 archive_sha256。";
+                return false;
+            }
+
+            unsigned long long n = 0ull;
+            if (obj.MemberUInt64("directory_count", n)) item.directoryCount = static_cast<unsigned int>(n);
+            if (obj.MemberUInt64("file_count", n)) item.fileCount = static_cast<unsigned int>(n);
+            if (obj.MemberUInt64("exception_count", n)) item.exceptionCount = static_cast<unsigned int>(n);
+            if (obj.MemberUInt64("entry_count", n))
+            {
+                item.entryCount = static_cast<unsigned int>(n);
+            }
+            else
+            {
+                item.entryCount = item.directoryCount + item.fileCount;
+            }
+
+            const CatalogJsonValue* pkg = obj.Member("package");
+            if (pkg == nullptr || pkg->kind != CatalogJsonValue::Kind::Object)
+            {
+                error = L"目录条目「" + item.publisher + L" / " + item.title
+                      + L"」缺少有效的 package 信息。";
+                return false;
+            }
+            item.remoteUrl = TrimSpaces(pkg->MemberText("url"));
+            UrlParts pkgUrlParts;
+            std::wstring urlErr;
+            if (!ParseHttpsUrl(item.remoteUrl, pkgUrlParts, false, urlErr))
+            {
+                error = L"目录条目「" + item.publisher + L" / " + item.title
+                      + L"」下载地址不是合法 https 地址：" + urlErr;
+                return false;
+            }
+            unsigned long long pkgSize = 0ull;
+            if (!pkg->MemberUInt64("size", pkgSize) || pkgSize == 0ull || pkgSize > kMaxArchiveBytes)
+            {
+                error = L"目录条目「" + item.publisher + L" / " + item.title
+                      + L"」安装包大小超出合理范围。";
+                return false;
+            }
+            item.remoteSize = pkgSize;
+
+            const std::wstring pkgSha = pkg->MemberText("sha256");
+            if (!ExtensionSet::IsHexLength(pkgSha, 64u) || !SameHash(pkgSha, item.archiveDigest))
+            {
+                error = L"目录条目「" + item.publisher + L" / " + item.title
+                      + L"」package.sha256 与 archive_sha256 不一致。";
+                return false;
+            }
+            item.source = L"yua-extensions-catalog";
+            parsed.push_back(std::move(item));
+        }
+
+        out = std::move(parsed);
+        return true;
+    }
+
+    namespace
+    {
+        bool ParseManifestIndexText(const std::vector<unsigned char>& body, const std::wstring& sourceUrl,
+                                    std::vector<ExtensionSet::LibraryEntry>& out, std::wstring& error)
+        {
+            if (!IsValidUtf8(body))
+            {
+                error = L"索引格式不对（" + sourceUrl + L"）：内容不是合法的 UTF-8 文本。"
+                        L"\r\n（索引就是一份 manifest.txt，UTF-8 的 TSV。）";
+                return false;
+            }
+            const std::string text = body.empty()
+                ? std::string()
+                : std::string(reinterpret_cast<const char*>(body.data()), body.size());
+
+            std::vector<ExtensionSet::LibraryEntry> entries;
+            std::wstring parseReport;
+            if (!ExtensionSet::ParseManifestText(text, entries, parseReport))
+            {
+                error = L"索引格式不对（" + sourceUrl + L"）：\r\n" + parseReport;
+                return false;
+            }
+            if (!parseReport.empty())
+            {
+                error = L"索引里有不合规的行（索引必须整份干净，一行都不能跳过）：\r\n" + parseReport
+                      + L"地址：" + sourceUrl;
+                return false;
+            }
+            for (const ExtensionSet::LibraryEntry& item : entries)
+            {
+                if (!ExtensionSet::IsHexLength(item.exeDigest, 64u))
+                {
+                    error = L"索引里「" + item.publisher + L" / " + item.title
+                          + L"」这一条没有目标 exe 摘要（该列是空的）。\r\n"
+                            L"索引是在线的信任根，缺了它，下载回来的字节就没有东西可以对，拒绝。\r\n"
+                            L"地址：" + sourceUrl;
+                    return false;
+                }
+                if (!ExtensionSet::IsHexLength(item.archiveDigest, 64u))
+                {
+                    error = L"索引里「" + item.publisher + L" / " + item.title
+                          + L"」这一条没有档案摘要（该列是空的）。\r\n"
+                            L"下载回来的档案要拿它对（§14.4 第 2 条），没有它就无法校验，拒绝。\r\n"
+                            L"地址：" + sourceUrl;
+                    return false;
+                }
+            }
+            out = std::move(entries);
+            return true;
+        }
+    }
 
     bool FetchIndex(const std::wstring& base, std::vector<ExtensionSet::LibraryEntry>& out,
                     IndexResult& info, std::wstring& error, const Request& request)
@@ -1800,14 +2948,13 @@ namespace Online
         error.clear();
         info = IndexResult();
 
-        // 入口校基址：只 https、不能还是占位符、不能带 URL 非法字符 —— 三种情况各有各的措辞
-        //（用户改了 ini 或环境变量却没生效时，靠的就是这句话）。
         std::wstring normalized;
         if (!ResolveUsableBase(base, normalized, error))
         {
             return false;
         }
 
+        const std::vector<DownloadSource> sources = LoadDownloadSources();
         info.url = IndexUrl(normalized);
         if (request.progress)
         {
@@ -1815,71 +2962,83 @@ namespace Online
         }
 
         HttpResponse response;
-        const bool fetched = HttpGet(info.url, kMaxIndexBytes, L"拉取索引", request, response, error);
+        std::wstring usedSource;
+        bool sawHttp404 = false;
+        bool fetched = HttpGetWithSources(info.url, sources, kMaxIndexBytes, L"拉取索引", request,
+                                          response, usedSource, sawHttp404, error);
         info.httpStatus = static_cast<int>(response.status);
+        bool usedLegacyFallback = false;
+
+        // 默认指向 GitHub Releases 的 catalog.json；若仓库尚未发布首个 Release（404），
+        // 自动兼容回退到旧版 raw main/index.txt，确保平滑过渡。
+        if (!fetched && sawHttp404 && normalized == DefaultRepositoryBase())
+        {
+            const std::wstring legacyBase = NormalizeBase(kLegacyFallbackRepositoryBase);
+            const std::wstring legacyUrl = IndexUrl(legacyBase);
+            if (request.progress)
+            {
+                request.progress(25, L"Releases 目录尚不可用，兼容尝试 raw 索引…");
+            }
+            HttpResponse legacyResp;
+            std::wstring legacyUsed;
+            bool legacy404 = false;
+            std::wstring legacyErr;
+            if (HttpGetWithSources(legacyUrl, sources, kMaxIndexBytes, L"拉取兼容索引", request,
+                                   legacyResp, legacyUsed, legacy404, legacyErr))
+            {
+                response = std::move(legacyResp);
+                usedSource = legacyUsed;
+                info.url = legacyUrl;
+                info.httpStatus = static_cast<int>(response.status);
+                fetched = true;
+                usedLegacyFallback = true;
+                error.clear();
+            }
+        }
+
         if (!fetched)
         {
-            return false;   // 措辞已经分门别类写好了，原样带上去
-        }
-        info.bytes = static_cast<unsigned long long>(response.body.size());
-
-        if (!IsValidUtf8(response.body))
-        {
-            error = L"索引格式不对（" + info.url + L"）：内容不是合法的 UTF-8 文本。"
-                    L"\r\n（索引就是一份 manifest.txt，UTF-8 的 TSV。）";
             return false;
         }
 
+        info.usedSource = usedSource;
+        info.bytes = static_cast<unsigned long long>(response.body.size());
         if (request.progress)
         {
-            request.progress(60, L"正在解析索引…");
+            request.progress(65, L"正在解析索引…");
         }
 
-        const std::string text = response.body.empty()
-            ? std::string()
-            : std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size());
-
-        // 索引的解析**走本地库清单同一份实现**（§14.3）：两处口径一分叉，就会出现
-        // "本地能读、远端读不了"这种怪事。空索引不算错（仓库刚开张就是 0 条）。
         std::vector<ExtensionSet::LibraryEntry> entries;
-        std::wstring parseReport;
-        if (!ExtensionSet::ParseManifestText(text, entries, parseReport))
+        if (EndsWithJsonSuffix(info.url) && !usedLegacyFallback)
         {
-            // 整份不可用：某一行"写了值但值是坏的"。
-            error = L"索引格式不对（" + info.url + L"）：\r\n" + parseReport;
-            return false;
-        }
-        if (!parseReport.empty())
-        {
-            // 解析器对"列数不对 / 会社作品为空"是**跳过并报告**（本地库那边靠它保住其余条目）。
-            // 索引不能这么办：它是仓库的全部内容，跳一行等于用户永远看不到那一部作品，
-            // 而且 §14.3 明确要求缺列/多列必须报错点名行号 —— 所以在线这一侧把报告升级成硬错。
-            error = L"索引里有不合规的行（索引必须整份干净，一行都不能跳过）：\r\n" + parseReport
-                  + L"地址：" + info.url;
-            return false;
-        }
-
-        // 只属于**在线索引**的要求（§14.3 / §14.4 第 2、4 条）：目标 exe 摘要与档案摘要
-        // 必须非空。本地库清单允许空（那是用户自己装过的东西的记录），索引不行 ——
-        // 少了目标 exe 摘要就没有信任根可对，少了档案摘要就没法把字节钉死。
-        // 格式（64 位 hex）解析器已经保证过了（非空却不合法的行会整份作废）。
-        for (const ExtensionSet::LibraryEntry& item : entries)
-        {
-            if (!ExtensionSet::IsHexLength(item.exeDigest, 64u))
+            if (!IsValidUtf8(response.body))
             {
-                error = L"索引里「" + item.publisher + L" / " + item.title
-                      + L"」这一条没有目标 exe 摘要（该列是空的）。\r\n"
-                        L"索引是在线的信任根，缺了它，下载回来的字节就没有东西可以对，拒绝。\r\n"
-                        L"地址：" + info.url;
+                error = L"目录 JSON 不是合法的 UTF-8 文本：" + info.url;
                 return false;
             }
-            if (!ExtensionSet::IsHexLength(item.archiveDigest, 64u))
+            const std::string text(reinterpret_cast<const char*>(response.body.data()), response.body.size());
+            if (!ParseCatalogJson(text, info.url, entries, error))
             {
-                error = L"索引里「" + item.publisher + L" / " + item.title
-                      + L"」这一条没有档案摘要（该列是空的）。\r\n"
-                        L"下载回来的档案要拿它对（§14.4 第 2 条），没有它就无法校验，拒绝。\r\n"
-                        L"地址：" + info.url;
                 return false;
+            }
+            info.format = L"catalog-v1";
+        }
+        else
+        {
+            if (!ParseManifestIndexText(response.body, info.url, entries, error))
+            {
+                return false;
+            }
+            info.format = L"index-tsv";
+            if (usedLegacyFallback)
+            {
+                for (ExtensionSet::LibraryEntry& item : entries)
+                {
+                    if (item.remoteUrl.empty())
+                    {
+                        item.remoteUrl = ArchiveUrl(kLegacyFallbackRepositoryBase, item.publisher, item.title);
+                    }
+                }
             }
         }
 
@@ -1887,7 +3046,8 @@ namespace Online
         out = std::move(entries);
         if (request.progress)
         {
-            request.progress(100, L"索引读取完成，共 " + FormatUInt(info.entryCount) + L" 条扩展集。");
+            const std::wstring via = usedSource.empty() ? std::wstring() : (L"（" + usedSource + L"）");
+            request.progress(100, L"索引读取完成，共 " + FormatUInt(info.entryCount) + L" 条扩展集" + via + L"。");
         }
         return true;
     }
@@ -2048,10 +3208,12 @@ namespace Online
             return false;
         }
 
-        const std::wstring url = ArchiveUrl(normalized, publisher, title);
+        const std::wstring url = !entry.remoteUrl.empty()
+            ? entry.remoteUrl
+            : ArchiveUrl(normalized, publisher, title);
         if (url.empty())
         {
-            error = L"拼不出档案地址：会社 / 作品名不可用。";
+            error = L"拼不出档案地址：请先重新拉取目录索引或检查会社 / 作品名。";
             return false;
         }
 
@@ -2149,8 +3311,12 @@ namespace Online
         }
 #endif
 
+        const std::vector<DownloadSource> sources = LoadDownloadSources();
         HttpResponse response;
-        if (!HttpGet(url, kMaxArchiveBytes, L"下载档案", request, response, error))
+        std::wstring usedSource;
+        bool allHttp404 = false;
+        if (!HttpGetWithSources(url, sources, kMaxArchiveBytes, L"下载档案", request, response,
+                                usedSource, allHttp404, error))
         {
             // 还没创建任何文件：不调用 DeleteFile（避免误删别的进程刚建出来的同名文件）。
             return false;

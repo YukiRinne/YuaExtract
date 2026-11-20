@@ -581,6 +581,7 @@ namespace Bridge
         std::vector<ExtensionSet::LibraryEntry> remoteEntries;
         volatile LONG onlineCancel = 0;
         volatile LONG onlineActive = 0;
+        bool onlineIsDownload = false;
         bool pushPosted = false;
         bool closeConfirmed = false;
     };
@@ -842,6 +843,7 @@ namespace Bridge
             { "version", JsonString(L"") },
             { "date", JsonString(L"") },
             { "comment", JsonString(L"") },
+            { "entryCount", JsonNumber(static_cast<long long>(entry.entryCount)) },
             { "dirCount", JsonNumber(static_cast<long long>(entry.directoryCount)) },
             { "fileCount", JsonNumber(static_cast<long long>(entry.fileCount)) },
             { "exceptions", JsonNumber(static_cast<long long>(entry.exceptionCount)) },
@@ -870,6 +872,21 @@ namespace Bridge
         });
     }
 
+    std::string DownloadSourcesArrayJson(const std::vector<Online::DownloadSource>& sources)
+    {
+        std::vector<std::string> items;
+        items.reserve(sources.size());
+        for (const auto& src : sources)
+        {
+            items.push_back(JsonObject({
+                { "name", JsonString(src.name) },
+                { "prefix", JsonString(src.prefix) },
+                { "enabled", JsonBool(src.enabled) },
+            }));
+        }
+        return JsonArray(items);
+    }
+
     std::string HelloJson(const UiContext& context)
     {
         const BuildFingerprint& fingerprint = SelfFingerprint();
@@ -891,6 +908,8 @@ namespace Bridge
                         { "sha256", JsonString(fingerprint.Sha256) },
                     }) },
                   { "onlineBase", JsonString(Online::ResolveRepositoryBase()) },
+                  { "defaultOnlineBase", JsonString(Online::DefaultRepositoryBase()) },
+                  { "downloadSources", DownloadSourcesArrayJson(Online::LoadDownloadSources()) },
               }) },
         });
     }
@@ -1323,7 +1342,8 @@ namespace Bridge
             L"generateSet",     L"saveMeta",       L"dryRunSet",      L"installSet",
             L"openDraftDir",    L"openLibraryRoot", L"openSelectedSet", L"pickSourceDir",
             L"pickTestDir",     L"refreshLibrary", L"selfCheck",      L"readNotes",
-            L"fetchIndex",      L"downloadRemote", L"startRestore",   L"stopRestore",
+            L"fetchIndex",      L"downloadRemote", L"saveDownloadSources", L"resetDownloadSources",
+            L"startRestore",    L"stopRestore",
             L"startCollectDemo", L"stopGame",      L"clearCollectFiles", L"openCollectDir",
             L"enqueueXp3",      L"startBatch",     L"stopBatch",      L"openLegacy",
             L"failDemo",        L"windowControl",  L"confirmReply",
@@ -1352,10 +1372,10 @@ namespace Bridge
         HWND notify = nullptr;
         std::wstring base;
         std::wstring endpoint;
+        std::wstring usedSource;
         bool force = false;
         bool cancelled = false;
         ExtensionSet::LibraryEntry entry;
-        ExtensionSet::LibraryCatalog catalog;
         bool ok = false;
         std::wstring error;
         std::wstring detail;
@@ -1374,6 +1394,83 @@ namespace Bridge
         }
     }
 
+    const ExtensionSet::LibraryEntry* FindBestLocalMatch(const ExtensionSet::LibraryEntry& remote,
+                                                           const ExtensionSet::LibraryCatalog& local)
+    {
+        const ExtensionSet::LibraryEntry* best = nullptr;
+        const std::wstring remoteSlot = ExtensionSet::LibrarySlotKey(remote.publisher, remote.title);
+        for (const ExtensionSet::LibraryEntry& candidate : local.entries)
+        {
+            const bool sameSlot =
+                !remoteSlot.empty() &&
+                ExtensionSet::LibrarySlotKey(candidate.publisher, candidate.title) == remoteSlot;
+            const bool sameExe =
+                !remote.exeDigest.empty() && !candidate.exeDigest.empty() &&
+                _wcsicmp(candidate.exeDigest.c_str(), remote.exeDigest.c_str()) == 0;
+            if (!sameSlot && !sameExe)
+            {
+                continue;
+            }
+            if (best == nullptr || candidate.entryCount > best->entryCount)
+            {
+                best = &candidate;
+            }
+        }
+        return best;
+    }
+
+    std::string BuildRemoteIndexJson(const std::vector<ExtensionSet::LibraryEntry>& entries,
+                                     const ExtensionSet::LibraryCatalog& catalog, const std::wstring& base)
+    {
+        std::vector<std::string> items;
+        items.reserve(entries.size());
+        for (const auto& entry : entries)
+        {
+            const Online::EntryState state = Online::Classify(entry, catalog);
+            const ExtensionSet::LibraryEntry* localBest = FindBestLocalMatch(entry, catalog);
+            items.push_back(JsonObject({
+                { "id", JsonString(entry.publisher + L"/" + entry.title) },
+                { "publisher", JsonString(entry.publisher) },
+                { "title", JsonString(entry.title) },
+                { "contributor", JsonString(entry.contributor) },
+                { "version", JsonString(entry.version) },
+                { "date", JsonString(entry.date) },
+                { "comment", JsonString(entry.comment) },
+                { "entryCount", JsonNumber(static_cast<long long>(entry.entryCount)) },
+                { "localEntryCount",
+                  JsonNumber(static_cast<long long>(localBest ? localBest->entryCount : 0u)) },
+                { "dirCount", JsonNumber(static_cast<long long>(localBest ? localBest->directoryCount : 0u)) },
+                { "fileCount", JsonNumber(static_cast<long long>(localBest ? localBest->fileCount : 0u)) },
+                { "exceptions", JsonNumber(static_cast<long long>(localBest ? localBest->exceptionCount : 0u)) },
+                { "archiveSha", JsonString(entry.archiveDigest) },
+                { "targetSha", JsonString(entry.exeDigest) },
+                { "siblingSha", JsonString(entry.siblingDigest) },
+                { "saltSha", JsonString(entry.saltDigest) },
+                { "generatedAt", JsonString(entry.generatedAt) },
+                { "installedAt", JsonString(entry.installedAt) },
+                { "source", JsonString(entry.source) },
+                { "path", JsonString(entry.archivePath) },
+                { "remoteEntryCount", JsonNumber(static_cast<long long>(entry.entryCount)) },
+                { "remoteDirCount", JsonNumber(static_cast<long long>(entry.directoryCount)) },
+                { "remoteFileCount", JsonNumber(static_cast<long long>(entry.fileCount)) },
+                { "remoteSize", JsonNumber(static_cast<long long>(entry.remoteSize)) },
+                { "remoteUrl", JsonString(entry.remoteUrl) },
+                { "remoteSha", JsonString(entry.archiveDigest) },
+                { "status", JsonString(RemoteStatusText(state)) },
+            }));
+        }
+        return JsonObject({
+            { "type", JsonString(L"remoteIndex") },
+            { "items", JsonArray(items) },
+            { "base", JsonString(base) },
+        });
+    }
+
+    void EmitRemoteIndex(UiContext& context, const std::wstring& base)
+    {
+        Emit(BuildRemoteIndexJson(S().remoteEntries, context.Catalog, base));
+    }
+
     DWORD WINAPI OnlineThreadProc(LPVOID parameter)
     {
         OnlineWork* work = static_cast<OnlineWork*>(parameter);
@@ -1381,8 +1478,30 @@ namespace Bridge
         {
             return ::InterlockedCompareExchange(&S().onlineCancel, 0, 0) != 0 || !S().attached;
         };
+        const bool isDownload = work->kind == OnlineWork::Kind::Download;
         Online::Request req;
         req.cancel = cancellationRequested;
+        req.progress = [isDownload, &cancellationRequested](int percent, const std::wstring& stage)
+        {
+            if (cancellationRequested())
+            {
+                return;
+            }
+            if (isDownload)
+            {
+                double p = 0.05 + (static_cast<double>(percent) / 100.0) * 0.75;
+                if (p < 0.05) p = 0.05;
+                if (p > 0.80) p = 0.80;
+                Emit(JobJson(L"online-download", L"running", p, stage, std::wstring()));
+            }
+            else
+            {
+                double p = static_cast<double>(percent) / 100.0;
+                if (p < 0.05) p = 0.05;
+                if (p > 0.95) p = 0.95;
+                Emit(JobJson(L"online-index", L"running", p, stage, std::wstring()));
+            }
+        };
         if (work->kind == OnlineWork::Kind::Index)
         {
             Online::IndexResult info;
@@ -1390,6 +1509,7 @@ namespace Bridge
             std::wstring error;
             work->ok = Online::FetchIndex(work->base, entries, info, error, req);
             work->error = error;
+            work->usedSource = info.usedSource;
             work->httpStatus = static_cast<unsigned int>(info.httpStatus);
             work->entries = std::move(entries);
         }
@@ -1431,6 +1551,7 @@ namespace Bridge
             else
             {
                 stagingCleanup.directory = download.stagingDirectory;
+                Emit(JobJson(L"online-download", L"running", 0.85, L"正在校验档案……", std::wstring()));
                 std::wstring detail;
                 if (!Online::VerifyArchiveBytes(download.blob, work->entry, detail, error))
                 {
@@ -1445,9 +1566,11 @@ namespace Bridge
                 }
                 else
                 {
+                    Emit(JobJson(L"online-download", L"running", 0.92, L"正在写入本地扩展集库……", std::wstring()));
                     std::wstring installError;
-                    const std::wstring source =
-                        Online::ArchiveUrl(work->base, work->entry.publisher, work->entry.title);
+                    const std::wstring source = !work->entry.remoteUrl.empty()
+                        ? work->entry.remoteUrl
+                        : Online::ArchiveUrl(work->base, work->entry.publisher, work->entry.title);
                     // 会社 / 作品由档案自己的 META 决定（已在上一步与索引交叉校验过），
                     // 所以这里只给库根、字节与来源标签。
                     ExtensionSet::LibraryInstallPolicy installPolicy;
@@ -1483,36 +1606,38 @@ namespace Bridge
         return 0;
     }
 
-    void StartOnlineWork(OnlineWork* work)
+    bool StartOnlineWork(OnlineWork* work, const wchar_t* jobKind, const wchar_t* startText)
     {
         if (::InterlockedCompareExchange(&S().onlineActive, 1, 0) != 0)
         {
             delete work;
             NotifyToast(L"info", L"在线更新", L"已有在线更新任务正在进行，请稍候。");
-            return;
+            return false;
         }
+        S().onlineIsDownload = (work->kind == OnlineWork::Kind::Download);
         ::InterlockedExchange(&S().onlineCancel, 0);
+        Emit(JobJson(jobKind, L"running", 0.05, startText, std::wstring()));
         HANDLE thread = ::CreateThread(nullptr, 0u, OnlineThreadProc, work, 0u, nullptr);
         if (thread == nullptr)
         {
             ::InterlockedExchange(&S().onlineActive, 0);
             delete work;
+            Emit(JobJson(jobKind, L"error", 0.0, L"启动网络线程失败。", L"启动网络线程失败。"));
             NotifyToast(L"error", L"在线更新", L"启动网络线程失败。");
-            return;
+            return false;
         }
         ::SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
         ::CloseHandle(thread); // 线程自己跑完就退，句柄不需要 join（结果靠消息回来）。
+        return true;
     }
 
     void HandleOnlineWork(UiContext& context, OnlineWork* work)
     {
         const bool index = work->kind == OnlineWork::Kind::Index;
-        Emit(JobJson(index ? L"online-index" : L"online-download", work->ok ? L"success" : L"error",
-                     work->ok ? 1.0 : 0.0,
-                     index ? std::wstring(L"索引拉取完成") : std::wstring(L"下载完成"),
-                     work->ok ? std::wstring() : work->error));
         if (!work->ok)
         {
+            Emit(JobJson(index ? L"online-index" : L"online-download", L"error", 0.0,
+                         index ? std::wstring(L"索引拉取失败") : std::wstring(L"下载失败"), work->error));
             // 仅索引失败才清空远端列表；下载失败只报 job + toast，不动界面已有列表。
             if (index)
             {
@@ -1532,52 +1657,30 @@ namespace Bridge
 
         if (index)
         {
-            std::vector<std::string> items;
-            for (const auto& entry : work->entries)
-            {
-                const Online::EntryState state = Online::Classify(entry, work->catalog);
-                items.push_back(JsonObject({
-                    { "id", JsonString(entry.publisher + L"/" + entry.title) },
-                    { "publisher", JsonString(entry.publisher) },
-                    { "title", JsonString(entry.title) },
-                    { "contributor", JsonString(L"") },
-                    { "version", JsonString(L"") },
-                    { "date", JsonString(L"") },
-                    { "comment", JsonString(L"") },
-                    { "dirCount", JsonNumber(static_cast<long long>(entry.directoryCount)) },
-                    { "fileCount", JsonNumber(static_cast<long long>(entry.fileCount)) },
-                    { "exceptions", JsonNumber(static_cast<long long>(entry.exceptionCount)) },
-                    { "archiveSha", JsonString(entry.archiveDigest) },
-                    { "targetSha", JsonString(entry.exeDigest) },
-                    { "siblingSha", JsonString(entry.siblingDigest) },
-                    { "saltSha", JsonString(entry.saltDigest) },
-                    { "generatedAt", JsonString(entry.generatedAt) },
-                    { "installedAt", JsonString(entry.installedAt) },
-                    { "source", JsonString(entry.source) },
-                    { "path", JsonString(entry.archivePath) },
-                    { "remoteDirCount", JsonNumber(static_cast<long long>(entry.directoryCount)) },
-                    { "remoteFileCount", JsonNumber(static_cast<long long>(entry.fileCount)) },
-                    { "remoteSha", JsonString(entry.archiveDigest) },
-                    { "status", JsonString(RemoteStatusText(state)) },
-                }));
-            }
-            Emit(JsonObject({
-                { "type", JsonString(L"remoteIndex") },
-                { "items", JsonArray(items) },
-                { "base", JsonString(work->base) },
-            }));
-            NotifyToast(L"info", L"索引已拉取",
-                        Host::Format(L"共 %u 条远端扩展集。", static_cast<unsigned int>(items.size())).c_str());
             // 缓存落地（仅 UI 线程）：downloadRemote 只认这份远端索引；
             // 索引失败的提前 return 不经过这里，上一次成功的缓存得以保留。
             S().remoteEntries = work->entries;
+            EmitRemoteIndex(context, work->base);
+            Emit(JobJson(L"online-index", L"success", 1.0, L"索引拉取完成", std::wstring()));
+            const std::wstring via = work->usedSource.empty()
+                ? std::wstring()
+                : (L"（" + work->usedSource + L"）");
+            NotifyToast(L"info", L"索引已拉取",
+                        Host::Format(L"共 %u 条远端扩展集%s。",
+                                     static_cast<unsigned int>(work->entries.size()), via.c_str())
+                            .c_str());
         }
         else
         {
             Host::LogLine(Log::Level::Info, L"[YuaExtract] 在线更新：已安装 " + work->entry.publisher + L" / " +
                                                work->entry.title);
-            NotifyToast(L"info", L"已安装到扩展集库", work->detail.c_str());
             RefreshLibrary(context);
+            if (!S().remoteEntries.empty())
+            {
+                EmitRemoteIndex(context, work->base);
+            }
+            Emit(JobJson(L"online-download", L"success", 1.0, L"下载完成", std::wstring()));
+            NotifyToast(L"info", L"已安装到扩展集库", work->detail.c_str());
         }
         delete work;
     }
@@ -1888,6 +1991,8 @@ namespace Bridge
             {
                 ::InterlockedExchange(&S().onlineCancel, 1);
                 Host::LogLine(Log::Level::Warn, L"[YuaExtract] 已请求取消在线更新任务");
+                Emit(JobJson(S().onlineIsDownload ? L"online-download" : L"online-index", L"cancelling", 0.0,
+                             L"正在取消在线更新……", std::wstring()));
             }
             return;
         }
@@ -1994,29 +2099,32 @@ namespace Bridge
             OnlineWork* work = new OnlineWork();
             work->kind = OnlineWork::Kind::Index;
             work->notify = context.Window;
-            work->catalog = context.Catalog;
             const std::wstring endpoint = document.MemberText("endpoint");
             work->endpoint = endpoint;
             if (!endpoint.empty())
             {
-                std::wstring error;
-                if (!Online::SetRepositoryBase(endpoint, error))
+                const std::wstring currentBase = Online::ResolveRepositoryBase();
+                const std::wstring normalized = Online::NormalizeBase(endpoint);
+                if (normalized.empty() || normalized != currentBase)
                 {
-                    delete work;
-                    Emit(JobJson(L"online-index", L"error", 0.0, L"索引拉取失败", error));
-                    Emit(JsonObject({
-                        { "type", JsonString(L"remoteIndex") },
-                        { "items", "[]" },
-                        { "base", JsonString(Online::ResolveRepositoryBase()) },
-                        { "error", JsonString(error) },
-                    }));
-                    NotifyToast(L"error", L"仓库地址无效", error.c_str());
-                    return;
+                    std::wstring error;
+                    if (!Online::SetRepositoryBase(endpoint, error))
+                    {
+                        delete work;
+                        Emit(JobJson(L"online-index", L"error", 0.0, L"索引拉取失败", error));
+                        Emit(JsonObject({
+                            { "type", JsonString(L"remoteIndex") },
+                            { "items", "[]" },
+                            { "base", JsonString(currentBase) },
+                            { "error", JsonString(error) },
+                        }));
+                        NotifyToast(L"error", L"仓库地址无效", error.c_str());
+                        return;
+                    }
                 }
             }
             work->base = Online::ResolveRepositoryBase();
-            Emit(JobJson(L"online-index", L"running", 0.05, L"正在拉取远端索引……", std::wstring()));
-            StartOnlineWork(work);
+            StartOnlineWork(work, L"online-index", L"正在拉取远端索引……");
             return;
         }
         if (type == L"downloadRemote")
@@ -2061,6 +2169,14 @@ namespace Bridge
                 return;
             }
             const Online::EntryState remoteState = Online::Classify(entry, liveCatalog);
+            if (remoteState == Online::EntryState::Same)
+            {
+                const std::wstring text = entry.publisher + L" / " + entry.title +
+                                          L" 本地已经是同一份（档案摘要相同），无需下载。";
+                Host::LogLine(Log::Level::Info, L"[YuaExtract] 在线更新：" + text);
+                NotifyToast(L"info", L"已是同一份", text.c_str());
+                return;
+            }
             if (remoteState == Online::EntryState::LocalNewer && !document.MemberBool("force", false))
             {
                 NotifyToast(L"warn", L"本地更全，默认不覆盖", Online::DescribeState(remoteState));
@@ -2072,8 +2188,62 @@ namespace Bridge
             work->entry = entry;
             work->force = document.MemberBool("force", false);
             work->base = Online::ResolveRepositoryBase();
-            Emit(JobJson(L"online-download", L"running", 0.05, L"正在下载并校验……", std::wstring()));
-            StartOnlineWork(work);
+            StartOnlineWork(work, L"online-download", L"正在下载并校验……");
+            return;
+        }
+        if (type == L"saveDownloadSources")
+        {
+            const JsonValue* listVal = document.Member("sources");
+            if (listVal == nullptr || listVal->kind != JsonValue::Kind::Array)
+            {
+                NotifyToast(L"error", L"下载源格式无效", L"请提交有效的下载源数组。");
+                return;
+            }
+            std::vector<Online::DownloadSource> sources;
+            sources.reserve(listVal->items.size());
+            for (const auto& item : listVal->items)
+            {
+                if (item.kind != JsonValue::Kind::Object)
+                {
+                    NotifyToast(L"error", L"下载源格式无效", L"下载源列表每一项必须是对象。");
+                    return;
+                }
+                Online::DownloadSource src;
+                src.name = item.MemberText("name");
+                src.prefix = item.MemberText("prefix");
+                src.enabled = item.MemberBool("enabled", true);
+                sources.push_back(std::move(src));
+            }
+            std::wstring error;
+            if (!Online::SaveDownloadSources(sources, error))
+            {
+                NotifyToast(L"error", L"保存下载源失败", error.c_str());
+                return;
+            }
+            const std::vector<Online::DownloadSource> saved = Online::LoadDownloadSources();
+            Emit(JsonObject({
+                { "type", JsonString(L"downloadSources") },
+                { "sources", DownloadSourcesArrayJson(saved) },
+            }));
+            Host::LogLine(Log::Level::Info, L"[YuaExtract] 在线更新：下载源列表已保存");
+            NotifyToast(L"info", L"下载源已保存", L"将在拉取索引和下载扩展集时按顺序自动回退。");
+            return;
+        }
+        if (type == L"resetDownloadSources")
+        {
+            std::wstring error;
+            const std::vector<Online::DownloadSource> defaults = Online::DefaultDownloadSources();
+            if (!Online::SaveDownloadSources(defaults, error))
+            {
+                NotifyToast(L"error", L"恢复默认下载源失败", error.c_str());
+                return;
+            }
+            Emit(JsonObject({
+                { "type", JsonString(L"downloadSources") },
+                { "sources", DownloadSourcesArrayJson(defaults) },
+            }));
+            Host::LogLine(Log::Level::Info, L"[YuaExtract] 在线更新：已恢复默认下载源");
+            NotifyToast(L"info", L"已恢复默认下载源", L"gh-proxy.com → ghproxy.vip → GitHub 官方。");
             return;
         }
         if (type == L"startRestore")

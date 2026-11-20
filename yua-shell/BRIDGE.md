@@ -40,8 +40,9 @@ Types live in `src/types.ts` (`HostRequest`, `HostEvent`).
 | `refreshLibrary` | 刷新列表 | Rescan library + manifest | `library` |
 | `selfCheck` | 运行环境自检 | Seven read-only checks | `selfCheck` |
 | `readNotes` | 扩展集留言 | Decode META comment (do not decode archive on every paint) | `notes` |
-| `fetchIndex` | 拉取索引 | Public HTTPS GET `index.txt`, no redirects, rejects localhost/loopback/private/reserved IPs before connecting | `remoteIndex` or error |
-| `downloadRemote` | 下载并安装选中 | Download + 9-point trust chain; confirm overwrite if local-richer | `job`, `library`, `toast` |
+| `fetchIndex` | 拉取索引 | Fetches `catalog.json` (GitHub Releases, with `index.txt` compatibility fallback) via ordered HTTPS download sources (`gh-proxy.com` → `ghproxy.vip` → direct) | `remoteIndex` or error |
+| `downloadRemote` | 下载并安装选中 | Downloads `.int` archive (bounded HTTPS-only redirects + source failover) → verifies sha256 against index → confirms on `local-richer` unless `force` → upserts library | `job`, `library`, `remoteIndex`, `toast` |
+| `saveDownloadSources` / `resetDownloadSources` | 保存 / 恢复下载源 | Validates HTTPS prefixes and saves ordered mirror fallback chain to `YuaExtract.ini` | `downloadSources`, `toast` |
 | `startRestore` | 还原窗口「开始」 | Offline restore via hidden `YuaRestoreWindow` engine, N threads, optional keep/infer | `restoreTasks`, `job`, `workspace` |
 | `stopRestore` | Close / abort | Cooperative stop, keep copied files | `restoreTasks`, `job` |
 | `startCollectDemo` / `stopGame` / `clearCollectFiles` / `openCollectDir` | Collect console | Game process control + mapping logs | `collect` |
@@ -70,7 +71,8 @@ Types live in `src/types.ts` (`HostRequest`, `HostEvent`).
 
 | type | Payload | Notes |
 |---|---|---|
-| `hello` | `HostInfo` | Product, paths, build fingerprint, online base URL |
+| `hello` | `HostInfo` | Product, paths, build fingerprint, online base + `defaultOnlineBase` + `downloadSources` |
+| `downloadSources` | `{ sources: DownloadSource[] }` | Pushed after saving or resetting mirror sources |
 | `workspace` | `WorkspaceSnapshot` | Target, dirs, readiness flags, attribution, restore rate |
 | `library` | `ExtensionEntry[]` | Installed archives (metadata only — no archive decode on timer) |
 | `remoteIndex` | items + base + optional error | Diff classes: `new` / `same` / `update` / `local-richer` |
@@ -89,7 +91,7 @@ Types live in `src/types.ts` (`HostRequest`, `HostEvent`).
 
 ## Security notes (must stay on the C++ side)
 
-- Online updates: Public HTTPS only (`OnlineHostPolicy` rejects `localhost`, `127.0.0.0/8`, `::1`, link-local, private, and reserved addresses before connecting), no redirects, triple timeouts, size cap, sha256 must match the index, refuse on any container/CRC/digest failure with zero local writes.
+- Online updates: Public HTTPS only (`OnlineHostPolicy` rejects `localhost`, `127.0.0.0/8`, `::1`, link-local, private, and reserved addresses before connecting on every hop; DNS-resolved `198.18.0.0/15`, `fc00::/18`, and `fdfe:dcba:9876::/64` TUN Fake-IP addresses are allowed for domain hosts while numeric literals remain blocked), bounded HTTPS-only redirects (`kMaxRedirects = 5`, no HTTP downgrade), ordered mirror failover, triple timeouts, size cap, sha256 must match the index/catalog, refuse on any container/CRC/digest failure with zero local writes.
 - Never auto-load a downloaded archive; installing ≠ using. Attribution still happens on homepage mode-1 step 1.
 - The archive stores names, not hash layers; the tool cannot prove names are “correct” — restore rate is the ground truth.
 

@@ -50,6 +50,7 @@ export interface ExtensionEntry {
   version: string;
   date: string;
   comment: string;
+  entryCount?: number;
   dirCount: number;
   fileCount: number;
   exceptions: number;
@@ -65,9 +66,19 @@ export interface ExtensionEntry {
 
 export interface RemoteExtension extends ExtensionEntry {
   status: "new" | "same" | "update" | "local-richer";
+  remoteEntryCount?: number;
+  localEntryCount?: number;
   remoteDirCount: number;
   remoteFileCount: number;
+  remoteSize?: number;
+  remoteUrl?: string;
   remoteSha: string;
+}
+
+export interface DownloadSource {
+  name: string;
+  prefix: string;
+  enabled: boolean;
 }
 
 export interface RestoreTask {
@@ -110,6 +121,8 @@ export interface HostInfo {
     sha256: string;
   };
   onlineBase: string;
+  defaultOnlineBase?: string;
+  downloadSources?: DownloadSource[];
 }
 
 export interface WorkspaceSnapshot {
@@ -164,6 +177,8 @@ type HostRequestMessage =
   | { id: string; type: "readNotes" }
   | { id: string; type: "fetchIndex"; endpoint?: string }
   | { id: string; type: "downloadRemote"; entryId: string; force?: boolean }
+  | { id: string; type: "saveDownloadSources"; sources: DownloadSource[] }
+  | { id: string; type: "resetDownloadSources" }
   | { id: string; type: "startRestore"; opts: RestoreOptions }
   | { id: string; type: "stopRestore" }
   | { id: string; type: "startCollectDemo" }
@@ -203,6 +218,7 @@ export type HostEvent =
   | { type: "workspace"; workspace: WorkspaceSnapshot }
   | { type: "library"; entries: ExtensionEntry[] }
   | { type: "remoteIndex"; items: RemoteExtension[]; base: string; error?: string }
+  | { type: "downloadSources"; sources: DownloadSource[] }
   | { type: "job"; kind: JobKind; status: JobStatus; progress: number; text: string; error?: string }
   | { type: "log"; entry: Omit<LogEntry, "id"> }
   | { type: "toast"; level: LogLevel; title: string; body: string }

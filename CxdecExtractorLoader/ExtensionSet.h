@@ -388,6 +388,10 @@ namespace Yua
         {
             std::wstring publisher;
             std::wstring title;
+            std::wstring contributor;
+            std::wstring version;
+            std::wstring date;
+            std::wstring comment;
             std::wstring exeDigest;     // 目标 exe 摘要（主键）
             std::wstring siblingDigest; // _crack 兄弟 exe 摘要（查找时两者都试）
             std::wstring saltDigest;    // 盐摘要
@@ -400,6 +404,8 @@ namespace Yua
             std::wstring installedAt;
             std::wstring source;
             std::wstring archivePath; // <库根>\<会社>\<作品>\rules.int（解析出来的绝对路径）
+            std::wstring remoteUrl;   // Releases/catalog.json 远端直链（仅在线索引使用）
+            unsigned long long remoteSize = 0;
         };
 
         struct LibraryCatalog
